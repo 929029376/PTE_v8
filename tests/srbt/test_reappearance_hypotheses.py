@@ -3,6 +3,7 @@ import torch
 from types import SimpleNamespace
 
 from lib.models.layers.redetection import RedetectionExpert
+from lib.models.layers.state_machine import OcclusionStateMachine, State
 from lib.models.layers.srbt_hypotheses import (
     HypothesisTracker,
     build_hypothesis_tracker,
@@ -389,3 +390,85 @@ def test_inference_tracker_keeps_cross_frame_hypothesis_state_and_maps_best_box(
     assert first_box != second_box
     assert first_conf == pytest.approx(0.9)
     assert second_conf == pytest.approx(0.87)
+
+
+def test_failed_redetect_cycle_discards_stale_hypotheses(monkeypatch):
+    tracker = object.__new__(PETTrack)
+    tracker.frame_id = 0
+    tracker.state = [1.0, 1.0, 2.0, 2.0]
+    tracker.params = SimpleNamespace(
+        search_factor=2.0,
+        search_size=8,
+        template_factor=2.0,
+        template_size=4,
+    )
+    tracker.preprocessor = SimpleNamespace(
+        process=lambda *_args: SimpleNamespace(tensors=torch.zeros(1, 3, 8, 8)))
+    tracker.network = SimpleNamespace(event_belief=SimpleNamespace(
+        energy_map=lambda value: value.mean(dim=0),
+        update_background=lambda *_args: None,
+    ))
+    tracker.cfg = SimpleNamespace(
+        MODEL=SimpleNamespace(EVENT_TRIGGER=None),
+        TEST=SimpleNamespace(SCORE_THRESHOLD=0.0),
+    )
+    tracker.state_machine = OcclusionStateMachine(
+        theta_re=0.9, w_fail=1, use_learned_policy=False)
+    tracker.state_machine.state = State.REDETECT
+    tracker.use_train_compatible_policy = False
+    tracker.t_max = 50.0
+    tracker._skip_count = 0
+    tracker._last_score_peak = 0.1
+    tracker._last_sim_zx = 0.1
+    tracker._last_redetect_conf = 0.8
+    tracker._pending_redetect_box = [2.0, 2.0, 2.0, 2.0]
+    tracker._redetect_hypotheses = {
+        "active_count": 1,
+        "posterior": torch.ones(1),
+    }
+    tracker._route_box_history = []
+    tracker.force_route = None
+    tracker.debug = False
+    tracker._step_event_belief = lambda *_args, **_kwargs: {
+        "belief": None,
+        "raw_stats": torch.zeros(1, 10),
+        "history_ready": True,
+    }
+    tracker._causal_route_motion = lambda *_args: torch.zeros(1, 4)
+    tracker._predict_c3_policy = lambda *_args, **_kwargs: {
+        "absence_prob": 1.0,
+        "freeze_prob": 1.0,
+        "redetect_prob": 0.0,
+    }
+    tracker._run_local_candidate = lambda *_args, **_kwargs: {
+        "score_peak": 0.1,
+        "sim_zx": 0.1,
+        "state": tracker.state,
+        "response": None,
+        "tail_raw_expert": "",
+        "tail_expert": "",
+        "router_expert": "",
+        "head_expert": "",
+        "router_confidence": 0.0,
+        "tail_router_confidence": 0.0,
+    }
+    monkeypatch.setattr(
+        "lib.test.tracker.pet_track.sample_target",
+        lambda **_kwargs: (
+            torch.zeros(8, 8, 3),
+            torch.zeros(8, 8, 3),
+            1.0,
+            torch.zeros(8, 8),
+        ),
+    )
+
+    output = PETTrack.track(
+        tracker,
+        torch.zeros(8, 8, 3),
+        torch.zeros(8, 8, 3),
+    )
+
+    assert output["c3_debug"]["action"] == "freeze"
+    assert tracker._pending_redetect_box is None
+    assert tracker._redetect_hypotheses is None
+    assert tracker._last_redetect_conf == 0.0

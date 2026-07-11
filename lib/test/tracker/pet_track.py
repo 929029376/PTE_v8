@@ -454,9 +454,6 @@ class PETTrack(BaseTracker):
 
             if (not self.use_train_compatible_policy
                     and decision["enter_frozen"]):
-                self._pending_redetect_box = None
-                self._redetect_hypotheses = None
-                self._last_redetect_conf = 0.0
                 self.thor_wrapper.freeze(True)
                 self.thor_wrapper.snapshot_clean(
                     self._last_trusted_zi, self._last_trusted_ze)
@@ -513,6 +510,8 @@ class PETTrack(BaseTracker):
                 is_absent = True
                 if action == "freeze":
                     self._pending_redetect_box = None
+                    self._redetect_hypotheses = None
+                    self._last_redetect_conf = 0.0
                 # Keep the search window where it was; do not pollute memory.
             elif action == "redetect":
                 is_absent = True
@@ -680,15 +679,6 @@ class PETTrack(BaseTracker):
         red_out['_patch_size'] = self.params.search_size
         red_out['_crop_center'] = (0.5 * W, 0.5 * H)
         return red_out
-
-    def _decode_redetect_box(self, red_out, H, W):
-        """Map the redetect head's normalized box back to image coords."""
-        bbox = red_out['bbox'][0]
-        rd_resize = red_out.get('_resize_factor', 1.0)
-        ps = red_out.get('_patch_size', self.params.search_size)
-        cx_prev, cy_prev = red_out.get('_crop_center', (0.5 * W, 0.5 * H))
-        return crop_cxcywh_to_image_xywh(
-            bbox, rd_resize, ps, (cx_prev, cy_prev)).tolist()
 
     def _update_redetect_hypotheses(self, red_out):
         observed = red_out.get("hypotheses")
