@@ -1,7 +1,8 @@
+import math
 import random
+
 import torch
 import torch.nn.functional as F
-import math
 
 
 class THOR_Wrapper():
@@ -15,6 +16,7 @@ class THOR_Wrapper():
         self.score_threshold = score_threshold
 
         self.current_type = 'st'
+        self._frame_open = False
         self.frame_no = 0
         self.zs = 64
         self.st_count = 0
@@ -45,6 +47,14 @@ class THOR_Wrapper():
 
     def setup(self, zi, ze):
         """initialize the short-term and long-term module"""
+        self.frame_no = 0
+        self._frame_open = False
+        self.st_update_count = 0
+        self.lt_update_count = 0
+        self.sample_count = 0
+        self.frozen = False
+        self.clean_zi = None
+        self.clean_ze = None
         self.st_module = ST_Module(net=self.net, z_capacity=self.st_capacity,)
         self.st_module.fill(zi, ze)
         self.lt_module = LT_Module(net=self.net, z_capacity=self.lt_capacity, lower_bound=self.lower_bound,)
@@ -52,8 +62,7 @@ class THOR_Wrapper():
 
     # --- PET-Track C3: freeze / clean snapshot / resume ---
     def freeze(self, freeze_flag=True):
-        """Toggle the FROZEN state. While frozen, update() is a no-op for the
-        ST/LT memory; only sampling continues."""
+        """Toggle write protection while keeping template reads available."""
         self.frozen = freeze_flag
 
     def snapshot_clean(self, zi, ze):
@@ -71,60 +80,72 @@ class THOR_Wrapper():
         return self.clean_zi, self.clean_ze
 
     def resume(self, new_zi=None, new_ze=None):
-        """Resume tracking after a successful redetection. Optionally reseed
-        the static template with the redetected patch so the tracker starts
-        from the correct target appearance."""
+        """Resume writes and optionally reseed only the short-term anchor.
+
+        The initial long-term template remains immutable for the sequence.
+        """
         self.frozen = False
         if new_zi is not None and new_ze is not None:
             self.st_module.static_i = new_zi
             self.st_module.static_e = new_ze
-            self.lt_module.static_i = new_zi
-            self.lt_module.static_e = new_ze
         # Discard the clean snapshot: it has served its purpose.
         self.clean_zi = None
         self.clean_ze = None
 
-    def update(self, zi, ze, pred_score):
-        """update the short-term and long-term module.
-
-        PET-Track C3: when frozen, skip ALL memory mutation (ST/LT update +
-        LT clear) so occlusion-frame boxes cannot pollute the memory. Sampling
-        continues so dynamic templates can still be read for feature compute.
-        """
+    def begin_frame(self):
+        """Read dynamic templates before inference without mutating memory."""
+        if self._frame_open:
+            raise RuntimeError("previous THOR frame has not been committed")
         self.frame_no += 1
+        self._frame_open = True
 
-        if not self.frozen:
-            curr_zi = self.net.backbone._z_feat(zi.unsqueeze(0))
-            curr_ze = self.net.backbone._z_feat(ze.unsqueeze(0))
+        resample = self.frame_no % self.sample_interval == 0 or self.frame_no == 1
+        if resample:
+            self.sample_count += 1
+        st_dynamic_zi, st_dynamic_ze = self.st_module.get_dynamic_z(
+            1, resample_flag=resample)
+        lt_dynamic_zi, lt_dynamic_ze = self.lt_module.get_dynamic_z(
+            1, resample_flag=resample)
+        return (torch.cat([lt_dynamic_zi, st_dynamic_zi], dim=1),
+                torch.cat([lt_dynamic_ze, st_dynamic_ze], dim=1))
 
-            # LT - clear
-            if self.frame_no % 500 == 0:
-                self.lt_module.clear()
-
-            # NOTE: ST - update
-            if pred_score >= self.score_threshold and self.frame_no % self.update_interval == 0:
+    def commit(self, zi, ze, pred_score, *, allow_recent_write,
+               allow_long_write):
+        """Commit the current observation after the controller accepts it."""
+        if not self._frame_open:
+            raise RuntimeError("begin_frame must be called before THOR commit")
+        recent_interval = max(1, self.update_interval // 2)
+        recent_due = self.frame_no % recent_interval == 0
+        long_due = self.frame_no % self.update_interval == 0
+        can_write_recent = (
+            not self.frozen
+            and bool(allow_recent_write)
+            and pred_score >= self.score_threshold
+            and recent_due
+        )
+        try:
+            if can_write_recent:
+                curr_zi = self.net.backbone._z_feat(zi.unsqueeze(0))
+                curr_ze = self.net.backbone._z_feat(ze.unsqueeze(0))
+                if bool(allow_long_write) and self.frame_no % 500 == 0:
+                    self.lt_module.clear()
                 self.st_update_count += 1
-                div_scale = self.st_module.update(zi, ze, curr_zi, curr_ze)
-
-                # NOTE: LT - update
-                if self.frame_no % (self.update_interval * 2) == 0:
-                    update_flag = self.lt_module.update(zi, ze, curr_zi, curr_ze, div_scale=div_scale, time=self.frame_no)
+                div_scale = self.st_module.update(
+                    zi, ze, curr_zi, curr_ze)
+                if bool(allow_long_write) and long_due:
+                    update_flag = self.lt_module.update(
+                        zi, ze, curr_zi, curr_ze,
+                        div_scale=div_scale, time=self.frame_no)
                     if update_flag:
                         self.lt_update_count += 1
-        else:
-            # Frozen: no memory mutation. Still advance sampling bookkeeping.
-            pass
+        finally:
+            self._frame_open = False
 
-        if self.frame_no % self.sample_interval == 0 or self.frame_no == 1:
-            self.sample_count += 1
-            st_dynamic_zi, st_dynamic_ze = self.st_module.get_dynamic_z(1, resample_flag=True)
-            lt_dynamic_zi, lt_dynamic_ze = self.lt_module.get_dynamic_z(1, resample_flag=True)
-        else:
-            st_dynamic_zi, st_dynamic_ze = self.st_module.get_dynamic_z(1, resample_flag=False)
-            lt_dynamic_zi, lt_dynamic_ze = self.lt_module.get_dynamic_z(1, resample_flag=False)
-        return torch.cat([lt_dynamic_zi, st_dynamic_zi], dim=1), torch.cat([lt_dynamic_ze, st_dynamic_ze], dim=1)
-
-        
+    def discard_frame(self):
+        """Close a begun frame without writing either memory bank."""
+        if not self._frame_open:
+            raise RuntimeError("begin_frame must be called before discard_frame")
+        self._frame_open = False
 
 class TemplateModule():
     def __init__(self, net, z_capacity, zs=64):
@@ -149,13 +170,19 @@ class TemplateModule():
         return self.z_capacity
 
     def fill(self, zi, ze):
-        self.static_i = zi
-        self.static_e = ze
         """fill all slots in the memory with the given template"""
+        self.static_i = zi.detach().clone()
+        self.static_e = ze.detach().clone()
+        self.zi_raw_list = []
+        self.ze_raw_list = []
+        self.zi_list = []
+        self.ze_list = []
+        self.selected_i = []
+        self.selected_e = []
         # zi / ze.shape (1, 3, 128, 128)
-        for _ in range(self.z_capacity): 
-            self.zi_raw_list.append(zi)  
-            self.ze_raw_list.append(ze)  
+        for _ in range(self.z_capacity):
+            self.zi_raw_list.append(self.static_i.clone())
+            self.ze_raw_list.append(self.static_e.clone())
         self.gen_z_feature()  
         self.calculate_gram_matrix()
         self.base_sim_zi = self.gram_matrix_zi[0, 0]
@@ -277,6 +304,7 @@ class LT_Module(TemplateModule):
         self.filled_idx = 0
     
     def clear(self):
+        self.filled_idx = 0
         self.fill(self.static_i, self.static_e)
 
     def throwaway_or_keep(self, curr_sims_zi, curr_sims_ze, self_sim_zi, self_sim_ze, div_scale):

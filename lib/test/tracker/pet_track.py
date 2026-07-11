@@ -1,24 +1,10 @@
-"""
-PET-Track inference tracker.
+"""PET-Track inference with causal SRBT control and protected THOR memory.
 
-Wraps the baseline inference loop and adds the C3 occlusion-aware controller,
-now driven by the unified event physical belief b_t and the learned
-MemoryPolicyHead gates (instead of hand-tuned theta_abs / theta_z thresholds):
-
-  belief = EventPhysicalBelief(event_image, roi)        # computed ONCE / frame
-  absence_prob = AbsencePredictor(belief, score, sim)
-  freeze_prob, redetect_prob = MemoryPolicyHead(belief, frozen_age, absence)
-  decision = state_machine.step(absence_prob, redetect_prob, redetect_conf, ...)
-
-When the policy gates decide the target is absent, the tracker enters FROZEN
-(memory protected + clean template snapshot) and then REDETECT (global
-re-localization guided by the event reappear prior from the belief module),
-instead of drifting forever after an occlusion.
-
-The normal TRACKING state preserves the inherited local crop/memory workflow
-while running the v8 routed model. The state machine's counters/timeouts
-(w_abs / w_re / w_fail / T_max / T_period / T_min_bg) are retained as a safety
-skeleton; only the two most brittle thresholds became learned gates.
+A real SRBT posterior selects TRACK, HOLD, or REDETECT and controls whether the
+current observation may enter short- and long-term memory. THOR therefore reads
+templates before inference and commits the current frame only after the action
+is known. Until M7 wires the posterior into the model output, the existing C3
+controller remains the compatibility path; no synthetic SRBT posterior is used.
 """
 import math
 import os
@@ -40,6 +26,10 @@ from lib.models.layers.expert_router import SparseRouteHysteresis
 from lib.models.layers.srbt_hypotheses import (
     build_hypothesis_tracker,
     crop_cxcywh_to_image_xywh,
+)
+from lib.models.layers.srbt_controller import (
+    Action as BeliefAction,
+    build_belief_controller,
 )
 from lib.utils.route_motion import ROUTE_MOTION_DIM, causal_route_motion_cues
 
@@ -95,6 +85,8 @@ class PETTrack(BaseTracker):
         network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu')['net'], strict=False)
         self.cfg = params.cfg
         self.hypothesis_tracker = build_hypothesis_tracker(self.cfg)
+        self.belief_controller = build_belief_controller(self.cfg)
+        self._srbt_last_action = BeliefAction.TRACK
         self._redetect_hypotheses = None
         self.network = network.cuda()
         self.network.eval()
@@ -200,6 +192,8 @@ class PETTrack(BaseTracker):
                 self._seed_event_belief(
                     event_template, info['init_bbox'], resize_factor)
             self.state_machine.reset()
+            self.belief_controller.reset()
+            self._srbt_last_action = BeliefAction.TRACK
             self.route_hysteresis.reset()
             # Reset accepted-candidate/redetect cues for the new sequence.
             self._last_score_peak = 0.0
@@ -296,15 +290,7 @@ class PETTrack(BaseTracker):
                              raw_stats, route_motion, resize_factor,
                              height, width, info):
         """Run the train-compatible local path without committing its box."""
-        previous_output = info.get('previous_output', {}) if info else {}
-        if not previous_output:
-            dynamic_zi, dynamic_ze = self.thor_wrapper.update(
-                self.static_zi, self.static_ze, 1)
-        else:
-            dynamic_zi, dynamic_ze = self.thor_wrapper.update(
-                previous_output['prediction_image'],
-                previous_output['prediction_event_image'],
-                previous_output['pred_score'])
+        dynamic_zi, dynamic_ze = self.thor_wrapper.begin_frame()
         self.dynamic_zi, self.dynamic_ze = dynamic_zi, dynamic_ze
 
         out_dict = self.network.inference(
@@ -347,6 +333,9 @@ class PETTrack(BaseTracker):
             "tail_router_confidence": (
                 float(tail_router_confidence.flatten()[0].item())
                 if tail_router_confidence is not None else -1.0),
+            "srbt_posterior": out_dict.get("srbt_posterior"),
+            "srbt_best_hypothesis": out_dict.get("srbt_best_hypothesis"),
+            "memory_frame_open": True,
         }
 
     def get_update_count(self):
@@ -354,6 +343,39 @@ class PETTrack(BaseTracker):
 
     def get_sample_count(self):
         return self.thor_wrapper.get_sample_count()
+
+    def _step_srbt_controller(self, local_candidate):
+        if local_candidate is None:
+            return None
+        posterior = local_candidate.get("srbt_posterior")
+        if posterior is None:
+            return None
+        return self.belief_controller.step(
+            posterior,
+            local_candidate.get("srbt_best_hypothesis"),
+            self.frame_id,
+        )
+
+    @staticmethod
+    def _should_update_event_background(
+            srbt_control, use_train_compatible_policy, state_machine_state):
+        if srbt_control is not None:
+            return False
+        return (
+            not use_train_compatible_policy
+            and state_machine_state == State.FROZEN
+        )
+
+    def _resolve_tracking_state(self, local_state, height, width,
+                                srbt_recovered):
+        if not srbt_recovered or self._pending_redetect_box is None:
+            return local_state
+        recovered_state = clip_box(
+            self._pending_redetect_box, height, width, margin=10)
+        self._pending_redetect_box = None
+        self._redetect_hypotheses = None
+        self._last_redetect_conf = 0.0
+        return recovered_state
 
     def track(self, image, event_image, info: dict = None):
         self.frame_id += 1
@@ -406,53 +428,77 @@ class PETTrack(BaseTracker):
                     search, event_search, belief_embed, raw_stats,
                     route_motion, resize_factor, H, W, info)
 
-            current_score = (
-                local_candidate["score_peak"]
-                if local_candidate is not None else self._last_score_peak)
-            current_sim = (
-                local_candidate["sim_zx"]
-                if local_candidate is not None else self._last_sim_zx)
-            frozen_age = (
-                float(self.state_machine.frames_in_frozen) / self.t_max
-                if not self.use_train_compatible_policy else 0.0)
-            policy = self._predict_c3_policy(
-                belief_embed,
-                raw_stats,
-                score_peak=local_candidate["score_peak"]
-                if local_candidate is not None else current_score,
-                sim_zx=local_candidate["sim_zx"]
-                if local_candidate is not None else current_sim,
-                frozen_age=frozen_age,
-            )
-            absence_prob = policy["absence_prob"]
-            freeze_prob = policy["freeze_prob"]
-            redetect_prob = policy["redetect_prob"]
+            srbt_control = self._step_srbt_controller(local_candidate)
 
-            if self.use_train_compatible_policy:
+            if srbt_control is not None:
+                posterior = local_candidate["srbt_posterior"]
+                absence_prob = float(posterior["state_prob"][0, 2].item())
+                redetect_prob = float(posterior["hazard"][0, :8].sum().item())
+                freeze_prob = None
                 redetect_signal = redetect_prob
-                decision = {"action": "track", "enter_frozen": False,
-                            "enter_redetect": False,
-                            "exit_to_tracking": False}
+                previous_action = self._srbt_last_action
+                current_action = srbt_control.action
+                decision = {
+                    "action": current_action.value,
+                    "enter_frozen": (
+                        previous_action is BeliefAction.TRACK
+                        and current_action is not BeliefAction.TRACK),
+                    "enter_redetect": (
+                        previous_action is not BeliefAction.REDETECT
+                        and current_action is BeliefAction.REDETECT),
+                    "exit_to_tracking": (
+                        previous_action is not BeliefAction.TRACK
+                        and current_action is BeliefAction.TRACK),
+                }
+                self._srbt_last_action = current_action
             else:
-                redetect_signal = (
-                    redetect_prob
-                    if self.state_machine.use_learned_policy
-                    else float(raw_stats[0, 5].item())
-                    if raw_stats is not None else 0.0)
-                decision = self.state_machine.step(
-                    absence_prob, redetect_signal,
-                    redetect_conf=self._last_redetect_conf,
-                    history_ready=history_ready, freeze_prob=freeze_prob)
+                current_score = (
+                    local_candidate["score_peak"]
+                    if local_candidate is not None else self._last_score_peak)
+                current_sim = (
+                    local_candidate["sim_zx"]
+                    if local_candidate is not None else self._last_sim_zx)
+                frozen_age = (
+                    float(self.state_machine.frames_in_frozen) / self.t_max
+                    if not self.use_train_compatible_policy else 0.0)
+                policy = self._predict_c3_policy(
+                    belief_embed,
+                    raw_stats,
+                    score_peak=local_candidate["score_peak"]
+                    if local_candidate is not None else current_score,
+                    sim_zx=local_candidate["sim_zx"]
+                    if local_candidate is not None else current_sim,
+                    frozen_age=frozen_age,
+                )
+                absence_prob = policy["absence_prob"]
+                freeze_prob = policy["freeze_prob"]
+                redetect_prob = policy["redetect_prob"]
+                if self.use_train_compatible_policy:
+                    redetect_signal = redetect_prob
+                    decision = {"action": "track", "enter_frozen": False,
+                                "enter_redetect": False,
+                                "exit_to_tracking": False}
+                else:
+                    redetect_signal = (
+                        redetect_prob
+                        if self.state_machine.use_learned_policy
+                        else float(raw_stats[0, 5].item())
+                        if raw_stats is not None else 0.0)
+                    decision = self.state_machine.step(
+                        absence_prob, redetect_signal,
+                        redetect_conf=self._last_redetect_conf,
+                        history_ready=history_ready, freeze_prob=freeze_prob)
             action = decision["action"]
 
             # Query-before-commit: the frame that enters FROZEN contributes
             # neither its event observation nor its rejected local bbox.
             if (self.network.event_belief is not None
-                    and (self.use_train_compatible_policy
+                    and ((srbt_control is None
+                          and self.use_train_compatible_policy)
                          or action == "track")):
                 self._commit_event_belief(event_search, roi)
 
-            if (not self.use_train_compatible_policy
+            if ((srbt_control is not None or not self.use_train_compatible_policy)
                     and decision["enter_frozen"]):
                 self.thor_wrapper.freeze(True)
                 self.thor_wrapper.snapshot_clean(
@@ -463,9 +509,18 @@ class PETTrack(BaseTracker):
                         self.network.event_belief.energy_map(
                             event_search.squeeze(0)))
 
-            if (not self.use_train_compatible_policy
-                    and self.network.event_belief is not None
-                    and self.state_machine.state == State.FROZEN):
+            if (srbt_control is not None and decision["exit_to_tracking"]):
+                self.thor_wrapper.resume()
+                if self.network.event_belief is not None:
+                    self.network.event_belief.freeze_history(False)
+
+            should_update_background = self._should_update_event_background(
+                srbt_control,
+                self.use_train_compatible_policy,
+                self.state_machine.state,
+            )
+            if (should_update_background
+                    and self.network.event_belief is not None):
                 self.network.event_belief.update_background(
                     self.network.event_belief.energy_map(
                         event_search.squeeze(0)))
@@ -500,8 +555,16 @@ class PETTrack(BaseTracker):
                 if local_candidate is None:
                     raise RuntimeError(
                         "tracking action requires a current local candidate")
-                self.state = local_candidate["state"]
-                pred_score = local_candidate["score_peak"]
+                self.state = self._resolve_tracking_state(
+                    local_candidate["state"], H, W,
+                    srbt_recovered=(
+                        srbt_control is not None
+                        and decision["exit_to_tracking"]),
+                )
+                pred_score = (
+                    float(srbt_control.output_score)
+                    if srbt_control is not None
+                    else local_candidate["score_peak"])
                 response = local_candidate["response"]
                 self._last_score_peak = pred_score
                 self._last_sim_zx = local_candidate["sim_zx"]
@@ -520,7 +583,11 @@ class PETTrack(BaseTracker):
                 if red_out is not None:
                     box, conf = self._update_redetect_hypotheses(red_out)
                     self._last_redetect_conf = conf
-                    if conf > self.state_machine.theta_re and box is not None:
+                    accepted = (
+                        box is not None
+                        and (srbt_control is not None
+                             or conf > self.state_machine.theta_re))
+                    if accepted:
                         self._pending_redetect_box = box
                     else:
                         self._pending_redetect_box = None
@@ -542,14 +609,35 @@ class PETTrack(BaseTracker):
                     is_absent = False
                     pred_score = self._last_redetect_conf
 
-        # Build the prediction patch for the next frame's template update.
+        # The current observation is committed only after its action is known.
         tracking_result_arr, tracking_result_event_arr, _, tracking_result_amask_arr = sample_target(
             im=image, eim=event_image, target_bb=self.state,
             search_area_factor=self.params.template_factor, output_sz=self.params.template_size)
         prediction_image = self.preprocessor.process(tracking_result_arr, tracking_result_amask_arr).tensors
         prediction_event_image = self.preprocessor.process(tracking_result_event_arr, tracking_result_amask_arr).tensors
-        if (action == "track" and not skip_frame and not is_absent
-                and pred_score >= float(self.cfg.TEST.SCORE_THRESHOLD)):
+        if srbt_control is not None:
+            allow_recent_write = (
+                srbt_control.allow_recent_write
+                and action == "track" and not skip_frame and not is_absent)
+            allow_long_write = (
+                srbt_control.allow_long_write and allow_recent_write)
+        else:
+            allow_recent_write = (
+                action == "track" and not skip_frame and not is_absent
+                and pred_score >= float(self.cfg.TEST.SCORE_THRESHOLD))
+            allow_long_write = allow_recent_write
+
+        memory_frame_open = bool(
+            local_candidate is not None
+            and local_candidate.get("memory_frame_open", False))
+        if memory_frame_open:
+            self.thor_wrapper.commit(
+                prediction_image, prediction_event_image, pred_score,
+                allow_recent_write=allow_recent_write,
+                allow_long_write=allow_long_write,
+            )
+
+        if allow_recent_write:
             self._last_trusted_zi = prediction_image.detach().clone()
             self._last_trusted_ze = prediction_event_image.detach().clone()
 
@@ -570,10 +658,14 @@ class PETTrack(BaseTracker):
                 "response": response if action == "track" else None,
                 "pred_score": pred_score,
                 "absent": is_absent,
+                "allow_recent_write": bool(allow_recent_write),
+                "allow_long_write": bool(allow_long_write),
                 "c3_debug": {
                     "frame_id": int(self.frame_id),
                     "action": str(action),
-                    "state": getattr(self.state_machine.state, "name", str(self.state_machine.state)),
+                    "state": (srbt_control.action.name if srbt_control is not None else
+                              getattr(self.state_machine.state, "name", str(self.state_machine.state))),
+                    "srbt_controller_active": int(srbt_control is not None),
                     "absence_prob": float(absence_prob),
                     "freeze_prob": -1.0 if freeze_prob is None else float(freeze_prob),
                     "redetect_prob": float(redetect_prob),
