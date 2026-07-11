@@ -237,6 +237,15 @@ class HeterogeneousTail(nn.Module):
         return output
 
 
+def build_evidence_adapters(embed_dim, num_heads):
+    """Build the three existing residual paths reused by SRBT evidence."""
+    return nn.ModuleDict({
+        "motion": EventMotionAdapter(embed_dim),
+        "detail": HighResDetailAdapter(embed_dim),
+        "cross": CrossAttentionAdapter(embed_dim, num_heads=num_heads),
+    })
+
+
 def build_heterogeneous_tail(cfg, embed_dim, num_heads):
     tail_cfg = getattr(cfg.MODEL, "HETEROGENEOUS_TAIL", None)
     tail_depth = int(getattr(tail_cfg, "DEPTH", 3)) if tail_cfg else 3

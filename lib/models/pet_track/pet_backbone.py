@@ -72,7 +72,7 @@ class PETBackBone(VisionTransformer):
 
     def forward(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe,
                 mask_z=None, mask_x=None, ce_template_mask=None, ce_keep_rate=None, 
-                return_last_attn=False):
+                return_last_attn=False, return_srbt_taps=False):
         lens_z = static_zi.size(1) + static_ze.size(1) + dynamic_zi.size(1) + dynamic_ze.size(1)
         lens_x = xi.size(1) + xe.size(1)
         x = torch.cat((static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe), dim=1)
@@ -81,12 +81,22 @@ class PETBackBone(VisionTransformer):
         self.amah_sp_dict = {}
         self.amah_sp_idx = 0
         self.amah_hop_idx = 0
+        detail_tokens = None
+        identity_tokens = None
+        detail_layer = min(3, len(self.blocks) - 1)
         for i, blk in enumerate(self.blocks):
             x, attn = blk(x, lens_z=lens_z, lens_x=lens_x)
             x = self._amah(x, i, lens_z)
+            if return_srbt_taps and i == detail_layer:
+                detail_tokens = x
+            if return_srbt_taps and i in self.amah_layers:
+                identity_tokens = x
         x = self.norm(x)  
 
         aux_dict = {"attn": attn,}
+        if return_srbt_taps:
+            aux_dict["detail_tokens"] = detail_tokens if detail_tokens is not None else x
+            aux_dict["identity_tokens"] = identity_tokens if identity_tokens is not None else x
         return x, aux_dict
 
 

@@ -128,6 +128,16 @@ cfg.MODEL.HETEROGENEOUS_TAIL.ENABLE = False
 cfg.MODEL.HETEROGENEOUS_TAIL.DEPTH = 3     # pre-tail router tap depth
 cfg.MODEL.HETEROGENEOUS_TAIL.DROP_PATH = 0.1  # native-tail compatibility field
 
+# MODEL.SRBT.EVIDENCE (candidate-level multimodal likelihood composition)
+cfg.MODEL.SRBT = edict()
+cfg.MODEL.SRBT.ENABLE = False
+cfg.MODEL.SRBT.EVIDENCE = edict()
+cfg.MODEL.SRBT.EVIDENCE.STATE_DIM = 32
+cfg.MODEL.SRBT.EVIDENCE.QUALITY_DIM = 16
+cfg.MODEL.SRBT.EVIDENCE.GATE_HIDDEN_DIM = 128
+cfg.MODEL.SRBT.EVIDENCE.GATE_EPSILON = 1.0
+cfg.MODEL.SRBT.EVIDENCE.POOL_SIZE = 3
+
 # EVENT_TRIGGER (optional diagnostic asynchronous inference; disabled in v8)
 # When the global event density rho is below THETA_LOW, the scene is judged
 # static and the tracker REUSES the last frame's box (skip the heavy forward)
