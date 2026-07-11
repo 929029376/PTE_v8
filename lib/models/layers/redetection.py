@@ -50,7 +50,8 @@ class RedetectionExpert(nn.Module):
 
     def __init__(self, inplanes=768, channel=256, feat_sz=20, stride=16,
                  lambda_H: float = 1.0, use_prior_gate: bool = True,
-                 identity_dim: int = 64, k_max: int = 5):
+                 identity_dim: int = 64, k_max: int = 5,
+                 cumulative_mass: float = 0.9):
         super().__init__()
         self.feat_sz = feat_sz
         self.stride = stride
@@ -58,6 +59,7 @@ class RedetectionExpert(nn.Module):
         self.use_prior_gate = use_prior_gate
         self.identity_dim = int(identity_dim)
         self.k_max = int(k_max)
+        self.cumulative_mass = float(cumulative_mass)
 
         # Project backbone features to the head's channel space.
         self.adapter = nn.Sequential(
@@ -70,9 +72,6 @@ class RedetectionExpert(nn.Module):
                                     feat_sz=feat_sz, stride=stride)
         self.template_proj = nn.Linear(inplanes, channel)
         self.template_scale = nn.Parameter(torch.zeros(()))
-        self.candidate_head = nn.Conv2d(channel, 1, kernel_size=1)
-        self.identity_head = nn.Conv2d(
-            channel, self.identity_dim, kernel_size=1)
 
         # Optional learned gate to weight the prior. Input: 2 channels
         # (score, prior) -> 1 channel gate in [0,1].
@@ -135,8 +134,14 @@ class RedetectionExpert(nn.Module):
                 score = raw_score * (1.0 + self.lambda_H * H)
 
         field = score.clamp(0.0, 1.0)
-        candidate_map = torch.sigmoid(self.candidate_head(x))
-        identity_map = F.normalize(self.identity_head(x), dim=1, eps=1e-8)
+        candidate_map = raw_score
+        identity_features = x[:, :self.identity_dim]
+        if identity_features.shape[1] < self.identity_dim:
+            padding = x.new_zeros(
+                x.shape[0], self.identity_dim - identity_features.shape[1],
+                *x.shape[-2:])
+            identity_features = torch.cat((identity_features, padding), dim=1)
+        identity_map = F.normalize(identity_features, dim=1, eps=1e-8)
         hypotheses = extract_hypotheses(
             field,
             candidate_map,
@@ -144,9 +149,22 @@ class RedetectionExpert(nn.Module):
             offset_map,
             identity_map,
             k_max=self.k_max,
+            cumulative_mass=self.cumulative_mass,
         )
         bbox = hypotheses["boxes"][:, 0]
-        conf = hypotheses["scores"][:, 0]
+        if gt_score_map is not None:
+            gt_field = gt_score_map
+            if gt_field.ndim == 3:
+                gt_field = gt_field.unsqueeze(1)
+            bbox = extract_hypotheses(
+                gt_field,
+                torch.ones_like(gt_field),
+                size_map,
+                offset_map,
+                identity_map,
+                k_max=1,
+            )["boxes"][:, 0]
+        conf = field.flatten(1).max(dim=1).values
         out = {
             "field": field,
             "candidate_map": candidate_map,
@@ -192,7 +210,10 @@ def build_redetection_expert(cfg, embed_dim):
     hypotheses_cfg = getattr(srbt_cfg, "HYPOTHESES", None) if srbt_cfg else None
     identity_dim = int(getattr(hypotheses_cfg, "IDENTITY_DIM", 64)) if hypotheses_cfg else 64
     k_max = int(getattr(hypotheses_cfg, "K_MAX", 5)) if hypotheses_cfg else 5
+    cumulative_mass = float(getattr(
+        hypotheses_cfg, "CUMULATIVE_MASS", 0.9)) if hypotheses_cfg else 0.9
     return RedetectionExpert(inplanes=embed_dim, channel=channel, feat_sz=feat_sz,
                              stride=stride, lambda_H=lambda_H,
                              use_prior_gate=use_prior_gate,
-                             identity_dim=identity_dim, k_max=k_max)
+                             identity_dim=identity_dim, k_max=k_max,
+                             cumulative_mass=cumulative_mass)

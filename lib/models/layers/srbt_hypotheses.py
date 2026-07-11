@@ -103,6 +103,8 @@ def extract_hypotheses(field, candidate_map, size_map, offset_map,
     gathered_identity = F.normalize(
         _gather_map(identity_map, indices), dim=-1, eps=1e-8
     )
+    field_scores = _gather_map(field, indices).squeeze(-1)
+    candidate_scores = _gather_map(candidate_map, indices).squeeze(-1)
     x = (indices % width).to(field.dtype)
     y = torch.div(indices, width, rounding_mode="floor").to(field.dtype)
     boxes = torch.stack((
@@ -116,6 +118,8 @@ def extract_hypotheses(field, candidate_map, size_map, offset_map,
         "boxes": boxes,
         "scores": scores,
         "weights": scores,
+        "field_scores": field_scores,
+        "candidate_scores": candidate_scores,
         "posterior": posterior,
         "identity": gathered_identity,
         "indices": indices,
@@ -199,7 +203,8 @@ class HypothesisTracker:
             if boxes.shape[0] != 1:
                 raise ValueError("HypothesisTracker updates one sequence at a time")
             boxes = boxes[0]
-        weights = state.get("scores", state.get("weights"))
+        weights = state.get(
+            "field_scores", state.get("scores", state.get("weights")))
         identity = state["identity"]
         if batched:
             weights = weights[0]
@@ -232,6 +237,7 @@ class HypothesisTracker:
         }
 
     @staticmethod
+    @torch.no_grad()
     def _optimal_matches(cost, valid):
         previous_count, observed_count = cost.shape
         max_matches = min(previous_count, observed_count)
@@ -413,3 +419,22 @@ class HypothesisTracker:
             "active_mask": active_mask,
             "active_count": active_count,
         }
+
+
+def build_hypothesis_tracker(cfg):
+    hypotheses = cfg.MODEL.SRBT.HYPOTHESES
+    return HypothesisTracker(
+        k_max=int(hypotheses.K_MAX),
+        cumulative_mass=float(hypotheses.CUMULATIVE_MASS),
+        identity_cost=float(hypotheses.IDENTITY_COST),
+        box_cost=float(hypotheses.BOX_COST),
+        min_identity=float(hypotheses.MIN_IDENTITY),
+        max_center_distance=float(hypotheses.MAX_CENTER_DISTANCE),
+        merge_iou=float(hypotheses.MERGE_IOU),
+        merge_identity=float(hypotheses.MERGE_IDENTITY),
+        previous_weight=float(hypotheses.PREVIOUS_WEIGHT),
+        observation_weight=float(hypotheses.OBSERVATION_WEIGHT),
+        miss_decay=float(hypotheses.MISS_DECAY),
+        min_weight=float(hypotheses.MIN_WEIGHT),
+        max_age=int(hypotheses.MAX_AGE),
+    )

@@ -37,6 +37,10 @@ from lib.utils.ce_utils import generate_mask_cond, generate_mask_z
 from lib.models.layers.thor import THOR_Wrapper
 from lib.models.layers.state_machine import OcclusionStateMachine, State
 from lib.models.layers.expert_router import SparseRouteHysteresis
+from lib.models.layers.srbt_hypotheses import (
+    build_hypothesis_tracker,
+    crop_cxcywh_to_image_xywh,
+)
 from lib.utils.route_motion import ROUTE_MOTION_DIM, causal_route_motion_cues
 
 
@@ -90,6 +94,8 @@ class PETTrack(BaseTracker):
         network = build_pet_track(params.cfg, training=False)
         network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu')['net'], strict=False)
         self.cfg = params.cfg
+        self.hypothesis_tracker = build_hypothesis_tracker(self.cfg)
+        self._redetect_hypotheses = None
         self.network = network.cuda()
         self.network.eval()
         self.preprocessor = Preprocessor()
@@ -162,7 +168,6 @@ class PETTrack(BaseTracker):
         self.redetect_factor = float(getattr(
             redetect_cfg, "TRAIN_SEARCH_FACTOR", 8.0
         )) if redetect_cfg is not None else 8.0
-        self.redetect_size = int(getattr(redetect_cfg, "FEAT_SZ", 12)) if redetect_cfg is not None else 12
 
     def initialize(self, image, event_image, info: dict, idx=0):
         z_patch_arr, event_z_patch_arr, resize_factor, z_amask_arr = sample_target(
@@ -202,6 +207,7 @@ class PETTrack(BaseTracker):
             self._last_redetect_conf = 0.0
             self._last_redetect_error = ""
             self._pending_redetect_box = None
+            self._redetect_hypotheses = None
             self._skip_count = 0
 
         self.state = info['init_bbox']
@@ -449,6 +455,7 @@ class PETTrack(BaseTracker):
             if (not self.use_train_compatible_policy
                     and decision["enter_frozen"]):
                 self._pending_redetect_box = None
+                self._redetect_hypotheses = None
                 self._last_redetect_conf = 0.0
                 self.thor_wrapper.freeze(True)
                 self.thor_wrapper.snapshot_clean(
@@ -512,15 +519,10 @@ class PETTrack(BaseTracker):
                 # Run GLOBAL redetection using the clean template + event prior.
                 red_out = self._run_redetection(image, event_image, H, W)
                 if red_out is not None:
-                    conf = float(red_out["conf"].item())
+                    box, conf = self._update_redetect_hypotheses(red_out)
                     self._last_redetect_conf = conf
-                    if conf > self.state_machine.theta_re:
-                        box = self._decode_redetect_box(red_out, H, W)
-                        if box is not None:
-                            self._pending_redetect_box = box
-                        else:
-                            self._last_redetect_conf = 0.0
-                            self._pending_redetect_box = None
+                    if conf > self.state_machine.theta_re and box is not None:
+                        self._pending_redetect_box = box
                     else:
                         self._pending_redetect_box = None
                 else:
@@ -579,6 +581,12 @@ class PETTrack(BaseTracker):
                     "redetect_signal": float(redetect_signal),
                     "redetect_conf": float(self._last_redetect_conf),
                     "redetect_error": str(self._last_redetect_error),
+                    "redetect_hypothesis_count": (
+                        0 if self._redetect_hypotheses is None else
+                        int(self._redetect_hypotheses["active_count"])),
+                    "redetect_hypothesis_weights": (
+                        [] if self._redetect_hypotheses is None else
+                        self._redetect_hypotheses["posterior"].detach().cpu().tolist()),
                     "history_ready": int(bool(history_ready)),
                     "rho_global": float(rho_global),
                     "skip_frame": int(bool(skip_frame)),
@@ -675,18 +683,31 @@ class PETTrack(BaseTracker):
 
     def _decode_redetect_box(self, red_out, H, W):
         """Map the redetect head's normalized box back to image coords."""
-        bbox = red_out['bbox'][0]  # cxcywh normalized in [0,1]
-        cx, cy, w, h = bbox.tolist()
+        bbox = red_out['bbox'][0]
         rd_resize = red_out.get('_resize_factor', 1.0)
         ps = red_out.get('_patch_size', self.params.search_size)
-        # The redetect crop is image-centered in both training and test.
         cx_prev, cy_prev = red_out.get('_crop_center', (0.5 * W, 0.5 * H))
-        half_side = 0.5 * ps / rd_resize
-        cx_real = cx * ps / rd_resize + (cx_prev - half_side)
-        cy_real = cy * ps / rd_resize + (cy_prev - half_side)
-        w_real = w * ps / rd_resize
-        h_real = h * ps / rd_resize
-        return [cx_real - 0.5 * w_real, cy_real - 0.5 * h_real, w_real, h_real]
+        return crop_cxcywh_to_image_xywh(
+            bbox, rd_resize, ps, (cx_prev, cy_prev)).tolist()
+
+    def _update_redetect_hypotheses(self, red_out):
+        observed = red_out.get("hypotheses")
+        if observed is None:
+            raise RuntimeError("redetection output is missing hypotheses")
+        state = self.hypothesis_tracker.update(
+            self._redetect_hypotheses, observed)
+        self._redetect_hypotheses = state
+        if state["active_count"] == 0:
+            return None, 0.0
+        rd_resize = red_out.get("_resize_factor", 1.0)
+        patch_size = red_out.get("_patch_size", self.params.search_size)
+        crop_center = red_out.get("_crop_center")
+        if crop_center is None:
+            raise RuntimeError("redetection output is missing crop center")
+        box = crop_cxcywh_to_image_xywh(
+            state["boxes"][0], rd_resize, patch_size, crop_center).tolist()
+        confidence = float(state["weights"][0].clamp(0.0, 1.0).item())
+        return box, confidence
 
     def _compute_sim_zx_inference(self, out_dict):
         """Cosine similarity between template and search token features at

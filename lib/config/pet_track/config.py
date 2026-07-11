@@ -113,8 +113,10 @@ cfg.MODEL.MEMORY_POLICY.GATE_THRESH = 0.5   # gate value above this triggers a t
 
 # MODEL.REDETECT  (redetection expert)
 cfg.MODEL.REDETECT = edict()
-cfg.MODEL.REDETECT.FEAT_SZ = 12            # global search grid size
-cfg.MODEL.REDETECT.STRIDE = 32             # global search stride
+# Legacy v8 config keys remain parseable until M7 removes generated route
+# configs. SRBT redetection derives its grid from the actual backbone tokens.
+cfg.MODEL.REDETECT.FEAT_SZ = 12
+cfg.MODEL.REDETECT.STRIDE = 32
 cfg.MODEL.REDETECT.LAMBDA_H = 1.0          # weight of the event reappear prior
 cfg.MODEL.REDETECT.USE_TEMPLATE_CONDITIONING = True
 cfg.MODEL.REDETECT.USE_PRIOR_GATE = True   # gate architecture when a trained prior is enabled

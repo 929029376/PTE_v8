@@ -1,11 +1,14 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
 from lib.models.layers.redetection import RedetectionExpert
 from lib.models.layers.srbt_hypotheses import (
     HypothesisTracker,
+    build_hypothesis_tracker,
     extract_hypotheses,
 )
+from lib.test.tracker.pet_track import PETTrack
 
 
 def _maps(size=8, identity_dim=4):
@@ -149,7 +152,35 @@ def test_redetection_uses_actual_token_grid_and_returns_srbt_maps():
     assert output["identity_map"].shape == (2, 6, 16, 16)
     assert output["hypotheses"]["boxes"].shape == (2, 5, 4)
     assert output["score_map"].data_ptr() == output["field"].data_ptr()
+    assert output["candidate_map"].data_ptr() == output["raw_score"].data_ptr()
     assert torch.allclose(output["bbox"], output["hypotheses"]["boxes"][:, 0])
+    assert torch.allclose(output["conf"], output["field"].flatten(1).max(dim=1).values)
+    assert not any(
+        name.startswith(("candidate_head.", "identity_head."))
+        for name in model.state_dict()
+    )
+
+
+def test_gt_score_map_controls_compatibility_bbox_without_changing_hypotheses(monkeypatch):
+    model = RedetectionExpert(
+        inplanes=4, channel=8, feat_sz=4, stride=16, identity_dim=4).eval()
+    raw = torch.zeros(1, 1, 4, 4)
+    raw[0, 0, 0, 0] = 0.9
+    size_map = torch.full((1, 2, 4, 4), 0.2)
+    offset_map = torch.full((1, 2, 4, 4), 0.5)
+    monkeypatch.setattr(
+        model.head, "get_score_map",
+        lambda _x: (raw, size_map, offset_map),
+    )
+    gt_score_map = torch.zeros(1, 4, 4)
+    gt_score_map[0, 3, 3] = 1.0
+
+    with torch.no_grad():
+        output = model(torch.randn(1, 4, 4, 4), gt_score_map=gt_score_map)
+
+    assert output["hypotheses"]["indices"][0, 0].item() == 0
+    assert torch.allclose(
+        output["bbox"][0], torch.tensor([0.875, 0.875, 0.2, 0.2]))
 
 
 def test_selected_hypothesis_keeps_all_five_prediction_paths_trainable():
@@ -283,3 +314,78 @@ def test_tracker_keeps_age_32_and_prunes_only_after_it_is_exceeded():
 
     assert updated["age"].tolist() == [32]
     assert updated["weights"][0].item() == pytest.approx(0.68)
+
+
+def test_config_builder_applies_every_lifecycle_threshold():
+    hypotheses = SimpleNamespace(
+        K_MAX=4,
+        CUMULATIVE_MASS=0.8,
+        IDENTITY_COST=0.55,
+        BOX_COST=0.45,
+        MIN_IDENTITY=0.3,
+        MAX_CENTER_DISTANCE=0.4,
+        MERGE_IOU=0.65,
+        MERGE_IDENTITY=0.75,
+        PREVIOUS_WEIGHT=0.6,
+        OBSERVATION_WEIGHT=0.4,
+        MISS_DECAY=0.7,
+        MIN_WEIGHT=0.1,
+        MAX_AGE=12,
+    )
+    cfg = SimpleNamespace(
+        MODEL=SimpleNamespace(SRBT=SimpleNamespace(HYPOTHESES=hypotheses)))
+
+    tracker = build_hypothesis_tracker(cfg)
+
+    assert tracker.k_max == 4
+    assert tracker.cumulative_mass == pytest.approx(0.8)
+    assert tracker.identity_cost == pytest.approx(0.55)
+    assert tracker.box_cost == pytest.approx(0.45)
+    assert tracker.min_identity == pytest.approx(0.3)
+    assert tracker.max_center_distance == pytest.approx(0.4)
+    assert tracker.merge_iou == pytest.approx(0.65)
+    assert tracker.merge_identity == pytest.approx(0.75)
+    assert tracker.previous_weight == pytest.approx(0.6)
+    assert tracker.observation_weight == pytest.approx(0.4)
+    assert tracker.miss_decay == pytest.approx(0.7)
+    assert tracker.min_weight == pytest.approx(0.1)
+    assert tracker.max_age == 12
+
+
+def test_inference_tracker_keeps_cross_frame_hypothesis_state_and_maps_best_box():
+    tracker = object.__new__(PETTrack)
+    tracker.hypothesis_tracker = HypothesisTracker(k_max=5)
+    tracker._redetect_hypotheses = None
+    tracker.params = SimpleNamespace(search_size=256)
+    field, candidate, size_map, offset_map, identity_map = _maps(
+        size=8, identity_dim=2)
+    field[0, 0, 2, 2] = 0.9
+    identity_map[0, :, 2, 2] = torch.tensor([1.0, 0.0])
+    red_out = {
+        "field": field,
+        "hypotheses": extract_hypotheses(
+            field, candidate, size_map, offset_map, identity_map, k_max=5),
+        "_resize_factor": 2.0,
+        "_patch_size": 256,
+        "_crop_center": (200.0, 150.0),
+    }
+
+    first_box, first_conf = PETTrack._update_redetect_hypotheses(
+        tracker, red_out)
+    first_state = tracker._redetect_hypotheses
+    field_next = field.clone()
+    field_next.zero_()
+    field_next[0, 0, 2, 3] = 0.8
+    identity_map[0, :, 2, 3] = torch.tensor([1.0, 0.0])
+    red_out["field"] = field_next
+    red_out["hypotheses"] = extract_hypotheses(
+        field_next, candidate, size_map, offset_map, identity_map, k_max=5)
+    second_box, second_conf = PETTrack._update_redetect_hypotheses(
+        tracker, red_out)
+
+    assert first_state["boxes"].shape[0] == 1
+    assert tracker._redetect_hypotheses["boxes"].shape[0] == 1
+    assert tracker._redetect_hypotheses["velocity"][0, 0] > 0
+    assert first_box != second_box
+    assert first_conf == pytest.approx(0.9)
+    assert second_conf == pytest.approx(0.87)
