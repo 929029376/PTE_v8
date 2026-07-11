@@ -21,6 +21,8 @@ This module is importable / constructible without a GPU (lazy .cuda() in the
 training script), and it is exercised by tests/test_pet_track_model.py.
 """
 import os
+from collections.abc import Mapping
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -88,8 +90,11 @@ class PETTrack(nn.Module):
             if pet_cfg is not None else True
         self.use_learned_policy = bool(getattr(pet_cfg, "USE_LEARNED_POLICY", True)) \
             if pet_cfg is not None else True
-        self.use_memory_policy = self.use_learned_policy and \
-            bool(getattr(pet_cfg, "MEMORY_POLICY", True)) if pet_cfg is not None else False
+        self.use_memory_policy = (
+            self.pet_enabled
+            and self.use_learned_policy
+            and bool(getattr(pet_cfg, "MEMORY_POLICY", True))
+        )
 
         embed_dim = transformer.embed_dim
         # The belief dimension is read once and shared by all consumers.
@@ -968,35 +973,80 @@ def build_pet_track(cfg, training=True):
 
 def _load_filtered_baseline_checkpoint(model, checkpoint_path):
     checkpoint_path = os.path.expanduser(checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    source = checkpoint.get("net", checkpoint)
-    target = model.state_dict()
-    pet_prefixes = (
-        "expert_router.", "expert_fusion.", "hetero_tail.",
-        "event_belief.", "absence_predictor.", "memory_policy.", "redetect_expert.",
+    # Legacy AMTTrack artifacts include trainer metadata rejected by weights_only.
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
     )
-    loaded = {}
-    unexpected = []
-    mismatched = []
+    if isinstance(checkpoint, Mapping) and "net" in checkpoint:
+        source = checkpoint["net"]
+    else:
+        source = checkpoint
+    if (not isinstance(source, Mapping) or not source
+            or not all(torch.is_tensor(value) for value in source.values())):
+        raise RuntimeError(
+            f"Baseline checkpoint {checkpoint_path} does not contain a tensor state mapping"
+        )
+
+    target = model.state_dict()
+    inherited_prefixes = ("backbone.", "memory.", "box_head.")
+    normalized = {}
+    duplicate_keys = []
     for key, value in source.items():
         clean_key = key[7:] if key.startswith("module.") else key
-        if clean_key.startswith(pet_prefixes):
-            continue
-        if clean_key not in target:
-            unexpected.append(clean_key)
-            continue
-        if tuple(value.shape) != tuple(target[clean_key].shape):
-            mismatched.append(clean_key)
-            continue
-        loaded[clean_key] = value
+        if clean_key in normalized:
+            duplicate_keys.append(clean_key)
+        normalized[clean_key] = value
+
+    inherited_target_keys = {
+        key for key in target if key.startswith(inherited_prefixes)
+    }
+    source_keys = set(normalized)
+    missing_keys = sorted(inherited_target_keys - source_keys)
+    unexpected_keys = sorted(
+        key for key in source_keys
+        if key not in inherited_target_keys
+    )
+    mismatched_keys = sorted(
+        key for key in inherited_target_keys & source_keys
+        if tuple(normalized[key].shape) != tuple(target[key].shape)
+    )
+    duplicate_keys = sorted(set(duplicate_keys))
+
+    violations = []
+    if missing_keys:
+        violations.append(f"missing inherited keys: {missing_keys}")
+    if unexpected_keys:
+        violations.append(f"unexpected source keys: {unexpected_keys}")
+    if mismatched_keys:
+        violations.append(f"shape-mismatched inherited keys: {mismatched_keys}")
+    if duplicate_keys:
+        violations.append(f"duplicate normalized keys: {duplicate_keys}")
+    if violations:
+        raise RuntimeError(
+            "Baseline checkpoint contract violated:\n  " + "\n  ".join(violations)
+        )
+
+    loaded = {key: normalized[key] for key in sorted(inherited_target_keys)}
     result = model.load_state_dict(loaded, strict=False)
     missing = result.missing_keys if hasattr(result, "missing_keys") else result[0]
-    print("Baseline checkpoint load report")
-    print("  path:", checkpoint_path)
-    print("  successfully loaded parameter count:", len(loaded))
-    print("  missing PETTrack parameter names:", [k for k in missing if k.startswith(pet_prefixes)])
-    print("  unexpected baseline parameter names:", unexpected[:50])
-    print("  shape-mismatched parameter names:", mismatched[:50])
+    unexpected = result.unexpected_keys if hasattr(result, "unexpected_keys") else result[1]
+    inherited_missing = sorted(
+        key for key in missing if key.startswith(inherited_prefixes)
+    )
+    if inherited_missing or unexpected:
+        raise RuntimeError(
+            "Baseline checkpoint load violated the audited state: "
+            f"missing={inherited_missing}, unexpected={sorted(unexpected)}"
+        )
+
+    return {
+        "path": checkpoint_path,
+        "loaded_count": len(loaded),
+        "loaded_keys": sorted(loaded),
+        "missing_extension_keys": sorted(
+            key for key in missing if not key.startswith(inherited_prefixes)
+        ),
+    }
 
 
 def _print_stage_report(model):
