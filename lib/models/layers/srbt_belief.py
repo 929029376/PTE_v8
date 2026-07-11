@@ -53,8 +53,8 @@ class SemiMarkovBelief(nn.Module):
             raise ValueError("state_dim and quality_dim must be positive")
         if self.max_hazard <= 0:
             raise ValueError("max_hazard must be positive")
-        if not 1 <= self.reappearing_max_frames <= 4:
-            raise ValueError("reappearing_max_frames must be in [1, 4]")
+        if not 1 <= self.reappearing_max_frames <= 3:
+            raise ValueError("reappearing_max_frames must be in [1, 3]")
 
         allowed = torch.tensor([
             [True, True, True, False],
@@ -149,12 +149,16 @@ class SemiMarkovBelief(nn.Module):
             raise ValueError("candidate_weights must have shape (B, K)")
         if not torch.isfinite(candidate_weights).all():
             raise ValueError("candidate_weights must be finite")
+        if candidate_weights.shape[-1] == 0:
+            return candidate_weights
         nonnegative = candidate_weights.clamp_min(0)
         total = nonnegative.sum(dim=-1, keepdim=True)
+        uniform = torch.full_like(
+            nonnegative, 1.0 / candidate_weights.shape[-1])
         return torch.where(
             total > 1e-8,
             nonnegative / total.clamp_min(1e-8),
-            torch.zeros_like(nonnegative),
+            uniform,
         )
 
     @staticmethod

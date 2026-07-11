@@ -1,5 +1,6 @@
 import warnings
 
+import pytest
 import torch
 
 with warnings.catch_warnings():
@@ -50,6 +51,11 @@ def test_initialize_biases_the_joint_posterior_to_visible_duration_one():
     assert torch.allclose(posterior["hazard"].sum(dim=-1), torch.ones(2))
     assert posterior["hypothesis_weights"].shape == (2, 0)
     assert posterior["belief_embedding"].shape == (2, 32)
+
+
+def test_constructor_rejects_reappearing_segments_longer_than_three_frames():
+    with pytest.raises(ValueError, match=r"\[1, 3\]"):
+        SemiMarkovBelief(reappearing_max_frames=4)
 
 
 def test_disallowed_visible_to_reappearing_transition_stays_zero():
@@ -131,6 +137,18 @@ def test_entropy_is_normalized_and_hypothesis_weights_are_candidate_probabilitie
         posterior["entropy"]["hypothesis"][1], torch.tensor(1.0), atol=1e-6)
     for value in posterior["entropy"].values():
         assert torch.all((value >= 0) & (value <= 1))
+
+
+def test_zero_candidate_scores_fall_back_to_a_normalized_uniform_distribution():
+    model = _model()
+    previous = model.initialize(1, torch.device("cpu"), torch.float32)
+
+    posterior = _step(
+        model, previous, candidate_weights=torch.zeros(1, 3))
+
+    assert torch.allclose(
+        posterior["hypothesis_weights"], torch.full((1, 3), 1.0 / 3.0))
+    assert posterior["entropy"]["hypothesis"][0] == 1
 
 
 def test_backward_reaches_transition_and_hazard_parameters():
