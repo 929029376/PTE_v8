@@ -3,6 +3,7 @@ from torch.utils.data.distributed import DistributedSampler
 # datasets related
 from lib.train.dataset import Coesot, Fe108, VisEvent, Felt
 from lib.train.data import sampler, opencv_loader, processing, LTRLoader
+from lib.train.data.loader import HorizonBatchSampler
 import lib.train.data.transforms as tfm
 from lib.utils.misc import is_main_process
 
@@ -51,6 +52,23 @@ def names2datasets(name_list: list, settings, image_loader):
 
     return datasets
 
+
+def _build_srbt_batch_sampler(dataset, cfg, settings, training):
+    srbt_cfg = getattr(cfg.DATA, "SRBT", None)
+    if not training or not bool(getattr(srbt_cfg, "ENABLE", False)):
+        return None
+    if settings.local_rank != -1:
+        indices = DistributedSampler(dataset, shuffle=True)
+    else:
+        indices = torch.utils.data.RandomSampler(dataset)
+    return HorizonBatchSampler(
+        indices=indices,
+        batch_size=cfg.TRAIN.BATCH_SIZE,
+        horizons=srbt_cfg.HORIZONS,
+        weights=srbt_cfg.HORIZON_WEIGHTS,
+        drop_last=True,
+    )
+
 def build_dataloaders(cfg, settings):
     if cfg.DATA.TRAIN.DATASETS_NAME[0] == "FE108":
         transform_joint = tfm.Transform(tfm.ToGrayscale(probability=0.5))  # for FE108 p=0.5 else 0.05
@@ -91,13 +109,29 @@ def build_dataloaders(cfg, settings):
                                             processing=data_processing_train,
                                             frame_sample_mode=sampler_mode, train_cls=train_cls,
                                             cfg=cfg, training=True)
-    train_sampler = DistributedSampler(dataset_train) if settings.local_rank != -1 else None  # None
-    shuffle = False if settings.local_rank != -1 else True
-
-    loader_train = LTRLoader('train', dataset_train, training=True, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=shuffle,
-                             num_workers=cfg.TRAIN.NUM_WORKER, drop_last=True, stack_dim=1, sampler=train_sampler,
-                             pin_memory=getattr(cfg.TRAIN, "PIN_MEMORY", False),
-                             persistent_workers=getattr(cfg.TRAIN, "PERSISTENT_WORKERS", False))
+    train_batch_sampler = _build_srbt_batch_sampler(
+        dataset_train, cfg, settings, training=True)
+    loader_train_kwargs = {
+        "num_workers": cfg.TRAIN.NUM_WORKER,
+        "stack_dim": 1,
+        "pin_memory": getattr(cfg.TRAIN, "PIN_MEMORY", False),
+        "persistent_workers": getattr(cfg.TRAIN, "PERSISTENT_WORKERS", False),
+    }
+    if train_batch_sampler is None:
+        train_sampler = DistributedSampler(dataset_train) if settings.local_rank != -1 else None
+        loader_train_kwargs.update({
+            "batch_size": cfg.TRAIN.BATCH_SIZE,
+            "shuffle": settings.local_rank == -1,
+            "sampler": train_sampler,
+            "drop_last": True,
+        })
+    else:
+        loader_train_kwargs.update({
+            "batch_size": 1,
+            "batch_sampler": train_batch_sampler,
+        })
+    loader_train = LTRLoader(
+        'train', dataset_train, training=True, **loader_train_kwargs)
 
     dataset_val = sampler.TrackingSampler(datasets=names2datasets(cfg.DATA.VAL.DATASETS_NAME, settings, opencv_loader),
                                           p_datasets=cfg.DATA.VAL.DATASETS_RATIO,

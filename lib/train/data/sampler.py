@@ -3,6 +3,7 @@ import torch.utils.data
 import torch
 from lib.utils import TensorDict
 from lib.utils.route_motion import ROUTE_MOTION_DIM, causal_route_motion_cues
+from lib.train.data.srbt_labels import build_temporal_targets
 
 def no_processing(data):
     return data
@@ -57,6 +58,16 @@ class TrackingSampler(torch.utils.data.Dataset):
         self.training = bool(training)
         train_cfg = getattr(cfg, "TRAIN", None)
         data_cfg = getattr(cfg, "DATA", None)
+        srbt_cfg = getattr(data_cfg, "SRBT", None)
+        self.srbt_enabled = bool(getattr(srbt_cfg, "ENABLE", False))
+        self.srbt_max_hazard = int(getattr(srbt_cfg, "MAX_HAZARD", 128))
+        anchor_weights = getattr(srbt_cfg, "ANCHOR_WEIGHTS", None)
+        self.srbt_anchor_weights = {
+            "visible_to_visible": float(getattr(anchor_weights, "VISIBLE", 0.25)),
+            "visible_to_absent": float(getattr(anchor_weights, "PRESENT_TO_ABSENT", 0.25)),
+            "absent_to_absent": float(getattr(anchor_weights, "ABSENT", 0.25)),
+            "absent_to_present": float(getattr(anchor_weights, "REAPPEARING", 0.25)),
+        }
         stage = getattr(train_cfg, "STAGE", None) or getattr(train_cfg, "EXPERT_STAGE", "all")
         stage = "all" if stage in (None, "", "all") else str(stage).lower()
         self.stage = stage
@@ -75,6 +86,7 @@ class TrackingSampler(torch.utils.data.Dataset):
         }
         self.motion_causal_sampling = (
             self.training
+            and not self.srbt_enabled
             and self.stage in ("router", "all")
             and self.frame_sample_mode == "causal"
             and bool(getattr(data_cfg, "MOTION_CAUSAL_SAMPLING", False))
@@ -217,8 +229,15 @@ class TrackingSampler(torch.utils.data.Dataset):
         return ids
 
     def _c3_event_order(self):
-        events = list(self.c3_event_weights.keys())
-        weights = [max(0.0, self.c3_event_weights[event]) for event in events]
+        return self._weighted_event_order(self.c3_event_weights)
+
+    def _srbt_event_order(self):
+        return self._weighted_event_order(self.srbt_anchor_weights)
+
+    @staticmethod
+    def _weighted_event_order(event_weights):
+        events = list(event_weights.keys())
+        weights = [max(0.0, event_weights[event]) for event in events]
         order = []
         remaining = events[:]
         remaining_weights = weights[:]
@@ -403,14 +422,60 @@ class TrackingSampler(torch.utils.data.Dataset):
             if anchor_id is not None:
                 search_anno["bbox"][item_id] = seq_info_dict["bbox"][anchor_id].clone()
 
+    def _add_srbt_future_fields(self, data, dataset, seq_id, seq_info_dict,
+                                anchor, horizon):
+        present = seq_info_dict.get("absent", seq_info_dict["visible"]).to(torch.bool)
+        if "valid" in seq_info_dict:
+            present = present & seq_info_dict["valid"].to(torch.bool)
+
+        targets = build_temporal_targets(
+            present,
+            anchor=anchor,
+            horizon=horizon,
+            max_hazard=self.srbt_max_hazard,
+        )
+        valid_length = int(targets["future_valid"].sum().item())
+        future_frame_ids = list(range(anchor + 1, anchor + 1 + valid_length))
+
+        if future_frame_ids:
+            future_images, future_event_images, future_anno, _ = dataset.get_frames(
+                seq_id, future_frame_ids, seq_info_dict)
+            height, width = future_images[0].shape[:2]
+            future_masks = future_anno.get(
+                "mask", [torch.zeros((height, width))] * valid_length)
+            future_boxes = future_anno["bbox"]
+        else:
+            future_images = []
+            future_event_images = []
+            future_boxes = []
+            future_masks = []
+
+        padded_ids = torch.full((int(horizon),), -1, dtype=torch.long)
+        if future_frame_ids:
+            padded_ids[:valid_length] = torch.tensor(future_frame_ids, dtype=torch.long)
+
+        data.update({
+            "future_images": future_images,
+            "future_event_images": future_event_images,
+            "future_anno": future_boxes,
+            "future_masks": future_masks,
+            "future_frame_ids": padded_ids,
+            **targets,
+        })
+
     def __getitem__(self, index):
+        horizon = None
+        if isinstance(index, tuple):
+            if len(index) != 2:
+                raise ValueError("sample index tuples must contain (index, horizon)")
+            _, horizon = index
         if self.train_cls:
             batch_data = self.getitem_cls()
         else:
-            batch_data = self.getitem()
+            batch_data = self.getitem(horizon=horizon)
         return batch_data
 
-    def getitem(self):
+    def getitem(self, horizon=None):
         """
         returns:
             TensorDict - dict containing all the data blocks
@@ -438,7 +503,14 @@ class TrackingSampler(torch.utils.data.Dataset):
                     sampler_event_type = None
                     gap_increase = 0
                     # Sample test and train frames in a causal manner, i.e. search_frame_ids > template_frame_ids
-                    if self.c3_event_sampling and random.random() < self.c3_event_sample_prob:
+                    if self.srbt_enabled:
+                        template_frame_ids, search_frame_ids, sampler_event_type = \
+                            self._sample_c3_event_causal_frame_ids(
+                                visible,
+                                seq_info_dict,
+                                preferred_events=self._srbt_event_order(),
+                            )
+                    elif self.c3_event_sampling and random.random() < self.c3_event_sample_prob:
                         template_frame_ids, search_frame_ids, sampler_event_type = \
                             self._sample_c3_event_causal_frame_ids(visible, seq_info_dict)
                     while search_frame_ids is None:
@@ -504,6 +576,15 @@ class TrackingSampler(torch.utils.data.Dataset):
                                    'search_event_images': search_dvs_frame_list,
                                    'route_motion_cues': route_motion_cues,
                                 })
+                if horizon is not None:
+                    self._add_srbt_future_fields(
+                        data,
+                        dataset,
+                        seq_id,
+                        seq_info_dict,
+                        anchor=search_frame_ids[-1],
+                        horizon=int(horizon),
+                    )
                 self._add_presence_transition_fields(
                     data, seq_info_dict, template_frame_ids, search_frame_ids,
                     template_anno, search_anno, sampler_event_type)

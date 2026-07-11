@@ -3,6 +3,8 @@ import torch.utils.data.dataloader
 import importlib
 import collections
 import collections.abc as collections_abc
+import math
+import random
 string_classes = (str, bytes)
 from lib.utils import TensorDict, TensorList
 
@@ -26,6 +28,86 @@ def _new_shared_stack_output(batch, dim):
     out_shape = list(batch[0].size())
     out_shape.insert(dim, len(batch))
     return batch[0].new(storage).resize_(*out_shape)
+
+
+class HorizonBatchSampler:
+    """Group arbitrary sample indices into batches sharing one horizon."""
+
+    def __init__(self, indices, batch_size, horizons, weights, drop_last):
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        if not horizons or any(int(value) <= 0 for value in horizons):
+            raise ValueError("horizons must contain positive values")
+        if len(horizons) != len(weights):
+            raise ValueError("horizons and weights must have the same length")
+        if any(float(value) < 0 for value in weights) or sum(weights) <= 0:
+            raise ValueError("weights must contain a positive total")
+        self.indices = indices
+        self.batch_size = int(batch_size)
+        self.horizons = tuple(int(value) for value in horizons)
+        self.weights = tuple(float(value) for value in weights)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+
+    def __iter__(self):
+        rng = random.Random(self.epoch)
+        batch = []
+        for index in self.indices:
+            batch.append(index)
+            if len(batch) == self.batch_size:
+                yield self._with_horizon(batch, rng)
+                batch = []
+        if batch and not self.drop_last:
+            yield self._with_horizon(batch, rng)
+
+    def __len__(self):
+        length = len(self.indices)
+        if self.drop_last:
+            return length // self.batch_size
+        return math.ceil(length / self.batch_size)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        if hasattr(self.indices, "set_epoch"):
+            self.indices.set_epoch(epoch)
+
+    def _with_horizon(self, indices, rng):
+        horizon = rng.choices(self.horizons, weights=self.weights, k=1)[0]
+        return [(index, horizon) for index in indices]
+
+
+_FUTURE_PAD_KEYS = {
+    "future_images",
+    "future_event_images",
+    "future_anno",
+}
+
+
+def _pad_future_tensors(values, target_length, stack_dim):
+    padded = []
+    for value in values:
+        if value.shape[0] > target_length:
+            raise ValueError("future tensor exceeds its declared horizon")
+        output = value.new_zeros((target_length, *value.shape[1:]))
+        output[:value.shape[0]] = value
+        padded.append(output)
+    return torch.stack(padded, dim=stack_dim)
+
+
+def _collate_tensor_dict(batch, collate, stack_dim):
+    target_length = max(
+        (int(item["future_valid"].numel()) for item in batch
+         if "future_valid" in item),
+        default=0,
+    )
+    result = {}
+    for key in batch[0]:
+        values = [item[key] for item in batch]
+        if key in _FUTURE_PAD_KEYS and target_length:
+            result[key] = _pad_future_tensors(values, target_length, stack_dim)
+        else:
+            result[key] = collate(values)
+    return TensorDict(result)
 
 
 
@@ -61,7 +143,7 @@ def ltr_collate(batch):
     elif isinstance(batch[0], string_classes):
         return batch
     elif isinstance(batch[0], TensorDict):
-        return TensorDict({key: ltr_collate([d[key] for d in batch]) for key in batch[0]})
+        return _collate_tensor_dict(batch, ltr_collate, stack_dim=0)
     elif isinstance(batch[0], collections_abc.Mapping):
         return {key: ltr_collate([d[key] for d in batch]) for key in batch[0]}
     elif isinstance(batch[0], TensorList):
@@ -108,7 +190,7 @@ def ltr_collate_stack1(batch):
     elif isinstance(batch[0], string_classes):
         return batch
     elif isinstance(batch[0], TensorDict):
-        return TensorDict({key: ltr_collate_stack1([d[key] for d in batch]) for key in batch[0]})
+        return _collate_tensor_dict(batch, ltr_collate_stack1, stack_dim=1)
     elif isinstance(batch[0], collections_abc.Mapping):
         return {key: ltr_collate_stack1([d[key] for d in batch]) for key in batch[0]}
     elif isinstance(batch[0], TensorList):

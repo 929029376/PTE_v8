@@ -98,6 +98,67 @@ class STARKProcessing(BaseProcessing):
         jittered_center = box[0:2] + 0.5 * box[2:4] + max_offset * (torch.rand(2) - 0.5)
         return torch.cat((jittered_center - 0.5 * jittered_size, jittered_size), dim=0)
 
+    @staticmethod
+    def _default_masks(images):
+        return [torch.zeros(image.shape[:2]) for image in images]
+
+    def _apply_joint_full_frame_transform(self, data, prefix):
+        image_key = prefix + '_images'
+        if image_key not in data or not data[image_key]:
+            return
+        anno_key = prefix + '_anno'
+        mask_key = prefix + '_masks'
+        event_key = prefix + '_event_images'
+        if mask_key not in data:
+            data[mask_key] = self._default_masks(data[image_key])
+        data[image_key], data[anno_key], data[mask_key] = self.transform['joint'](
+            image=data[image_key], bbox=data[anno_key], mask=data[mask_key], new_roll=False)
+        data[event_key] = self.transform['joint'](
+            image=data[event_key], new_roll=False)
+
+    def _process_full_frame_sequence(self, data, prefix, factor, keep_auxiliary):
+        image_key = prefix + '_images'
+        event_key = prefix + '_event_images'
+        anno_key = prefix + '_anno'
+        mask_key = prefix + '_masks'
+        att_key = prefix + '_att'
+
+        if not data[image_key]:
+            image = data['search_images'][0]
+            event_image = data['search_event_images'][0]
+            anno = data['search_anno'][0]
+            data[image_key] = image.new_empty((0, *image.shape))
+            data[event_key] = event_image.new_empty((0, *event_image.shape))
+            data[anno_key] = anno.new_empty((0, 4))
+            data.pop(mask_key, None)
+            return
+
+        if mask_key not in data:
+            data[mask_key] = self._default_masks(data[image_key])
+        anchors = [
+            _full_frame_anchor(frame, factor, box)
+            for frame, box in zip(data[image_key], data[anno_key])
+        ]
+        crops, crops_event, boxes, att_mask, mask_crops = prutils.jittered_center_crop(
+            frames=data[image_key],
+            event_frames=data[event_key],
+            box_extract=anchors,
+            box_gt=data[anno_key],
+            search_area_factor=factor,
+            output_sz=self.output_sz['search'],
+            masks=data[mask_key])
+        data[image_key], data[anno_key], transformed_att, transformed_masks = \
+            self.transform['search'](
+                image=crops, bbox=boxes, att=att_mask, mask=mask_crops, joint=False)
+        data[event_key], _, _, _ = self.transform['search'](
+            image=crops_event, bbox=boxes, att=att_mask, mask=mask_crops,
+            joint=False, new_roll=False)
+        if keep_auxiliary:
+            data[att_key] = transformed_att
+            data[mask_key] = transformed_masks
+        else:
+            data.pop(mask_key, None)
+
     def __call__(self, data: TensorDict):
         """
         args:
@@ -120,6 +181,8 @@ class STARKProcessing(BaseProcessing):
                     mask=data['redetect_search_masks'], new_roll=False)
                 data['redetect_search_event_images'] = self.transform['joint'](
                     image=data['redetect_search_event_images'], new_roll=False)
+            if 'future_images' in data:
+                self._apply_joint_full_frame_transform(data, 'future')
 
         for s in ['template', 'search']:
             assert self.mode == 'sequence' or len(data[s + '_images']) == 1, \
@@ -165,24 +228,15 @@ class STARKProcessing(BaseProcessing):
                     return data
 
         if 'redetect_search_images' in data:
-            factor = float(getattr(self.settings, "redetect_search_area_factor", self.search_area_factor['search']))
-            anno = data['redetect_search_anno']
-            anchors = [
-                _full_frame_anchor(frame, factor, box)
-                for frame, box in zip(data['redetect_search_images'], anno)
-            ]
-            crops, crops_event, boxes, att_mask, mask_crops = prutils.jittered_center_crop(
-                frames=data['redetect_search_images'],
-                event_frames=data['redetect_search_event_images'],
-                box_extract=anchors,
-                box_gt=anno,
-                search_area_factor=factor,
-                output_sz=self.output_sz['search'],
-                masks=data['redetect_search_masks'])
-            data['redetect_search_images'], data['redetect_search_anno'], data['redetect_search_att'], data['redetect_search_masks'] = \
-                self.transform['search'](image=crops, bbox=boxes, att=att_mask, mask=mask_crops, joint=False)
-            data['redetect_search_event_images'], _, _, _ = self.transform['search'](
-                image=crops_event, bbox=boxes, att=att_mask, mask=mask_crops, joint=False, new_roll=False)
+            factor = float(getattr(
+                self.settings, "redetect_search_area_factor",
+                self.search_area_factor['search']))
+            self._process_full_frame_sequence(
+                data, 'redetect_search', factor, keep_auxiliary=True)
+        if 'future_images' in data:
+            self._process_full_frame_sequence(
+                data, 'future', self.search_area_factor['search'],
+                keep_auxiliary=False)
 
         data['valid'] = True
 

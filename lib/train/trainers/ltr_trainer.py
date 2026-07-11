@@ -14,6 +14,14 @@ from torch.cuda.amp import GradScaler
 from lib.utils.misc import get_world_size
 
 
+def _set_loader_epoch(loader, epoch):
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    if hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
+    elif isinstance(loader.sampler, DistributedSampler):
+        loader.sampler.set_epoch(epoch)
+
+
 class LTRTrainer(BaseTrainer):
     def __init__(self, actor, loaders, optimizer, settings, lr_scheduler=None, use_amp=False):
         """
@@ -210,8 +218,7 @@ class LTRTrainer(BaseTrainer):
         for loader in self.loaders:
             if self._should_run_loader(loader, self.epoch, getattr(self, "max_epochs", self.epoch), self.settings):
                 # 2021.1.10 Set epoch
-                if isinstance(loader.sampler, DistributedSampler):
-                    loader.sampler.set_epoch(self.epoch)
+                _set_loader_epoch(loader, self.epoch)
                 self.cycle_dataset(loader)
                 if not loader.training:
                     self._sync_distributed_average_meters(
