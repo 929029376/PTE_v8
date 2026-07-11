@@ -6,7 +6,7 @@ Default config for PET-Track (Physics-guided Event-Triggered Tracker).
 
 Standalone copy: carries the full PET-Track configuration including the
 C1/C2/C3 sections (PET, EPSM, ABSENCE, REDETECT, HETEROGENEOUS_TAIL,
-STATE_MACHINE, PET_LOSS) plus the shared backbone/memory/head/expert fields.
+STATE_MACHINE, SRBT_LOSS) plus the shared backbone/memory/head/expert fields.
 No imports from other configs.
 """
 cfg = edict()
@@ -171,6 +171,17 @@ cfg.MODEL.SRBT.CONTROLLER.REDETECT_AGE = 5
 cfg.MODEL.SRBT.CONTROLLER.REDETECT_PERIOD = 10
 cfg.MODEL.SRBT.CONTROLLER.VERIFY_FRAMES = 3
 cfg.MODEL.SRBT.CONTROLLER.LONG_STABLE_FRAMES = 5
+cfg.MODEL.SRBT.TEACHER = edict()
+cfg.MODEL.SRBT.TEACHER.INPUT_DIM = 768
+cfg.MODEL.SRBT.TEACHER.POOLED_DIM = 128
+cfg.MODEL.SRBT.TEACHER.D_MODEL = 256
+cfg.MODEL.SRBT.TEACHER.NHEAD = 8
+cfg.MODEL.SRBT.TEACHER.NUM_LAYERS = 2
+cfg.MODEL.SRBT.TEACHER.FFN_DIM = 1024
+cfg.MODEL.SRBT.TEACHER.SPATIAL_DIM = 64
+cfg.MODEL.SRBT.TEACHER.IDENTITY_DIM = 32
+cfg.MODEL.SRBT.TEACHER.HAZARD_BINS = 129
+cfg.MODEL.SRBT.TEACHER.MAX_HORIZON = 128
 
 # EVENT_TRIGGER (optional diagnostic asynchronous inference; disabled in v8)
 # When the global event density rho is below THETA_LOW, the scene is judged
@@ -240,20 +251,20 @@ cfg.TRAIN.SAVE_BEST = False
 cfg.TRAIN.BEST_METRIC = "IoU"
 cfg.TRAIN.BEST_METRIC_MODE = "max"
 
-# PET-Track loss weights (training)
-cfg.TRAIN.PET_LOSS = edict()
-cfg.TRAIN.PET_LOSS.ROUTE_WEIGHT = 0.2
-cfg.TRAIN.PET_LOSS.ABSENCE_WEIGHT = 1.0
-cfg.TRAIN.PET_LOSS.REDETECT_WEIGHT = 1.0
-cfg.TRAIN.PET_LOSS.FREEZE_WEIGHT = 1.0
-cfg.TRAIN.PET_LOSS.REDETECT_GATE_WEIGHT = 1.0
-cfg.TRAIN.PET_LOSS.ROUTE_TEMPERATURE = 0.5
-cfg.TRAIN.PET_LOSS.ROUTE_REGRET_WEIGHT = 1.0
-cfg.TRAIN.PET_LOSS.ROUTE_ORACLE_CE_WEIGHT = 1.0
-cfg.TRAIN.PET_LOSS.ROUTE_PAIR_PENALTY = 0.02
-cfg.TRAIN.PET_LOSS.ROUTE_CHUNK_SIZE = 3
-cfg.TRAIN.PET_LOSS.ABSENCE_POS_WEIGHT = 10.0
-cfg.TRAIN.PET_LOSS.LABEL_SMOOTHING = 0.1
+# SRBT joint objective weights (training)
+cfg.TRAIN.SRBT_LOSS = edict()
+cfg.TRAIN.SRBT_LOSS.EXISTENCE_WEIGHT = 1.0
+cfg.TRAIN.SRBT_LOSS.SURVIVAL_WEIGHT = 1.0
+cfg.TRAIN.SRBT_LOSS.FIELD_WEIGHT = 1.0
+cfg.TRAIN.SRBT_LOSS.HYPOTHESIS_WEIGHT = 0.5
+cfg.TRAIN.SRBT_LOSS.IDENTITY_WEIGHT = 0.2
+cfg.TRAIN.SRBT_LOSS.CALIBRATION_WEIGHT = 0.05
+cfg.TRAIN.SRBT_LOSS.TEACHER_WEIGHT = 1.0
+cfg.TRAIN.SRBT_LOSS.DISTILL_MAX_WEIGHT = 0.5
+cfg.TRAIN.SRBT_LOSS.DISTILL_WARMUP = 0.05
+cfg.TRAIN.SRBT_LOSS.IDENTITY_TEMPERATURE = 0.1
+cfg.TRAIN.SRBT_LOSS.DIVERSITY_MARGIN = 0.25
+cfg.TRAIN.SRBT_LOSS.DIVERSITY_WEIGHT = 0.1
 
 cfg.TRAIN.CE_START_EPOCH = 20  # candidate elimination start epoch
 cfg.TRAIN.CE_WARM_EPOCH = 80  # candidate elimination warm up epoch
@@ -394,6 +405,9 @@ def update_config_from_file(filename, base_cfg=None):
     # 閺勬儳绱￠幐鍥х暰缂傛牜鐖滄稉?utf-8
     with open(filename, 'r', encoding='utf-8') as f:
         exp_config = edict(yaml.safe_load(f))
+        if "PET_LOSS" in exp_config.get("TRAIN", {}):
+            raise ValueError(
+                "legacy TRAIN.PET_LOSS is removed; use TRAIN.SRBT_LOSS")
         if base_cfg is not None:
             _update_config(base_cfg, exp_config)
         else:
