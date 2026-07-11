@@ -2,27 +2,22 @@
 
 A real SRBT posterior selects TRACK, HOLD, or REDETECT and controls whether the
 current observation may enter short- and long-term memory. THOR therefore reads
-templates before inference and commits the current frame only after the action
-is known. Until M7 wires the posterior into the model output, the existing C3
-controller remains the compatibility path; no synthetic SRBT posterior is used.
+templates before inference and commits the current frame only after the action is
+known.
 """
-import math
 import os
 
 import torch
-import torch.nn.functional as F
 
 from lib.models.pet_track import build_pet_track
 from lib.test.tracker.basetracker import BaseTracker
 from lib.test.tracker.vis_utils import gen_visualization
 from lib.test.utils.hann import hann2d
-from lib.train.data.processing_utils import sample_target, transform_image_to_crop
+from lib.train.data.processing_utils import sample_target
 from lib.test.tracker.data_utils import Preprocessor
 from lib.utils.box_ops import clip_box
 from lib.utils.ce_utils import generate_mask_cond, generate_mask_z
 from lib.models.layers.thor import THOR_Wrapper
-from lib.models.layers.state_machine import OcclusionStateMachine, State
-from lib.models.layers.expert_router import SparseRouteHysteresis
 from lib.models.layers.srbt_hypotheses import (
     build_hypothesis_tracker,
     crop_cxcywh_to_image_xywh,
@@ -31,58 +26,22 @@ from lib.models.layers.srbt_controller import (
     Action as BeliefAction,
     build_belief_controller,
 )
-from lib.utils.route_motion import ROUTE_MOTION_DIM, causal_route_motion_cues
+from lib.train.trainers.base_trainer import validate_srbt_checkpoint_schema
 
 
-def _bbox_to_crop_pixel_roi(box, resize_factor, output_size, device, box_extract=None):
-    """Map an image-space xywh box to pixel xywh coordinates in its crop.
-
-    The belief module receives the resized search crop, so ROI statistics must be
-    computed in crop coordinates, not original image coordinates.
-    """
-    box_in = torch.tensor(box, dtype=torch.float32, device=device)
-    if box_extract is None:
-        box_extract = box_in
-    else:
-        box_extract = torch.tensor(box_extract, dtype=torch.float32, device=device)
-    crop_sz = torch.tensor([output_size, output_size], dtype=torch.float32, device=device)
-    return transform_image_to_crop(
-        box_in, box_extract, resize_factor, crop_sz, normalize=False).view(1, 4)
-
-
-def _redetect_uses_prior(cfg):
-    """Return whether the redetection expert should consume the event prior."""
-    redetect_cfg = getattr(getattr(cfg, "MODEL", None), "REDETECT", None)
-    if redetect_cfg is None:
-        return False
-    # The current C3 training path supervises RedetectionExpert with
-    # prior_H=None. Injecting an event prior at test time would shift the score
-    # distribution for the best checkpoint, so require an explicit marker for
-    # future checkpoints that are trained with prior modulation enabled.
-    return (bool(getattr(redetect_cfg, "USE_PRIOR", True)) and
-            bool(getattr(redetect_cfg, "TRAINED_WITH_PRIOR", False)))
-
-
-def _parse_force_route(value):
-    if value is None:
-        return None
-    if isinstance(value, (list, tuple)):
-        route = tuple(str(name).strip() for name in value if str(name).strip())
-    else:
-        text = str(value).strip()
-        if text.lower() in ("", "none", "null"):
-            return None
-        route = tuple(
-            name.strip() for name in text.replace(",", "+").split("+")
-            if name.strip())
-    return route or None
+def _load_srbt_eval_checkpoint(network, checkpoint_path):
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False)
+    validate_srbt_checkpoint_schema(checkpoint)
+    network.load_state_dict(checkpoint["net"], strict=True)
+    return checkpoint
 
 
 class PETTrack(BaseTracker):
     def __init__(self, params, dataset_name):
         super().__init__(params)
         network = build_pet_track(params.cfg, training=False)
-        network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu')['net'], strict=False)
+        _load_srbt_eval_checkpoint(network, self.params.checkpoint)
         self.cfg = params.cfg
         self.hypothesis_tracker = build_hypothesis_tracker(self.cfg)
         self.belief_controller = build_belief_controller(self.cfg)
@@ -104,20 +63,6 @@ class PETTrack(BaseTracker):
             os.makedirs(self.save_dir, exist_ok=True)
 
         self.save_all_boxes = params.save_all_boxes
-        self.policy_mode = str(getattr(params.cfg.TEST, "POLICY_MODE", "stateful")).lower()
-        self.use_train_compatible_policy = self.policy_mode in ("train_compatible", "train", "strict_train")
-        self.force_route = _parse_force_route(
-            getattr(params.cfg.TEST, "FORCE_ROUTE", ""))
-        expert_cfg = params.cfg.MODEL.EXPERT
-        self.route_hysteresis = SparseRouteHysteresis(
-            self.network.route_options,
-            margin=float(getattr(
-                expert_cfg, "ROUTE_HYSTERESIS_MARGIN", 0.05)),
-            patience=int(getattr(
-                expert_cfg, "ROUTE_HYSTERESIS_PATIENCE", 2)),
-            confidence_threshold=float(getattr(
-                expert_cfg, "ROUTER_CONFIDENCE_THRESHOLD", 0.0)),
-        )
         self.thor_wrapper = THOR_Wrapper(
             net=self.network,
             st_capacity=params.cfg.TEST.SHORTTERM_LIBRARY_NUMS,
@@ -127,39 +72,21 @@ class PETTrack(BaseTracker):
             lower_bound=params.cfg.TEST.LOWER_BOUND,
             score_threshold=params.cfg.TEST.SCORE_THRESHOLD)
 
-        # --- C3 occlusion controller (learned gates + safety skeleton) ---
-        sm_cfg = getattr(self.cfg.MODEL, "STATE_MACHINE", None)
-        pet_cfg = getattr(self.cfg.MODEL, "PET", None)
-        use_learned = bool(getattr(pet_cfg, "USE_LEARNED_POLICY", True)) \
-            if pet_cfg is not None else True
-        mp_cfg = getattr(self.cfg.MODEL, "MEMORY_POLICY", None)
-        gate_thresh = float(getattr(mp_cfg, "GATE_THRESH", 0.5)) if mp_cfg is not None else 0.5
-        self.state_machine = OcclusionStateMachine(
-            gate_thresh=gate_thresh,
-            w_abs=getattr(sm_cfg, "W_ABS", 3),
-            theta_re=getattr(sm_cfg, "THETA_RE", 0.7),
-            w_re=getattr(sm_cfg, "W_RE", 2),
-            w_fail=getattr(sm_cfg, "W_FAIL", 5),
-            T_max=getattr(sm_cfg, "T_MAX", 50),
-            T_period=getattr(sm_cfg, "T_PERIOD", 10),
-            T_min_bg=getattr(sm_cfg, "T_MIN_BG", 3),
-            use_learned_policy=use_learned,
-            legacy_theta_abs=getattr(sm_cfg, "THETA_ABS", 0.6),
-            legacy_theta_z=getattr(sm_cfg, "THETA_Z", 2.5))
-        self.t_max = float(getattr(sm_cfg, "T_MAX", 50)) if sm_cfg is not None else 50.0
-        # Last accepted cues are retained only for the optional event-skip
-        # diagnostic path. Formal v8 policy uses the current local candidate.
         self._last_score_peak = 0.0
-        self._last_sim_zx = 0.0
         self._last_redetect_conf = 0.0
         self._last_redetect_error = ""
         self._pending_redetect_box = None
-        self._skip_count = 0  # event-trigger: consecutive skipped frames
         # Redetect full-image crop config.
         redetect_cfg = getattr(self.cfg.MODEL, "REDETECT", None)
         self.redetect_factor = float(getattr(
             redetect_cfg, "TRAIN_SEARCH_FACTOR", 8.0
         )) if redetect_cfg is not None else 8.0
+
+    def _reset_srbt_sequence_state(self):
+        self._srbt_posterior = None
+        self._srbt_last_action = BeliefAction.TRACK
+        self._redetect_hypotheses = None
+        self._pending_redetect_box = None
 
     def initialize(self, image, event_image, info: dict, idx=0):
         z_patch_arr, event_z_patch_arr, resize_factor, z_amask_arr = sample_target(
@@ -186,153 +113,40 @@ class PETTrack(BaseTracker):
             self._last_trusted_zi = template.detach().clone()
             self._last_trusted_ze = event_template.detach().clone()
             self.thor_wrapper.setup(self.static_zi, self.static_ze)
-            # Reset the belief history and the state machine for the new sequence.
-            if self.network.event_belief is not None:
-                self.network.event_belief.reset()
-                self._seed_event_belief(
-                    event_template, info['init_bbox'], resize_factor)
-            self.state_machine.reset()
             self.belief_controller.reset()
-            self._srbt_last_action = BeliefAction.TRACK
-            self.route_hysteresis.reset()
-            # Reset accepted-candidate/redetect cues for the new sequence.
+            self._reset_srbt_sequence_state()
             self._last_score_peak = 0.0
-            self._last_sim_zx = 0.0
             self._last_redetect_conf = 0.0
             self._last_redetect_error = ""
-            self._pending_redetect_box = None
-            self._redetect_hypotheses = None
-            self._skip_count = 0
 
         self.state = info['init_bbox']
-        self._route_box_history = [list(info['init_bbox'])]
         self.frame_id = idx
 
-    def _causal_route_motion(self, height, width, device):
-        if len(self._route_box_history) < 2:
-            return torch.zeros(
-                1, ROUTE_MOTION_DIM, device=device, dtype=torch.float32)
-        cues = causal_route_motion_cues(
-            self._route_box_history[-2], self._route_box_history[-1],
-            (height, width), device=device)
-        return cues.unsqueeze(0)
-
-    def _step_event_belief(self, event_search, roi, commit=True):
-        event_belief = self.network.event_belief
-        if event_belief is None:
-            return None
-
-        event_frame = event_search.squeeze(0)
-        # Match training causality in every policy mode: query the current
-        # search frame against only past observations, then commit it for the
-        # next frame. A frozen belief ignores the commit by construction.
-        result = event_belief(event_frame, roi=roi, update_history=False)
-        if commit:
-            self._commit_event_belief(event_search, roi)
-        return result
-
-    def _commit_event_belief(self, event_search, roi):
-        event_belief = self.network.event_belief
-        if event_belief is None:
-            return
-        event_belief(
-            event_search.squeeze(0), roi=roi, update_history=True)
-
-    def _seed_event_belief(self, event_template, initial_box,
-                           resize_factor):
-        event_belief = self.network.event_belief
-        if event_belief is None:
-            return
-        roi = _bbox_to_crop_pixel_roi(
-            initial_box,
-            resize_factor,
-            self.params.template_size,
-            event_template.device,
-        )
-        event_belief(event_template, roi=roi, update_history=True)
-
-    def _predict_c3_policy(self, belief_embed, raw_stats, score_peak,
-                           sim_zx, frozen_age):
-        """Evaluate C3 heads from the current local candidate cues."""
-        result = {
-            "absence_prob": 0.0,
-            "freeze_prob": None,
-            "redetect_prob": 0.0,
-        }
-        if belief_embed is None:
-            return result
-
-        device = belief_embed.device
-        if self.network.absence_predictor is not None:
-            score = torch.as_tensor(
-                [score_peak], device=device, dtype=torch.float32)
-            similarity = torch.as_tensor(
-                [sim_zx], device=device, dtype=torch.float32)
-            absence = self.network.predict_absence(
-                belief_embed, score, similarity, raw_stats=raw_stats)
-            result["absence_prob"] = float(absence[0].item())
-
-        if self.network.memory_policy is not None:
-            age = torch.as_tensor(
-                [frozen_age], device=device, dtype=torch.float32)
-            absence = torch.as_tensor(
-                [result["absence_prob"]], device=device,
-                dtype=torch.float32)
-            gates = self.network.predict_memory_policy(
-                belief_embed, age, absence, raw_stats=raw_stats)
-            result["freeze_prob"] = float(
-                gates["freeze_prob"][0].item())
-            result["redetect_prob"] = float(
-                gates["redetect_prob"][0].item())
-        return result
-
-    def _run_local_candidate(self, search, event_search, belief_embed,
-                             raw_stats, route_motion, resize_factor,
-                             height, width, info):
-        """Run the train-compatible local path without committing its box."""
+    def _run_local_candidate(self, search, event_search,
+                             resize_factor, height, width):
+        """Run the local path without committing its box."""
         dynamic_zi, dynamic_ze = self.thor_wrapper.begin_frame()
         self.dynamic_zi, self.dynamic_ze = dynamic_zi, dynamic_ze
 
         out_dict = self.network.inference(
             static_zi=self.static_zi, static_ze=self.static_ze,
             dynamic_zi=dynamic_zi, dynamic_ze=dynamic_ze,
-            xi=search, xe=event_search, belief=belief_embed,
-            raw_stats=raw_stats, route=self.force_route,
-            route_motion=route_motion,
-            route_selector=self.route_hysteresis.select)
+            xi=search, xe=event_search,
+            previous_posterior=getattr(self, "_srbt_posterior", None))
+        self._srbt_posterior = out_dict.get("srbt_posterior")
         response = self.output_window * out_dict['score_map']
-        pred_boxes = self.network.box_head.cal_bbox(
-            response, out_dict['size_map'], out_dict['offset_map'])
         pred_box = (
-            pred_boxes.view(-1, 4).mean(dim=0)
+            out_dict["target_bbox"][0]
             * self.params.search_size / resize_factor
         ).tolist()
         candidate_state = clip_box(
             self.map_box_back(pred_box, resize_factor),
             height, width, margin=10)
 
-        router_confidence = out_dict.get("route_confidence")
-        tail_router_confidence = out_dict.get(
-            "tail_router_confidence")
         return {
             "state": candidate_state,
             "score_peak": float(response.max().item()),
-            "sim_zx": self._compute_sim_zx_inference(out_dict),
             "response": response,
-            "tail_raw_expert": self._first_debug_value(
-                out_dict.get("tail_router_selected_routes")),
-            "tail_expert": self._first_debug_value(
-                out_dict.get("tail_routes")),
-            "router_expert": self._first_debug_value(
-                out_dict.get("route_selected")),
-            "head_expert": self._first_debug_value(
-                out_dict.get("route_routed")),
-            "router_confidence": (
-                float(router_confidence.flatten()[0].item())
-                if router_confidence is not None else -1.0),
-            "tail_router_confidence": (
-                float(tail_router_confidence.flatten()[0].item())
-                if tail_router_confidence is not None else -1.0),
             "srbt_posterior": out_dict.get("srbt_posterior"),
             "srbt_best_hypothesis": out_dict.get("srbt_best_hypothesis"),
             "memory_frame_open": True,
@@ -356,16 +170,6 @@ class PETTrack(BaseTracker):
             self.frame_id,
         )
 
-    @staticmethod
-    def _should_update_event_background(
-            srbt_control, use_train_compatible_policy, state_machine_state):
-        if srbt_control is not None:
-            return False
-        return (
-            not use_train_compatible_policy
-            and state_machine_state == State.FROZEN
-        )
-
     def _resolve_tracking_state(self, local_state, height, width,
                                 srbt_recovered):
         if not srbt_recovered or self._pending_redetect_box is None:
@@ -386,172 +190,47 @@ class PETTrack(BaseTracker):
             search_area_factor=self.params.search_factor, output_sz=self.params.search_size)
         search = self.preprocessor.process(x_patch_arr, x_amask_arr).tensors
         event_search = self.preprocessor.process(event_x_patch_arr, x_amask_arr).tensors
-        route_motion = self._causal_route_motion(
-            H, W, event_search.device)
 
         with torch.no_grad():
-            # --- Unified event physical belief (computed ONCE this frame) ---
-            belief_embed = None
-            raw_stats = None
-            history_ready = False
-            rho_global = 1.0
-            if self.network.event_belief is not None:
-                roi = _bbox_to_crop_pixel_roi(
-                    self.state, resize_factor, self.params.search_size, event_search.device)
-                eb_dict = self._step_event_belief(
-                    event_search, roi, commit=False)
-                belief_embed = eb_dict['belief']
-                raw_stats = eb_dict['raw_stats']
-                history_ready = bool(eb_dict['history_ready'])
-                if raw_stats is not None:
-                    rho_global = float(raw_stats[0, 0].item())
-
-            # Formal v8 configs disable event skipping. Keep the diagnostic
-            # path, but otherwise run the same local forward used in training
-            # before C3 decides whether the candidate is trusted.
-            et = getattr(self.cfg.MODEL, "EVENT_TRIGGER", None)
-            et_enable = (bool(getattr(et, "ENABLE", False)) if et is not None else False) \
-                and not self.use_train_compatible_policy
-            skip_frame = (
-                et_enable
-                and self.state_machine.state == State.TRACKING
-                and self._skip_count < int(getattr(et, "MAX_SKIP", 5))
-                and rho_global < float(getattr(et, "THETA_LOW", 0.02))
-            )
-            if (et is not None
-                    and rho_global >= float(getattr(et, "THETA_HIGH", 0.15))):
-                self._skip_count = 0
-
-            local_candidate = None
-            if not skip_frame:
-                local_candidate = self._run_local_candidate(
-                    search, event_search, belief_embed, raw_stats,
-                    route_motion, resize_factor, H, W, info)
+            local_candidate = self._run_local_candidate(
+                search, event_search, resize_factor, H, W)
 
             srbt_control = self._step_srbt_controller(local_candidate)
 
-            if srbt_control is not None:
-                posterior = local_candidate["srbt_posterior"]
-                absence_prob = float(posterior["state_prob"][0, 2].item())
-                redetect_prob = float(posterior["hazard"][0, :8].sum().item())
-                freeze_prob = None
-                redetect_signal = redetect_prob
-                previous_action = self._srbt_last_action
-                current_action = srbt_control.action
-                decision = {
-                    "action": current_action.value,
-                    "enter_frozen": (
-                        previous_action is BeliefAction.TRACK
-                        and current_action is not BeliefAction.TRACK),
-                    "enter_redetect": (
-                        previous_action is not BeliefAction.REDETECT
-                        and current_action is BeliefAction.REDETECT),
-                    "exit_to_tracking": (
-                        previous_action is not BeliefAction.TRACK
-                        and current_action is BeliefAction.TRACK),
-                }
-                self._srbt_last_action = current_action
-            else:
-                current_score = (
-                    local_candidate["score_peak"]
-                    if local_candidate is not None else self._last_score_peak)
-                current_sim = (
-                    local_candidate["sim_zx"]
-                    if local_candidate is not None else self._last_sim_zx)
-                frozen_age = (
-                    float(self.state_machine.frames_in_frozen) / self.t_max
-                    if not self.use_train_compatible_policy else 0.0)
-                policy = self._predict_c3_policy(
-                    belief_embed,
-                    raw_stats,
-                    score_peak=local_candidate["score_peak"]
-                    if local_candidate is not None else current_score,
-                    sim_zx=local_candidate["sim_zx"]
-                    if local_candidate is not None else current_sim,
-                    frozen_age=frozen_age,
-                )
-                absence_prob = policy["absence_prob"]
-                freeze_prob = policy["freeze_prob"]
-                redetect_prob = policy["redetect_prob"]
-                if self.use_train_compatible_policy:
-                    redetect_signal = redetect_prob
-                    decision = {"action": "track", "enter_frozen": False,
-                                "enter_redetect": False,
-                                "exit_to_tracking": False}
-                else:
-                    redetect_signal = (
-                        redetect_prob
-                        if self.state_machine.use_learned_policy
-                        else float(raw_stats[0, 5].item())
-                        if raw_stats is not None else 0.0)
-                    decision = self.state_machine.step(
-                        absence_prob, redetect_signal,
-                        redetect_conf=self._last_redetect_conf,
-                        history_ready=history_ready, freeze_prob=freeze_prob)
+            if srbt_control is None:
+                raise RuntimeError(
+                    "SRBT inference requires srbt_posterior from network output")
+            posterior = local_candidate["srbt_posterior"]
+            previous_action = self._srbt_last_action
+            current_action = srbt_control.action
+            decision = {
+                "action": current_action.value,
+                "enter_frozen": (
+                    previous_action is BeliefAction.TRACK
+                    and current_action is not BeliefAction.TRACK),
+                "enter_redetect": (
+                    previous_action is not BeliefAction.REDETECT
+                    and current_action is BeliefAction.REDETECT),
+                "exit_to_tracking": (
+                    previous_action is not BeliefAction.TRACK
+                    and current_action is BeliefAction.TRACK),
+            }
+            self._srbt_last_action = current_action
             action = decision["action"]
 
-            # Query-before-commit: the frame that enters FROZEN contributes
-            # neither its event observation nor its rejected local bbox.
-            if (self.network.event_belief is not None
-                    and ((srbt_control is None
-                          and self.use_train_compatible_policy)
-                         or action == "track")):
-                self._commit_event_belief(event_search, roi)
-
-            if ((srbt_control is not None or not self.use_train_compatible_policy)
-                    and decision["enter_frozen"]):
+            if decision["enter_frozen"]:
                 self.thor_wrapper.freeze(True)
                 self.thor_wrapper.snapshot_clean(
                     self._last_trusted_zi, self._last_trusted_ze)
-                if self.network.event_belief is not None:
-                    self.network.event_belief.freeze_history(True)
-                    self.network.event_belief.init_background(
-                        self.network.event_belief.energy_map(
-                            event_search.squeeze(0)))
 
-            if (srbt_control is not None and decision["exit_to_tracking"]):
+            if decision["exit_to_tracking"]:
                 self.thor_wrapper.resume()
-                if self.network.event_belief is not None:
-                    self.network.event_belief.freeze_history(False)
-
-            should_update_background = self._should_update_event_background(
-                srbt_control,
-                self.use_train_compatible_policy,
-                self.state_machine.state,
-            )
-            if (should_update_background
-                    and self.network.event_belief is not None):
-                self.network.event_belief.update_background(
-                    self.network.event_belief.energy_map(
-                        event_search.squeeze(0)))
 
             pred_score = 0.0
             is_absent = False
             response = None
-            tail_raw_expert = (
-                local_candidate["tail_raw_expert"]
-                if local_candidate is not None else "")
-            tail_expert = (
-                local_candidate["tail_expert"]
-                if local_candidate is not None else "")
-            router_expert = (
-                local_candidate["router_expert"]
-                if local_candidate is not None else "")
-            head_expert = (
-                local_candidate["head_expert"]
-                if local_candidate is not None else "")
-            router_confidence = (
-                local_candidate["router_confidence"]
-                if local_candidate is not None else -1.0)
-            tail_router_confidence = (
-                local_candidate["tail_router_confidence"]
-                if local_candidate is not None else -1.0)
-            route_fallback = 0
 
-            if skip_frame and action == "track":
-                self._skip_count += 1
-                pred_score = self._last_score_peak
-            elif action == "track":
+            if action == "track":
                 if local_candidate is None:
                     raise RuntimeError(
                         "tracking action requires a current local candidate")
@@ -567,11 +246,9 @@ class PETTrack(BaseTracker):
                     else local_candidate["score_peak"])
                 response = local_candidate["response"]
                 self._last_score_peak = pred_score
-                self._last_sim_zx = local_candidate["sim_zx"]
-                self._skip_count = 0
             elif action in ("freeze", "hold"):
                 is_absent = True
-                if action == "freeze":
+                if action in ("freeze", "hold"):
                     self._pending_redetect_box = None
                     self._redetect_hypotheses = None
                     self._last_redetect_conf = 0.0
@@ -585,8 +262,7 @@ class PETTrack(BaseTracker):
                     self._last_redetect_conf = conf
                     accepted = (
                         box is not None
-                        and (srbt_control is not None
-                             or conf > self.state_machine.theta_re))
+                        and conf > 0.0)
                     if accepted:
                         self._pending_redetect_box = box
                     else:
@@ -596,7 +272,6 @@ class PETTrack(BaseTracker):
                     self._pending_redetect_box = None
             elif action == "resume":
                 if self._pending_redetect_box is None:
-                    self.state_machine.state = State.FROZEN
                     action = "hold"
                     is_absent = True
                 else:
@@ -604,8 +279,6 @@ class PETTrack(BaseTracker):
                         self._pending_redetect_box, H, W, margin=10)
                     self._pending_redetect_box = None
                     self.thor_wrapper.resume()
-                    if self.network.event_belief is not None:
-                        self.network.event_belief.freeze_history(False)
                     is_absent = False
                     pred_score = self._last_redetect_conf
 
@@ -618,14 +291,11 @@ class PETTrack(BaseTracker):
         if srbt_control is not None:
             allow_recent_write = (
                 srbt_control.allow_recent_write
-                and action == "track" and not skip_frame and not is_absent)
+                and action == "track" and not is_absent)
             allow_long_write = (
                 srbt_control.allow_long_write and allow_recent_write)
         else:
-            allow_recent_write = (
-                action == "track" and not skip_frame and not is_absent
-                and pred_score >= float(self.cfg.TEST.SCORE_THRESHOLD))
-            allow_long_write = allow_recent_write
+            raise RuntimeError("SRBT controller output is required")
 
         memory_frame_open = bool(
             local_candidate is not None
@@ -649,9 +319,6 @@ class PETTrack(BaseTracker):
                           color=(0, 0, 255), thickness=2)
             cv2.imwrite(os.path.join(self.save_dir, "%04d.jpg" % self.frame_id), image_BGR)
 
-        self._route_box_history.append(list(self.state))
-        self._route_box_history = self._route_box_history[-2:]
-
         return {"target_bbox": self.state,
                 "prediction_image": prediction_image,
                 "prediction_event_image": prediction_event_image,
@@ -659,39 +326,7 @@ class PETTrack(BaseTracker):
                 "pred_score": pred_score,
                 "absent": is_absent,
                 "allow_recent_write": bool(allow_recent_write),
-                "allow_long_write": bool(allow_long_write),
-                "c3_debug": {
-                    "frame_id": int(self.frame_id),
-                    "action": str(action),
-                    "state": (srbt_control.action.name if srbt_control is not None else
-                              getattr(self.state_machine.state, "name", str(self.state_machine.state))),
-                    "srbt_controller_active": int(srbt_control is not None),
-                    "absence_prob": float(absence_prob),
-                    "freeze_prob": -1.0 if freeze_prob is None else float(freeze_prob),
-                    "redetect_prob": float(redetect_prob),
-                    "redetect_signal": float(redetect_signal),
-                    "redetect_conf": float(self._last_redetect_conf),
-                    "redetect_error": str(self._last_redetect_error),
-                    "redetect_hypothesis_count": (
-                        0 if self._redetect_hypotheses is None else
-                        int(self._redetect_hypotheses["active_count"])),
-                    "redetect_hypothesis_weights": (
-                        [] if self._redetect_hypotheses is None else
-                        self._redetect_hypotheses["posterior"].detach().cpu().tolist()),
-                    "history_ready": int(bool(history_ready)),
-                    "rho_global": float(rho_global),
-                    "skip_frame": int(bool(skip_frame)),
-                    "force_route": "" if self.force_route is None else str(self.force_route),
-                    "tail_raw_expert": tail_raw_expert,
-                    "tail_expert": tail_expert,
-                    "router_expert": router_expert,
-                    "head_expert": head_expert,
-                    "router_confidence": float(router_confidence),
-                    "tail_router_confidence": float(tail_router_confidence),
-                    "route_fallback": int(route_fallback),
-                    "pred_score": float(pred_score),
-                    "is_absent": int(bool(is_absent)),
-                }}
+                "allow_long_write": bool(allow_long_write)}
 
     @staticmethod
     def _first_debug_value(value):
@@ -757,14 +392,7 @@ class PETTrack(BaseTracker):
                 clean_tokens = torch.cat(
                     (clean_zi_tokens, clean_ze_tokens), dim=1)
 
-        # Event reappear prior from the global event crop (background-subtracted).
         prior_H = None
-        if _redetect_uses_prior(self.cfg):
-            if self.network.event_belief is None:
-                raise RuntimeError(
-                    "prior-conditioned redetection requires event_belief")
-            prior_H = self.network.event_belief.reappear_prior(
-                self.network.event_belief.energy_map(full_event_search.squeeze(0)))
         red_out = self.network.redetect(
             feat_map, prior_H=prior_H, template_tokens=clean_tokens)
         red_out['_resize_factor'] = rd_resize
@@ -790,22 +418,6 @@ class PETTrack(BaseTracker):
             state["boxes"][0], rd_resize, patch_size, crop_center).tolist()
         confidence = float(state["weights"][0].clamp(0.0, 1.0).item())
         return box, confidence
-
-    def _compute_sim_zx_inference(self, out_dict):
-        """Cosine similarity between template and search token features at
-        inference (real cue for the absence predictor, replacing the zero
-        placeholder)."""
-        feat = out_dict.get('backbone_feat')
-        if feat is None:
-            raise RuntimeError("backbone_feat missing from inference output")
-        feat_len_s = self.network.feat_len_s
-        feat_len_z = self.network.feat_len_z
-        lens_z = feat_len_z * 2
-        z = feat[:, :lens_z].mean(dim=1)
-        x = feat[:, -feat_len_s:].mean(dim=1)
-        z = z / (z.norm(dim=-1, keepdim=True) + 1e-6)
-        x = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
-        return float((z * x).sum(dim=-1)[0].item())
 
     def map_box_back(self, pred_box, resize_factor):
         cx_prev = self.state[0] + 0.5 * self.state[2]

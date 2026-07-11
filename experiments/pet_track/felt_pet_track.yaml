@@ -1,19 +1,8 @@
-# PETTrack v8: challenge-annotation-free sparse compositional experts on FELT.
-#
-# This canonical file is Stage 1 (balanced expert bootstrap). Generate the
-# complete Stage 1 -> Stage 2 router -> Stage 3 C3 chain with
-# tracking/create_pettrack_ablation_configs.py.
+# PETTrack v8: SRBT-only FELT tracker.
 
 DATA:
   MAX_SAMPLE_INTERVAL: 100
   SAMPLER_MODE: causal
-  C3_EVENT_SAMPLING: true
-  C3_EVENT_SAMPLE_PROB: 0.8
-  C3_EVENT_WEIGHTS:
-    ABSENT_TO_PRESENT: 0.35
-    VISIBLE_TO_ABSENT: 0.25
-    ABSENT_TO_ABSENT: 0.25
-    HARD_VISIBLE: 0.15
   SRBT:
     ENABLE: true
     HISTORY_LENGTH: 8
@@ -25,12 +14,6 @@ DATA:
       PRESENT_TO_ABSENT: 0.25
       ABSENT: 0.25
       REAPPEARING: 0.25
-  MOTION_CAUSAL_SAMPLING: false
-  MOTION_CAUSAL_SAMPLE_PROB: 0.0
-  MOTION_CAUSAL_SPEED_THRESHOLD: 0.08
-  MOTION_CAUSAL_MAX_TRIES: 8
-  ROUTE_MOTION_DROPOUT: 0.1
-  ROUTE_MOTION_JITTER_STD: 0.02
   MEAN: [0.485, 0.456, 0.406]
   STD: [0.229, 0.224, 0.225]
   SEARCH:
@@ -56,8 +39,8 @@ DATA:
 
 MODEL:
   PRETRAIN_PATH: ./pretrained_networks
-  PRETRAIN_FILE: OSTrack_ep0300.pth.tar
-  PRETRAINED_BASELINE_CKPT: ""
+  PRETRAIN_FILE: ""
+  PRETRAINED_BASELINE_CKPT: "D:/AgentProject/AAAI/workspace/CIPTracker/output/checkpoints/train/amttrack/felt/AMTTrack_ep0098.pth.tar"
   SRBT:
     ENABLE: true
     HYPOTHESES:
@@ -97,57 +80,13 @@ MODEL:
       IDENTITY_DIM: 32
       HAZARD_BINS: 129
       MAX_HORIZON: 128
-  EXTRA_MERGER: false
-  PET:
-    ENABLE: true
-    PHYSICS_ROUTER: true
-    HETEROGENEOUS_TAIL: true
-    ABSENCE_HEAD: true
-    REDETECT_HEAD: true
-    STATE_MACHINE: true
-    USE_SHARED_BELIEF: true
-    USE_LEARNED_POLICY: true
-    MEMORY_POLICY: true
-  EVENT_BELIEF:
-    ENABLE: true
-    BELIEF_DIM: 64
-  EXPERT:
-    ENABLE: true
-    ROUTER_ENABLE: true
-    HEADS_ENABLE: false
-    DEFAULT: generalist
-    NAMES: [generalist, motion_fm, small_target_st, visibility_foc_ov, discrimination_bi]
-    MAX_ACTIVE: 2
-    ROUTER_HIDDEN_DIM: 128
-    ROUTE_HYSTERESIS_MARGIN: 0.05
-    ROUTE_HYSTERESIS_PATIENCE: 2
-  EPSM:
-    ALPHA: 0.9
-    MIN_HISTORY: 3
-    EVENT_THRESHOLD: 0.10
-    ROI_FORMAT: xywh
-    PHYS_DIM: 8
-  ABSENCE:
-    HIDDEN_DIM: 64
-    BELIEF_DIM: 64
-  MEMORY_POLICY:
-    HIDDEN_DIM: 64
-    GATE_THRESH: 0.5
+      ENCODE_CHUNK_SIZE: 2
   REDETECT:
     LAMBDA_H: 1.0
     USE_TEMPLATE_CONDITIONING: true
     USE_PRIOR_GATE: true
     USE_PRIOR: false
     TRAINED_WITH_PRIOR: false
-  HETEROGENEOUS_TAIL:
-    ENABLE: true
-    DEPTH: 3
-    DROP_PATH: 0.1
-  EVENT_TRIGGER:
-    ENABLE: false
-    THETA_LOW: 0.02
-    THETA_HIGH: 0.15
-    MAX_SKIP: 5
   BACKBONE:
     TYPE: pet_vit_base_patch16_224
     STRIDE: 16
@@ -162,30 +101,12 @@ MODEL:
     AMAH_BETA: 0.25
     AMAH_LAYERS: [5, 8, 11]
     AMAH_SP_LAYERS: [[1, 3], [4, 6], [7, 9]]
-  STATE_MACHINE:
-    THETA_ABS: 0.6
-    W_ABS: 3
-    THETA_Z: 2.5
-    THETA_RE: 0.7
-    W_RE: 2
-    W_FAIL: 5
-    T_MAX: 50
-    T_PERIOD: 10
-    T_MIN_BG: 3
 
 TRAIN:
-  STAGE: expert
-  EXPERT_STAGE: expert
-  INIT_CHECKPOINT: ""
+  STAGE: srbt
   LOAD_LATEST: true
   BACKBONE_MULTIPLIER: 0.1
   BASE_LR_MULTIPLIER_IN_ALL: 0.1
-  ROUTER_LR_MULTIPLIER: 3.0
-  ROUTER_OBJECTIVE_VERSION: 8
-  ROUTER_RESET_ON_OBJECTIVE_MIGRATION: false
-  ROUTER_GRAD_CLIP_NORM: 0.1
-  FREEZE_BACKBONE_IN_C3: true
-  FREEZE_BOX_HEAD_IN_C3: true
   DROP_PATH_RATE: 0.1
   BATCH_SIZE: 48
   EPOCH: 100
@@ -237,7 +158,6 @@ TRAIN:
 
 TEST:
   POLICY_MODE: stateful
-  FORCE_ROUTE: ""
   CHECKPOINT: best
   EPOCH: 100
   SEARCH_FACTOR: 4.0

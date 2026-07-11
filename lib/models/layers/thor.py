@@ -25,7 +25,7 @@ class THOR_Wrapper():
         self.lt_update_count = 0
         self.sample_count = 0
 
-        # --- PET-Track C3: occlusion-aware memory protection ---
+        # --- PET-Track SRBT: occlusion-aware memory protection ---
         # When frozen, the ST/LT modules are NOT updated, so the memory is not
         # corrupted by occlusion-frame (wrong) boxes. Sampling still returns
         # the last good templates so features can be computed during REDETECT.
@@ -60,7 +60,7 @@ class THOR_Wrapper():
         self.lt_module = LT_Module(net=self.net, z_capacity=self.lt_capacity, lower_bound=self.lower_bound,)
         self.lt_module.fill(zi, ze)
 
-    # --- PET-Track C3: freeze / clean snapshot / resume ---
+    # --- PET-Track SRBT: freeze / clean snapshot / resume ---
     def freeze(self, freeze_flag=True):
         """Toggle write protection while keeping template reads available."""
         self.frozen = freeze_flag

@@ -103,6 +103,10 @@ class Tracker:
         output = self._track_sequence(tracker, seq, init_info)
         return output
 
+    @staticmethod
+    def _default_result_container():
+        return {'target_bbox': [], 'time': [], 'absent': []}
+
     def _track_sequence(self, tracker, seq, init_info):
         # Define outputs
         # Each field in output is a list containing tracker prediction for each frame.
@@ -117,7 +121,7 @@ class Tracker:
         # time[i] is either the processing time for frame i, or an OrderedDict containing processing times for each
         # object in frame i
 
-        output = {'target_bbox': [], 'time': [], 'absent': [], 'c3_debug': []}
+        output = self._default_result_container()
 
         def _store_outputs(tracker_out: dict, defaults=None):
             defaults = {} if defaults is None else defaults
@@ -324,6 +328,4 @@ class Tracker:
             return decode_img(image_file[0], image_file[1])
         else:
             raise ValueError("type of image_file should be str or list")
-
-
 

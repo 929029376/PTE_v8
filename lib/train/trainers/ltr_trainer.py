@@ -89,53 +89,15 @@ class LTRTrainer(BaseTrainer):
         return float(max_norm) / (total_norm + 1e-6)
 
     def _clip_gradients(self):
-        """Clip the router independently so large expert gradients cannot suppress it."""
         global_max_norm = float(getattr(self.settings, 'grad_clip_norm', 0.0))
-        router_max_norm = float(getattr(self.settings, 'router_grad_clip_norm', 0.0))
-
-        if router_max_norm <= 0:
-            if global_max_norm <= 0:
-                return {}
-            total_norm = torch.nn.utils.clip_grad_norm_(
-                self.actor.net.parameters(), global_max_norm)
-            return {
-                'GradNorm/all': float(total_norm),
-                'GradClip/all_scale': self._clip_scale(global_max_norm, total_norm),
-            }
-
-        router_params = []
-        for group in self.optimizer.param_groups:
-            if group.get('name') == 'expert_router':
-                router_params.extend(
-                    parameter for parameter in group['params'] if parameter.grad is not None)
-        if not router_params:
-            if global_max_norm <= 0:
-                return {}
-            total_norm = torch.nn.utils.clip_grad_norm_(
-                self.actor.net.parameters(), global_max_norm)
-            return {
-                'GradNorm/all': float(total_norm),
-                'GradClip/all_scale': self._clip_scale(global_max_norm, total_norm),
-            }
-
-        router_ids = {id(parameter) for parameter in router_params}
-        non_router_params = [
-            parameter for parameter in self.actor.net.parameters()
-            if parameter.grad is not None and id(parameter) not in router_ids
-        ]
-        stats = {}
-        if global_max_norm > 0 and non_router_params:
-            non_router_norm = torch.nn.utils.clip_grad_norm_(
-                non_router_params, global_max_norm)
-            stats['GradNorm/non_router'] = float(non_router_norm)
-            stats['GradClip/non_router_scale'] = self._clip_scale(
-                global_max_norm, non_router_norm)
-
-        router_norm = torch.nn.utils.clip_grad_norm_(router_params, router_max_norm)
-        stats['GradNorm/router'] = float(router_norm)
-        stats['GradClip/router_scale'] = self._clip_scale(
-            router_max_norm, router_norm)
-        return stats
+        if global_max_norm <= 0:
+            return {}
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor.net.parameters(), global_max_norm)
+        return {
+            'GradNorm/all': float(total_norm),
+            'GradClip/all_scale': self._clip_scale(global_max_norm, total_norm),
+        }
 
     def cycle_dataset(self, loader):
         """Do a cycle of training or validation."""
@@ -187,8 +149,7 @@ class LTRTrainer(BaseTrainer):
                     self.optimizer.step()
                 else:
                     self.scaler.scale(loss).backward()
-                    if (self.settings.grad_clip_norm > 0 or
-                            getattr(self.settings, 'router_grad_clip_norm', 0.0) > 0):
+                    if self.settings.grad_clip_norm > 0:
                         self.scaler.unscale_(self.optimizer)
                     stats.update(self._clip_gradients())
                     self.scaler.step(self.optimizer)

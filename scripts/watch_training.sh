@@ -4,7 +4,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
 RUN_DIR="${RUN_DIR:-/root/fnvme/PETTrack_runs/v8_annotation_free_20260711}"
-CONFIG_NAME="${CONFIG_NAME:-generated/felt_pet_track_v8_stage1_expert}"
+CONFIG_NAME="${CONFIG_NAME:-felt_pet_track}"
 CONFIG_LOG_NAME="${CONFIG_NAME//\//__}"
 LOG="${LOG:-$RUN_DIR/logs/watch_training.log}"
 TRAIN_LOG="$RUN_DIR/logs/pet_track-$CONFIG_LOG_NAME.log"

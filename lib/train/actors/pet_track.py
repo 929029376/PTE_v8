@@ -1,10 +1,11 @@
 """PET-Track actor with one baseline-localization plus SRBT objective stack."""
+from collections.abc import Mapping
+
 import torch
 
 from .pet_track_base import PETTrackBaseActor
 from lib.models.layers.pet_losses import PetTrackLoss
 from lib.models.layers.srbt_belief import REAPPEARING, VISIBLE
-from lib.utils.route_motion import ROUTE_MOTION_DIM
 from lib.utils.heapmap_utils import generate_heatmap
 
 
@@ -18,44 +19,6 @@ REQUIRED_SRBT_PREDICTIONS = frozenset({
     "identity_embeddings",
     "template_identity",
 })
-
-
-def _balanced_singleton_routes(batch_size, epoch, expert_names):
-    names = tuple(expert_names)
-    if not names or len(set(names)) != len(names):
-        raise ValueError("expert_names must be non-empty and unique")
-    if batch_size < 1:
-        raise ValueError("batch_size must be positive")
-    if torch.is_tensor(epoch):
-        epoch = epoch.detach().reshape(-1)[0].item()
-    offset = int(epoch) % len(names)
-    return [
-        (names[(offset + index) % len(names)],)
-        for index in range(int(batch_size))
-    ]
-
-
-def _augment_route_motion(cues, training, dropout_probability, jitter_std):
-    """Approximate prediction-history noise without using current GT."""
-    if cues is None or not training:
-        return cues
-    output = cues.clone()
-    valid = output[:, -1] > 0
-    dropout_probability = float(dropout_probability)
-    jitter_std = float(jitter_std)
-    if not 0.0 <= dropout_probability <= 1.0:
-        raise ValueError("route-motion dropout must be in [0, 1]")
-    if jitter_std < 0.0:
-        raise ValueError("route-motion jitter must be non-negative")
-
-    dropped = torch.rand(
-        output.shape[0], device=output.device) < dropout_probability
-    output[dropped] = 0.0
-    jittered = valid & ~dropped
-    if jitter_std > 0.0 and jittered.any():
-        output[jittered, :-1] += torch.randn_like(
-            output[jittered, :-1]) * jitter_std
-    return output
 
 
 class PETTrackActor(PETTrackBaseActor):
@@ -86,59 +49,107 @@ class PETTrackActor(PETTrackBaseActor):
                 cfg.MODEL.SRBT.TEACHER, "HAZARD_BINS", 129)),
         )
         self.srbt_enabled = bool(getattr(cfg.MODEL.SRBT, "ENABLE", False))
-        self.pet_enabled = bool(getattr(cfg.MODEL.PET, "ENABLE", False))
-        self.use_absence = (not self.srbt_enabled and self.pet_enabled
-                            and bool(getattr(cfg.MODEL.PET, "ABSENCE_HEAD", False)))
-        self.use_redetect = (not self.srbt_enabled and self.pet_enabled
-                             and bool(getattr(cfg.MODEL.PET, "REDETECT_HEAD", False)))
-        self.use_memory_policy = (self.pet_enabled
-                                  and not self.srbt_enabled
-                                  and bool(getattr(cfg.MODEL.PET, "USE_LEARNED_POLICY", True))
-                                  and bool(getattr(cfg.MODEL.PET, "MEMORY_POLICY", True)))
-        stage = getattr(cfg.TRAIN, "STAGE", "") or getattr(cfg.TRAIN, "EXPERT_STAGE", "all")
-        stage = "all" if stage in (None, "", "all") else str(stage).lower()
-        self.stage = "srbt" if self.srbt_enabled else stage
-        # T_max is used to normalize the sampled frozen_age for policy training.
-        sm_cfg = getattr(cfg.MODEL, "STATE_MACHINE", None)
-        self.t_max = float(getattr(sm_cfg, "T_MAX", 50)) if sm_cfg is not None else 50.0
-        # Counterfactual route evaluation is enabled only in router stages.
-        self.use_route = False
+        self.stage = "srbt" if self.srbt_enabled else "base"
         self.active_losses = (
             {"base", "srbt"} if self.srbt_enabled else {"base"})
 
-    @staticmethod
-    def _prepare_route_motion(cues, batch_size, device):
-        if cues is None:
-            return None
-        cues = torch.as_tensor(cues, device=device, dtype=torch.float32)
-        if cues.ndim == 1 and batch_size == 1:
-            cues = cues.unsqueeze(0)
-        elif cues.ndim == 2 and cues.shape == (ROUTE_MOTION_DIM, batch_size):
-            cues = cues.transpose(0, 1)
-        if cues.ndim != 2 or cues.shape != (batch_size, ROUTE_MOTION_DIM):
-            raise ValueError(
-                "route_motion_cues must collate to (K, B) or (B, K)")
-        return cues.contiguous()
-
-    @staticmethod
-    def _prepare_template_frame_ids(frame_ids, batch_size, template_count,
-                                    device):
-        if frame_ids is None:
-            return None
-        frame_ids = torch.as_tensor(
-            frame_ids, device=device, dtype=torch.long)
-        if frame_ids.shape == (template_count, batch_size):
-            frame_ids = frame_ids.transpose(0, 1)
-        if frame_ids.shape != (batch_size, template_count):
-            raise ValueError(
-                "template_frame_ids must collate to (M, B) or (B, M)")
-        return frame_ids.contiguous()
-
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _batch_first_future(value, batch_size, device):
+        if value is None:
+            return None
+        value = torch.as_tensor(value, device=device)
+        if value.ndim == 5 and value.shape[0] != batch_size \
+                and value.shape[1] == batch_size:
+            value = value.permute(1, 0, 2, 3, 4)
+        if value.ndim != 5 or value.shape[0] != batch_size:
+            raise ValueError("future observations must have shape (B,H,C,W,W) or (H,B,C,W,W)")
+        return value.contiguous()
+
+    @staticmethod
+    def _batch_first_future_mask(value, batch_size, device):
+        if value is None:
+            return None
+        value = torch.as_tensor(value, device=device, dtype=torch.bool)
+        if value.ndim == 2 and value.shape[0] != batch_size \
+                and value.shape[1] == batch_size:
+            value = value.transpose(0, 1)
+        if value.ndim != 2 or value.shape[0] != batch_size:
+            raise ValueError("future_valid must have shape (B,H) or (H,B)")
+        return value.contiguous()
+
+    @staticmethod
+    def _select_posterior(previous, updated, valid):
+        if bool(valid.all()):
+            return updated
+        if not bool(valid.any()):
+            return previous
+        if isinstance(updated, Mapping):
+            return {
+                key: PETTrackActor._select_posterior(
+                    previous[key], value, valid)
+                for key, value in updated.items()
+            }
+        if not torch.is_tensor(updated) or updated.ndim == 0:
+            return updated
+        if previous.shape != updated.shape:
+            if previous.ndim == updated.ndim and previous.shape[0] == updated.shape[0] \
+                    and previous.numel() == 0:
+                previous = torch.zeros_like(updated)
+            else:
+                raise ValueError("posterior field shape changed unexpectedly")
+        mask = valid.reshape(valid.shape[0], *([1] * (updated.ndim - 1)))
+        return torch.where(mask, updated, previous)
+
+    def _history_posterior(self, zi, ze, data, batch_size, device, dtype):
+        values = (
+            data.get("history_images"),
+            data.get("history_event_images"),
+            data.get("history_valid"),
+        )
+        if all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise RuntimeError(
+                "history_images, history_event_images, and history_valid "
+                "are required together")
+        history_images = self._batch_first_future(values[0], batch_size, device)
+        history_events = self._batch_first_future(values[1], batch_size, device)
+        history_valid = self._batch_first_future_mask(
+            values[2], batch_size, device)
+        if history_images.shape[:2] != history_events.shape[:2]:
+            raise ValueError("history RGB, event, and validity horizons must match")
+        if history_images.shape[1] < history_valid.shape[1]:
+            pad = history_valid.shape[1] - history_images.shape[1]
+            rgb_pad = history_images.new_zeros(
+                batch_size, pad, *history_images.shape[2:])
+            event_pad = history_events.new_zeros(
+                batch_size, pad, *history_events.shape[2:])
+            history_images = torch.cat((rgb_pad, history_images), dim=1)
+            history_events = torch.cat((event_pad, history_events), dim=1)
+        if history_images.shape[:2] != history_valid.shape:
+            raise ValueError("history RGB, event, and validity horizons must match")
+
+        model = self.net.module if hasattr(self.net, "module") else self.net
+        posterior = model.initialize_srbt_posterior(batch_size, device, dtype)
+        with torch.no_grad():
+            for frame_id in range(history_images.shape[1]):
+                valid = history_valid[:, frame_id]
+                if not bool(valid.any()):
+                    continue
+                history_out = self.net(
+                    zi=zi,
+                    ze=ze,
+                    xi=history_images[:, frame_id:frame_id + 1],
+                    xe=history_events[:, frame_id:frame_id + 1],
+                    previous_posterior=posterior,
+                )
+                posterior = self._select_posterior(
+                    posterior, history_out["srbt_posterior"], valid)
+        return posterior
+
     def forward_pass(self, data):
-        """Forward pass that builds one causal belief inside the network and
-        feeds it to all consumers (router / absence / memory policy). Optionally runs all
-        experts for IoU soft routing."""
+        """Forward pass for baseline localization plus causal SRBT outputs."""
         zi = data['template_images'].permute(1, 0, 2, 3, 4)
         ze = data['template_event_images'].permute(1, 0, 2, 3, 4)
         xi = data['search_images'].permute(1, 0, 2, 3, 4)
@@ -156,46 +167,8 @@ class PETTrackActor(PETTrackBaseActor):
             mask_z = torch.cat(mask_z, dim=1)
             ce_keep_rate = self._adjust_keep_rate(data.get('epoch', 0))
 
-        # NOTE: in DDP mode auxiliary trainable heads must run inside
-        # self.net(...), otherwise DDP can mark the same parameter ready twice.
-        net = self.net
-        if hasattr(net, 'module'):
-            net = net.module
-
-        redetect_mask = self._absent_to_present_mask(data, xi.shape[0], xi.device)
-        is_training = bool(getattr(self.net, 'training', True))
-        if is_training:
-            frozen_age = torch.rand(xi.shape[0], device=xi.device)
-        else:
-            # Deterministic stratified coverage of the training distribution.
-            # This keeps Stage-2 checkpoint ranking reproducible.
-            frozen_age = (torch.arange(
-                xi.shape[0], device=xi.device, dtype=torch.float32) + 0.5
-            ) / xi.shape[0]
-        redetect_images = data.get('redetect_search_images')
-        route_motion = self._prepare_route_motion(
-            data.get('route_motion_cues'), xi.shape[0], xi.device)
-        template_frame_ids = self._prepare_template_frame_ids(
-            data.get('template_frame_ids'), xi.shape[0], ze.shape[1],
-            xi.device)
-        data_cfg = getattr(self.cfg, "DATA", None)
-        route_motion = _augment_route_motion(
-            route_motion,
-            training=is_training,
-            dropout_probability=float(getattr(
-                data_cfg, "ROUTE_MOTION_DROPOUT", 0.1)),
-            jitter_std=float(getattr(
-                data_cfg, "ROUTE_MOTION_JITTER_STD", 0.02)),
-        )
-        if self.stage in ("c3", "all") and self.use_redetect:
-            missing = [
-                key for key in ("redetect_search_images", "redetect_search_anno")
-                if key not in data
-            ]
-            if missing:
-                raise RuntimeError(
-                    f"C3 training batch is missing global redetection fields: {missing}")
-            redetect_images = data["redetect_search_images"]
+        previous_posterior = self._history_posterior(
+            zi, ze, data, xi.shape[0], xi.device, xi.dtype)
 
         forward_kwargs = {
             "zi": zi,
@@ -206,19 +179,14 @@ class PETTrackActor(PETTrackBaseActor):
             "ce_template_mask": box_mask_z,
             "ce_keep_rate": ce_keep_rate,
             "return_last_attn": False,
-            "redetect_images": redetect_images,
-            "redetect_mask": redetect_mask,
-            "template_anno": z_anno,
-            "template_frame_ids": template_frame_ids,
-            "route_motion": route_motion,
-            "frozen_age": frozen_age,
+            "previous_posterior": previous_posterior,
+            "future_images": self._batch_first_future(
+                data.get("future_images"), xi.shape[0], xi.device),
+            "future_event_images": self._batch_first_future(
+                data.get("future_event_images"), xi.shape[0], xi.device),
+            "future_valid": self._batch_first_future_mask(
+                data.get("future_valid"), xi.shape[0], xi.device),
         }
-        if self.stage == "expert":
-            expert_names = tuple(getattr(net, "expert_names", ()))
-            if not expert_names:
-                expert_names = tuple(self.cfg.MODEL.EXPERT.NAMES)
-            forward_kwargs["route"] = _balanced_singleton_routes(
-                xi.shape[0], data.get("epoch", 0), expert_names)
         out_dict = self.net(**forward_kwargs)
 
         return out_dict
@@ -251,8 +219,14 @@ class PETTrackActor(PETTrackBaseActor):
             if predictions is None:
                 raise RuntimeError(
                     "SRBT training requires srbt_predictions from model forward")
-            missing = sorted(REQUIRED_SRBT_PREDICTIONS - predictions.keys())
-            if missing:
+            actual = set(predictions)
+            if actual != REQUIRED_SRBT_PREDICTIONS:
+                missing = sorted(REQUIRED_SRBT_PREDICTIONS - actual)
+                extra = sorted(actual - REQUIRED_SRBT_PREDICTIONS)
+                if extra:
+                    raise RuntimeError(
+                        "SRBT predictions must expose exactly eight outputs; "
+                        f"extra outputs: {extra}")
                 raise RuntimeError(
                     f"SRBT predictions missing required outputs: {missing}")
             targets = self._build_srbt_targets(
@@ -308,31 +282,3 @@ class PETTrackActor(PETTrackBaseActor):
             self.cfg.MODEL.BACKBONE.STRIDE,
         )[-1].unsqueeze(1).to(device=device)
         return targets
-
-    # ------------------------------------------------------------------ #
-    def _absent_to_present_mask(self, gt_dict, B, device):
-        """True reappearance: previous frame absent, current frame present."""
-        current = gt_dict.get("current_present", None)
-        previous = gt_dict.get("previous_present", None)
-        if current is not None and previous is not None:
-            cur = current[-1] if current.dim() > 1 else current
-            prev = previous[-1] if previous.dim() > 1 else previous
-            cur = cur.to(device=device).reshape(-1).bool()
-            prev = prev.to(device=device).reshape(-1).bool()
-            if cur.numel() == B and prev.numel() == B:
-                return (~prev) & cur
-
-        # Legacy key name: FELT absent.txt is a presence flag in this project
-        # (1=present, 0=absent), verified against zero-box frames.
-        search_present = gt_dict.get("search_absent", None)
-        if (search_present is not None and torch.is_tensor(search_present)
-                and search_present.shape[0] > 1):
-            prev = search_present[-2].to(device=device).reshape(-1) > 0
-            cur = search_present[-1].to(device=device).reshape(-1) > 0
-            if cur.numel() == B and prev.numel() == B:
-                return (~prev) & cur
-        if self.stage in ("c3", "all"):
-            raise RuntimeError(
-                "C3 training requires previous_present/current_present or "
-                "at least two search_absent frames")
-        return torch.zeros(B, dtype=torch.bool, device=device)

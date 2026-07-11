@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from lib.models.layers.heterogeneous_tail import (
+from lib.models.layers.srbt_evidence_adapters import (
     _split_search_modalities,
     build_evidence_adapters,
 )
@@ -127,7 +127,9 @@ class EvidenceBank(nn.Module):
                 raise ValueError("all evidence token tensors must share (B, N)")
 
         lens_x = 2 * self.search_tokens_per_modality
-        shared_rgb, shared_event = self._search_maps(shared_tokens)
+        appearance_tokens = self.adapters["appearance"](
+            shared_tokens, lens_x=lens_x)
+        shared_rgb, shared_event = self._search_maps(appearance_tokens)
 
         motion_tokens = self.adapters["motion"](
             shared_tokens, lens_x=lens_x)
@@ -142,7 +144,9 @@ class EvidenceBank(nn.Module):
         cross_adapted = self.adapters["cross"](
             shared_tokens, lens_x=lens_x)
         cross_rgb, cross_event = self._search_maps(cross_adapted)
-        identity_rgb, identity_event = self._search_maps(identity_tokens)
+        identity_adapted = self.adapters["identity"](
+            identity_tokens, lens_x=lens_x)
+        identity_rgb, identity_event = self._search_maps(identity_adapted)
 
         evidence_maps = OrderedDict((
             ("appearance", shared_rgb),
@@ -174,6 +178,7 @@ class EvidenceBank(nn.Module):
         weights = gates / (gates.sum(dim=-1, keepdim=True) + self.gate_epsilon)
         combined = (weights * likelihood_logits).sum(dim=-1)
         return {
+            "evidence_maps": evidence_maps,
             "evidence": evidence,
             "likelihood_logits": likelihood_logits,
             "gates": gates,

@@ -28,13 +28,6 @@ def _baseline_config():
     model_cfg = deepcopy(cfg)
     model_cfg.MODEL.PRETRAIN_FILE = ""
     model_cfg.MODEL.PRETRAINED_BASELINE_CKPT = ""
-    model_cfg.MODEL.EXPERT.ENABLE = False
-    model_cfg.MODEL.EXPERT.ROUTER_ENABLE = False
-    model_cfg.MODEL.PET.ENABLE = False
-    model_cfg.MODEL.PET.PHYSICS_ROUTER = False
-    model_cfg.MODEL.PET.HETEROGENEOUS_TAIL = False
-    model_cfg.MODEL.PET.ABSENCE_HEAD = False
-    model_cfg.MODEL.PET.REDETECT_HEAD = False
     model_cfg.MODEL.MEMORY.AMAH_LAYERS = [5, 8, 11]
     model_cfg.MODEL.MEMORY.AMAH_SP_LAYERS = [[1, 3], [4, 6], [7, 9]]
     model_cfg.DATA.SEARCH.SIZE = 256
@@ -65,14 +58,14 @@ def test_real_amttrack_checkpoint_preserves_baseline_eval_path():
     assert report["loaded_count"] == 288
     assert len(report["loaded_keys"]) == 288
     assert all(key.startswith(INHERITED_PREFIXES) for key in report["loaded_keys"])
-    assert model.expert_enabled is False
-    assert model.pet_enabled is False
-    assert model.expert_router is None
-    assert model.expert_fusion is None
-    assert model.hetero_tail is None
-    assert model.event_belief is None
-    assert model.absence_predictor is None
-    assert model.memory_policy is None
+    assert not hasattr(model, "expert_enabled")
+    assert not hasattr(model, "pet_enabled")
+    assert not hasattr(model, "expert_router")
+    assert not hasattr(model, "expert_fusion")
+    assert not hasattr(model, "hetero_tail")
+    assert not hasattr(model, "event_belief")
+    assert not hasattr(model, "absence_predictor")
+    assert not hasattr(model, "memory_policy")
     assert model.redetect_expert is None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

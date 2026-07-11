@@ -126,11 +126,7 @@ def _save_tracker_output(seq: Sequence, tracker: Tracker, output: dict):
             flag_file = '{}_absent.txt'.format(base_results_path)
             save_flag(flag_file, data)
 
-        if key == 'c3_debug':
-            debug_file = '{}_c3_debug.csv'.format(base_results_path)
-            save_debug_csv(debug_file, data)
-
-        elif key == 'time':
+        if key == 'time':
             if isinstance(data[0], dict):
                 data_dict = _convert_dict(data)
 

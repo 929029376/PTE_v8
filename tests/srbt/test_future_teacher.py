@@ -124,6 +124,7 @@ def test_default_and_canonical_teacher_configuration_is_exact():
         "IDENTITY_DIM": 32,
         "HAZARD_BINS": 129,
         "MAX_HORIZON": 128,
+        "ENCODE_CHUNK_SIZE": 2,
     }
 
     config_path = (

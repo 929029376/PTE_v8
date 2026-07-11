@@ -19,8 +19,6 @@ def update_settings(settings, cfg):
     settings.scale_jitter_factor = {'template': cfg.DATA.TEMPLATE.SCALE_JITTER,
                                     'search': cfg.DATA.SEARCH.SCALE_JITTER}
     settings.grad_clip_norm = cfg.TRAIN.GRAD_CLIP_NORM
-    settings.router_grad_clip_norm = float(
-        getattr(cfg.TRAIN, "ROUTER_GRAD_CLIP_NORM", 0.0))
     settings.print_stats = None
     settings.batchsize = cfg.TRAIN.BATCH_SIZE
     settings.scheduler_type = cfg.TRAIN.SCHEDULER.TYPE
@@ -156,14 +154,16 @@ def _unwrap_net(net):
     return net.module if hasattr(net, "module") else net
 
 
-def _normalized_stage(cfg):
-    stage = getattr(cfg.TRAIN, "STAGE", "") or getattr(cfg.TRAIN, "EXPERT_STAGE", "all")
-    stage = "all" if stage in (None, "", "all") else str(stage).lower()
-    return stage
-
-
 def assert_all_trainable_params_in_optimizer(model, optimizer):
-    opt_param_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    counts = {}
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            counts[id(param)] = counts.get(id(param), 0) + 1
+    duplicates = [name for name, param in model.named_parameters()
+                  if counts.get(id(param), 0) > 1]
+    if duplicates:
+        raise RuntimeError("Parameters appear multiple times in optimizer: " + ", ".join(duplicates))
+    opt_param_ids = set(counts)
     missing = [name for name, param in model.named_parameters()
                if param.requires_grad and id(param) not in opt_param_ids]
     if missing:
@@ -175,59 +175,55 @@ def _optimizer_groups(net, cfg):
     model = _unwrap_net(net)
     lr = cfg.TRAIN.LR
     wd = cfg.TRAIN.WEIGHT_DECAY
-    stage = _normalized_stage(cfg)
-    base_mult = float(getattr(cfg.TRAIN, "BASE_LR_MULTIPLIER_IN_ALL", cfg.TRAIN.BACKBONE_MULTIPLIER))
-    router_mult = float(getattr(cfg.TRAIN, "ROUTER_LR_MULTIPLIER", 1.0))
-    router_objective_version = int(getattr(
-        cfg.TRAIN, "ROUTER_OBJECTIVE_VERSION", 0))
-    reset_router_on_migration = bool(getattr(
-        cfg.TRAIN, "ROUTER_RESET_ON_OBJECTIVE_MIGRATION", False))
-    if stage != "all":
-        base_mult = float(getattr(cfg.TRAIN, "BACKBONE_MULTIPLIER", 0.1))
-
-    specs = [
-        ("backbone", getattr(model, "backbone", None), lr * base_mult),
-        ("memory", getattr(model, "memory", None), lr * base_mult),
-        ("box_head", getattr(model, "box_head", None), lr * base_mult),
-        ("expert_router", getattr(model, "expert_router", None), lr * router_mult),
-        ("expert_fusion", getattr(model, "expert_fusion", None), lr),
-        ("hetero_tail", getattr(model, "hetero_tail", None), lr),
-        ("event_belief", getattr(model, "event_belief", None), lr),
-        ("absence_predictor", getattr(model, "absence_predictor", None), lr),
-        ("memory_policy", getattr(model, "memory_policy", None), lr),
-        ("redetect_expert", getattr(model, "redetect_expert", None), lr),
-    ]
-
     used = set()
     groups = []
-    for name, module, group_lr in specs:
-        if module is None:
-            continue
-        params = [p for p in module.parameters() if p.requires_grad and id(p) not in used]
+    named_params = list(model.named_parameters())
+
+    def add_group(name, group_lr, predicate):
+        params = [
+            param for param_name, param in named_params
+            if param.requires_grad and id(param) not in used and predicate(param_name)
+        ]
         if not params:
-            continue
+            return
         used.update(id(p) for p in params)
-        group = {
+        groups.append({
             "name": name,
             "params": params,
             "lr": group_lr,
             "weight_decay": wd,
             "param_count": sum(p.numel() for p in params),
-        }
-        if name == "expert_router":
-            group["objective_version"] = router_objective_version
-            group["reset_on_objective_migration"] = reset_router_on_migration
-        groups.append(group)
-
-    other = [p for p in model.parameters() if p.requires_grad and id(p) not in used]
-    if other:
-        groups.append({
-            "name": "other_trainable",
-            "params": other,
-            "lr": lr,
-            "weight_decay": wd,
-            "param_count": sum(p.numel() for p in other),
         })
+
+    add_group(
+        "vit_blocks_1_8", lr * 0.1,
+        lambda name: (
+            name.startswith("backbone.blocks.")
+            and int(name.split(".")[2]) < 8
+        ) or (
+            name.startswith("backbone.")
+            and not name.startswith((
+                "backbone.blocks.", "backbone.norm.", "backbone.amah_"))
+        ))
+    add_group(
+        "vit_blocks_9_12_core", lr * 0.25,
+        lambda name: (
+            name.startswith("backbone.blocks.")
+            and int(name.split(".")[2]) >= 8
+        ) or name.startswith((
+            "backbone.norm.", "backbone.amah_", "memory.", "box_head.")))
+    add_group(
+        "srbt_teacher", lr,
+        lambda name: name.startswith("srbt_teacher."))
+    add_group(
+        "srbt_student", lr,
+        lambda name: name.startswith(("srbt_", "redetect_expert.")))
+
+    other = [name for name, param in named_params
+             if param.requires_grad and id(param) not in used]
+    if other:
+        raise RuntimeError(
+            "Unowned trainable parameters: " + ", ".join(other))
     return groups
 
 

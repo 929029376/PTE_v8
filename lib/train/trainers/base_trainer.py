@@ -6,6 +6,63 @@ from lib.train.admin import multigpu
 from torch.utils.data.distributed import DistributedSampler
 
 
+SRBT_SCHEMA_VERSION = 1
+SRBT_CHECKPOINT_REQUIRED_KEYS = (
+    "schema_version",
+    "net",
+    "optimizer",
+    "lr_scheduler",
+    "amp_scaler",
+    "epoch",
+    "best_val_score",
+    "best_val_epoch",
+    "config_summary",
+)
+
+
+def validate_srbt_checkpoint_schema(state):
+    missing = [key for key in SRBT_CHECKPOINT_REQUIRED_KEYS if key not in state]
+    if missing:
+        raise RuntimeError(
+            "SRBT resume requires schema_version=1; missing keys: "
+            + ", ".join(missing))
+    if int(state["schema_version"]) != SRBT_SCHEMA_VERSION:
+        raise RuntimeError("SRBT resume requires schema_version=1")
+    net = state["net"]
+    if not isinstance(net, dict):
+        raise RuntimeError("SRBT checkpoint net must be a state dict")
+    for key in ("optimizer", "config_summary"):
+        if not isinstance(state[key], dict):
+            raise RuntimeError(f"SRBT checkpoint {key} must be a state dict")
+    if state["lr_scheduler"] is not None \
+            and not isinstance(state["lr_scheduler"], dict):
+        raise RuntimeError("SRBT checkpoint lr_scheduler must be a state dict or None")
+    if state["amp_scaler"] is not None \
+            and not isinstance(state["amp_scaler"], dict):
+        raise RuntimeError("SRBT checkpoint amp_scaler must be a state dict or None")
+    if any(key.startswith(("expert_router.", "expert_fusion.", "absence_predictor.",
+                           "memory_policy.")) for key in net):
+        raise RuntimeError("Legacy PET route checkpoint is not a valid SRBT resume")
+    return True
+
+
+def _config_summary(settings):
+    cfg = getattr(settings, "cfg", None)
+    if cfg is None:
+        return {}
+    return {
+        "MODEL.SRBT.ENABLE": bool(getattr(cfg.MODEL.SRBT, "ENABLE", False)),
+        "DATA.SRBT.ENABLE": bool(getattr(cfg.DATA.SRBT, "ENABLE", False)),
+    }
+
+
+def _scaler_state(trainer):
+    scaler = getattr(trainer, "scaler", None)
+    if scaler is None:
+        scaler = getattr(trainer, "amp_scaler", None)
+    return None if scaler is None else scaler.state_dict()
+
+
 class BaseTrainer:
     """Base trainer class. Contains functions for training and saving/loading checkpoints.
     Trainer classes should inherit from this one and overload the train_epoch function."""
@@ -59,7 +116,7 @@ class BaseTrainer:
         else:
             self._checkpoint_dir = None
 
-    def train(self, max_epochs, load_latest=False, fail_safe=True, load_previous_ckpt=False, distill=False):
+    def train(self, max_epochs, load_latest=False, fail_safe=True):
         """Do training for the given number of epochs.
         args:
             max_epochs - Max number of training epochs,
@@ -74,12 +131,6 @@ class BaseTrainer:
             try:
                 if load_latest:
                     self.load_checkpoint()
-                if load_previous_ckpt:
-                    directory = '{}/{}'.format(self._checkpoint_dir, self.settings.project_path_prv)
-                    self.load_state_dict(directory)
-                if distill:
-                    directory_teacher = '{}/{}'.format(self._checkpoint_dir, self.settings.project_path_teacher)
-                    self.load_state_dict(directory_teacher, distill=True)
                 self.max_epochs = max_epochs
                 for epoch in range(self.epoch+1, max_epochs+1):
                     self.epoch = epoch
@@ -276,11 +327,16 @@ class BaseTrainer:
             'net_info': getattr(net, 'info', None),
             'constructor': getattr(net, 'constructor', None),
             'optimizer': self.optimizer.state_dict(),
+            'lr_scheduler': (
+                None if self.lr_scheduler is None else self.lr_scheduler.state_dict()),
+            'amp_scaler': _scaler_state(self),
             'stats': self.stats,
             'best_val_score': getattr(self, 'best_val_score', None),
             'best_val_epoch': getattr(self, 'best_val_epoch', 0),
-            'settings': self.settings
+            'schema_version': SRBT_SCHEMA_VERSION,
+            'config_summary': _config_summary(self.settings),
         }
+        validate_srbt_checkpoint_schema(state)
 
         directory = '{}/{}'.format(self._checkpoint_dir, self.settings.project_path)
         print(directory)
@@ -300,57 +356,7 @@ class BaseTrainer:
         # Atomically replace the checkpoint when refreshing best.
         os.replace(tmp_file_path, file_path)
 
-    @staticmethod
-    def _migrate_optimizer_objectives(optimizer, configured_groups):
-        """Reset only optimizer groups whose training objective was upgraded."""
-        migrated = []
-        for group in optimizer.param_groups:
-            name = group.get("name")
-            configured = configured_groups.get(name)
-            if configured is None:
-                continue
-            loaded_version = int(group.get("objective_version", 0) or 0)
-            configured_version = int(configured.get("objective_version", 0) or 0)
-            if configured_version <= loaded_version:
-                continue
-            for parameter in group["params"]:
-                optimizer.state.pop(parameter, None)
-            group["lr"] = configured["lr"]
-            group["initial_lr"] = configured["lr"]
-            group["objective_version"] = configured_version
-            migrated.append((name, loaded_version, configured_version, group["lr"]))
-        return migrated
-
-    @staticmethod
-    def _reset_migrated_modules(net, migrations, configured_groups):
-        """Reset only modules explicitly tied to an upgraded objective."""
-        reset_names = [
-            name for name, _old, _new, _lr in migrations
-            if configured_groups.get(name, {}).get(
-                "reset_on_objective_migration", False)
-        ]
-        for name in reset_names:
-            module = getattr(net, name, None)
-            if module is None:
-                raise RuntimeError(
-                    f"Objective migration requested reset for missing module: {name}")
-            if (not torch.distributed.is_available()
-                    or not torch.distributed.is_initialized()
-                    or torch.distributed.get_rank() == 0):
-                for child in module.modules():
-                    reset_parameters = getattr(child, "reset_parameters", None)
-                    if callable(reset_parameters):
-                        reset_parameters()
-            if (torch.distributed.is_available()
-                    and torch.distributed.is_initialized()):
-                for parameter in module.parameters():
-                    torch.distributed.broadcast(parameter.data, src=0)
-                for buffer in module.buffers():
-                    torch.distributed.broadcast(buffer.data, src=0)
-            print("Model objective migration reset:", name)
-        return reset_names
-
-    def load_checkpoint(self, checkpoint = None, fields = None, ignore_fields = None, load_constructor = False):
+    def load_checkpoint(self, checkpoint=None, load_constructor=False):
         """Loads a network checkpoint file.
 
         Can be called in three different ways:
@@ -399,119 +405,36 @@ class BaseTrainer:
 
         # Load network
         checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+        validate_srbt_checkpoint_schema(checkpoint_dict)
 
         assert net_type == checkpoint_dict['net_type'], 'Network is not of correct type.'
 
-        if fields is None:
-            fields = checkpoint_dict.keys()
-        if ignore_fields is None:
-            ignore_fields = ['settings']
-
-        # Never load the scheduler. It exists in older checkpoints.
-        ignore_fields.extend(['lr_scheduler', 'constructor', 'net_type', 'actor_type', 'net_info'])
-
-        configured_groups = {
-            group.get("name"): {
-                "lr": group["lr"],
-                "objective_version": group.get("objective_version", 0),
-                "reset_on_objective_migration": group.get(
-                    "reset_on_objective_migration", False),
-            }
-            for group in self.optimizer.param_groups if group.get("name")
-        }
-
-        # Load all fields
-        migrations = []
-        for key in fields:
-            if key in ignore_fields:
-                continue
-            if key == 'net':
-                net.load_state_dict(checkpoint_dict[key])
-            elif key == 'optimizer':
-                self.optimizer.load_state_dict(checkpoint_dict[key])
-                migrations = self._migrate_optimizer_objectives(
-                    self.optimizer, configured_groups)
-                for name, old_version, new_version, lr in migrations:
-                    print("Optimizer objective migration:", name,
-                          f"v{old_version}->v{new_version}", "lr:", lr)
-            else:
-                setattr(self, key, checkpoint_dict[key])
-
-        self._reset_migrated_modules(net, migrations, configured_groups)
-
-        # for key in fields:
-        #     if key in ignore_fields:
-        #         continue
-        #     if key == 'net':
-        #         # 加载网络权重
-        #         model_dict = net.state_dict()
-        #         pretrained_dict = {k: v for k, v in checkpoint_dict[key].items() if k in model_dict}
-        #         model_dict.update(pretrained_dict)
-        #         net.load_state_dict(model_dict, strict=False)
-        #     elif key == 'optimizer':
-        #         # 跳过优化器状态加?
-        #         print('Skipping optimizer state loading due to model structure changes')
-        #         # self.optimizer.load_state_dict(checkpoint_dict[key])  # 注释掉这?
-        #     else:
-        #         setattr(self, key, checkpoint_dict[key])
-        
-
-        # Set the net info
-        if load_constructor and 'constructor' in checkpoint_dict and checkpoint_dict['constructor'] is not None:
+        net.load_state_dict(checkpoint_dict['net'], strict=True)
+        self.optimizer.load_state_dict(checkpoint_dict['optimizer'])
+        scheduler_state = checkpoint_dict['lr_scheduler']
+        if (self.lr_scheduler is None) != (scheduler_state is None):
+            raise RuntimeError(
+                "Checkpoint scheduler state does not match the trainer")
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(scheduler_state)
+        scaler_state = checkpoint_dict['amp_scaler']
+        scaler = getattr(self, "scaler", None)
+        if scaler is None:
+            scaler = getattr(self, "amp_scaler", None)
+        if (scaler is None) != (scaler_state is None):
+            raise RuntimeError(
+                "Checkpoint scaler state does not match the trainer")
+        if scaler is not None:
+            scaler.load_state_dict(scaler_state)
+        self.epoch = checkpoint_dict['epoch']
+        self.best_val_score = checkpoint_dict['best_val_score']
+        self.best_val_epoch = checkpoint_dict['best_val_epoch']
+        self.config_summary = checkpoint_dict['config_summary']
+        if load_constructor and checkpoint_dict.get('constructor') is not None:
             net.constructor = checkpoint_dict['constructor']
-        if 'net_info' in checkpoint_dict and checkpoint_dict['net_info'] is not None:
+        if checkpoint_dict.get('net_info') is not None:
             net.info = checkpoint_dict['net_info']
-
-        # Update the epoch in lr scheduler
-        if 'epoch' in fields:
-            self.lr_scheduler.last_epoch = self.epoch
-        # 2021.1.10 Update the epoch in data_samplers
-            for loader in self.loaders:
-                if isinstance(loader.sampler, DistributedSampler):
-                    loader.sampler.set_epoch(self.epoch)
-        return True
-
-    def load_state_dict(self, checkpoint=None, distill=False):
-        """Loads a network checkpoint file.
-
-        Can be called in three different ways:
-            load_checkpoint():
-                Loads the latest epoch from the workspace. Use this to continue training.
-            load_checkpoint(epoch_num):
-                Loads the network at the given epoch number (int).
-            load_checkpoint(path_to_checkpoint):
-                Loads the file from the given absolute path (str).
-        """
-        if distill:
-            net = self.actor.net_teacher.module if multigpu.is_multi_gpu(self.actor.net_teacher) \
-                else self.actor.net_teacher
-        else:
-            net = self.actor.net.module if multigpu.is_multi_gpu(self.actor.net) else self.actor.net
-
-        net_type = type(net).__name__
-
-        if isinstance(checkpoint, str):
-            # checkpoint is the path
-            if os.path.isdir(checkpoint):
-                checkpoint_list = sorted(glob.glob('{}/*_ep*.pth.tar'.format(checkpoint)))
-                if checkpoint_list:
-                    checkpoint_path = checkpoint_list[-1]
-                else:
-                    raise Exception('No checkpoint found')
-            else:
-                checkpoint_path = os.path.expanduser(checkpoint)
-        else:
-            raise TypeError
-
-        # Load network
-        print("Loading pretrained model from ", checkpoint_path)
-        checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-
-        assert net_type == checkpoint_dict['net_type'], 'Network is not of correct type.'
-
-        missing_k, unexpected_k = net.load_state_dict(checkpoint_dict["net"], strict=False)
-        print("previous checkpoint is loaded.")
-        print("missing keys: ", missing_k)
-        print("unexpected keys:", unexpected_k)
-
+        for loader in self.loaders:
+            if isinstance(loader.sampler, DistributedSampler):
+                loader.sampler.set_epoch(self.epoch)
         return True

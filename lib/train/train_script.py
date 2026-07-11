@@ -1,4 +1,3 @@
-import glob
 import os
 from pathlib import Path
 # loss function related
@@ -21,15 +20,6 @@ import importlib
 from ..utils.focal_loss import FocalLoss
 
 
-def _has_resumable_checkpoint(checkpoint_dir):
-    checkpoint_dir = os.fspath(checkpoint_dir)
-    patterns = ("*_latest.pth.tar", "*_ep*.pth.tar")
-    return any(
-        glob.glob(os.path.join(checkpoint_dir, pattern))
-        for pattern in patterns
-    )
-
-
 def _training_log_path(save_dir, script_name, config_name):
     safe_config_name = str(config_name).replace("\\", "__").replace("/", "__")
     return Path(save_dir) / "logs" / (
@@ -37,7 +27,7 @@ def _training_log_path(save_dir, script_name, config_name):
 
 
 def run(settings):
-    settings.description = 'Training script for STARK-S, STARK-ST stage1, and STARK-ST stage2'
+    settings.description = 'SRBT PETTrack training'
 
     # update the default configs with config file
     if not os.path.exists(settings.cfg_file):
@@ -82,9 +72,6 @@ def run(settings):
         settings.device = torch.device("cuda:%d" % settings.local_rank)
     else:
         settings.device = torch.device("cuda:0")
-    settings.deep_sup = getattr(cfg.TRAIN, "DEEP_SUPERVISION", False)
-    settings.distill = getattr(cfg.TRAIN, "DISTILL", False)
-    settings.distill_loss_type = getattr(cfg.TRAIN, "DISTILL_LOSS_TYPE", "KL")
     settings.save_epoch_interval = getattr(cfg.TRAIN, "SAVE_EPOCH_INTERVAL", 50)
     settings.save_last_epochs = getattr(cfg.TRAIN, "SAVE_LAST_EPOCHS", 3)
     settings.save_epochs = list(getattr(cfg.TRAIN, "SAVE_EPOCHS", [79, 159, 239]) or [])
@@ -123,15 +110,5 @@ def run(settings):
 
     trainer = LTRTrainer(actor, [loader_train, loader_val], optimizer, settings, lr_scheduler, use_amp=use_amp)
 
-    init_checkpoint = getattr(cfg.TRAIN, "INIT_CHECKPOINT", "")
     load_latest = getattr(cfg.TRAIN, "LOAD_LATEST", True)
-    if init_checkpoint:
-        checkpoint_dir = os.path.join(trainer._checkpoint_dir, settings.project_path)
-        has_checkpoint = _has_resumable_checkpoint(checkpoint_dir)
-        if load_latest and has_checkpoint:
-            print("Existing training checkpoint found. Skipping INIT_CHECKPOINT and resuming latest checkpoint.")
-        else:
-            trainer.load_state_dict(init_checkpoint)
-
-    # train process
     trainer.train(cfg.TRAIN.EPOCH, load_latest=load_latest, fail_safe=True)

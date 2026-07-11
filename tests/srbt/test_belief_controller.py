@@ -7,7 +7,6 @@ from lib.models.layers.srbt_controller import (
     BeliefController,
     build_belief_controller,
 )
-from lib.models.layers.state_machine import State
 from lib.test.tracker.pet_track import PETTrack
 
 
@@ -215,14 +214,20 @@ def test_verified_srbt_recovery_consumes_the_pending_global_box():
     assert tracker._last_redetect_conf == 0.0
 
 
-def test_srbt_hold_and_redetect_never_update_event_background():
-    assert not PETTrack._should_update_event_background(
-        srbt_control=object(),
-        use_train_compatible_policy=False,
-        state_machine_state=State.FROZEN,
-    )
-    assert PETTrack._should_update_event_background(
-        srbt_control=None,
-        use_train_compatible_policy=False,
-        state_machine_state=State.FROZEN,
-    )
+def test_tracker_has_no_event_background_fallback():
+    assert not hasattr(PETTrack, "_should_update_event_background")
+
+
+def test_new_sequence_resets_causal_srbt_posterior():
+    tracker = object.__new__(PETTrack)
+    tracker._srbt_posterior = {"state_prob": torch.ones(1, 4)}
+    tracker._srbt_last_action = Action.HOLD
+    tracker._redetect_hypotheses = {"active_count": 1}
+    tracker._pending_redetect_box = [1.0, 2.0, 3.0, 4.0]
+
+    PETTrack._reset_srbt_sequence_state(tracker)
+
+    assert tracker._srbt_posterior is None
+    assert tracker._srbt_last_action is Action.TRACK
+    assert tracker._redetect_hypotheses is None
+    assert tracker._pending_redetect_box is None

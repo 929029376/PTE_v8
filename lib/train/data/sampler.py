@@ -2,7 +2,6 @@ import random
 import torch.utils.data
 import torch
 from lib.utils import TensorDict
-from lib.utils.route_motion import ROUTE_MOTION_DIM, causal_route_motion_cues
 from lib.train.data.srbt_labels import build_temporal_targets
 
 def no_processing(data):
@@ -56,7 +55,6 @@ class TrackingSampler(torch.utils.data.Dataset):
         self.frame_sample_mode = frame_sample_mode
         self.cfg = cfg
         self.training = bool(training)
-        train_cfg = getattr(cfg, "TRAIN", None)
         data_cfg = getattr(cfg, "DATA", None)
         srbt_cfg = getattr(data_cfg, "SRBT", None)
         self.srbt_enabled = bool(getattr(srbt_cfg, "ENABLE", False))
@@ -70,39 +68,6 @@ class TrackingSampler(torch.utils.data.Dataset):
             "visible_to_absent": float(getattr(anchor_weights, "PRESENT_TO_ABSENT", 0.25)),
             "absent_to_absent": float(getattr(anchor_weights, "ABSENT", 0.25)),
             "absent_to_present": float(getattr(anchor_weights, "REAPPEARING", 0.25)),
-        }
-        stage = getattr(train_cfg, "STAGE", None) or getattr(train_cfg, "EXPERT_STAGE", "all")
-        stage = "all" if stage in (None, "", "all") else str(stage).lower()
-        self.stage = stage
-        self.c3_event_sampling = (
-            self.stage in ("c3", "all")
-            and bool(getattr(data_cfg, "C3_EVENT_SAMPLING", False))
-            and self.frame_sample_mode == "causal"
-        )
-        self.c3_event_sample_prob = float(getattr(data_cfg, "C3_EVENT_SAMPLE_PROB", 0.8))
-        weights = getattr(data_cfg, "C3_EVENT_WEIGHTS", None)
-        self.c3_event_weights = {
-            "absent_to_present": float(getattr(weights, "ABSENT_TO_PRESENT", 0.35)),
-            "visible_to_absent": float(getattr(weights, "VISIBLE_TO_ABSENT", 0.25)),
-            "absent_to_absent": float(getattr(weights, "ABSENT_TO_ABSENT", 0.25)),
-            "hard_visible": float(getattr(weights, "HARD_VISIBLE", 0.15)),
-        }
-        self.motion_causal_sampling = (
-            self.training
-            and self.stage in ("router", "all")
-            and self.frame_sample_mode == "causal"
-            and bool(getattr(data_cfg, "MOTION_CAUSAL_SAMPLING", False))
-        )
-        self.motion_causal_sample_prob = float(getattr(
-            data_cfg, "MOTION_CAUSAL_SAMPLE_PROB", 0.0))
-        self.motion_causal_speed_threshold = float(getattr(
-            data_cfg, "MOTION_CAUSAL_SPEED_THRESHOLD", 0.08))
-        self.motion_causal_max_tries = int(getattr(
-            data_cfg, "MOTION_CAUSAL_MAX_TRIES", 8))
-        self._motion_candidate_cache = {}
-        self._motion_sequence_ids = {
-            id(dataset): list(range(dataset.get_num_sequences()))
-            for dataset in self.datasets
         }
         # self.batch_size = batch_size
 
@@ -170,89 +135,6 @@ class TrackingSampler(torch.utils.data.Dataset):
         data['is_reappear'] = ((~previous_present.bool()) & current_present.bool()).to(torch.uint8)
         return data
 
-    def _absence_boundary_ids(self, visible, absent, min_id=None, max_id=None):
-        visible = self._to_bool_list(visible)
-        absent = self._to_bool_list(absent)
-        if min_id is None or min_id < 0:
-            min_id = 0
-        if max_id is None or max_id > len(visible):
-            max_id = len(visible)
-
-        window = max(1, int(getattr(self, "visibility_boundary_window", 8)))
-        ids = []
-        for frame_id in range(min_id, max_id):
-            if not visible[frame_id]:
-                continue
-            left = max(0, frame_id - window)
-            right = min(len(absent), frame_id + window + 1)
-            if any(not absent[idx] for idx in range(left, right)):
-                ids.append(frame_id)
-        return ids
-
-    def _absence_ids(self, present_flags, min_id=None, max_id=None):
-        """Return frame ids where the legacy FELT presence flag is zero."""
-        present_flags = self._to_bool_list(present_flags)
-        if min_id is None or min_id < 0:
-            min_id = 0
-        if max_id is None or max_id > len(present_flags):
-            max_id = len(present_flags)
-        return [
-            idx for idx in range(min_id, max_id) if not present_flags[idx]
-        ]
-
-    def _c3_event_ids(self, visible, seq_info_dict, event_type, min_id=None, max_id=None):
-        if "absent" not in seq_info_dict:
-            return []
-        visible = self._to_bool_list(visible)
-        present = self._to_bool_list(seq_info_dict["absent"])
-        if min_id is None or min_id < 1:
-            min_id = 1
-        if max_id is None or max_id > len(present):
-            max_id = len(present)
-
-        ids = []
-        window = max(1, int(getattr(self, "visibility_boundary_window", 8)))
-        for frame_id in range(min_id, max_id):
-            prev = present[frame_id - 1]
-            cur = present[frame_id]
-            if event_type == "visible_to_visible" and prev and cur:
-                ids.append(frame_id)
-            elif event_type == "visible_to_absent" and prev and not cur:
-                ids.append(frame_id)
-            elif event_type == "absent_to_absent" and not prev and not cur:
-                ids.append(frame_id)
-            elif event_type == "absent_to_present" and not prev and cur:
-                ids.append(frame_id)
-            elif event_type == "hard_visible" and cur and visible[frame_id]:
-                left = max(0, frame_id - window)
-                right = min(len(present), frame_id + window + 1)
-                if any(not present[idx] for idx in range(left, right)):
-                    ids.append(frame_id)
-        return ids
-
-    def _c3_event_order(self):
-        return self._weighted_event_order(self.c3_event_weights)
-
-    @staticmethod
-    def _weighted_event_order(event_weights):
-        events = list(event_weights.keys())
-        weights = [max(0.0, event_weights[event]) for event in events]
-        order = []
-        remaining = events[:]
-        remaining_weights = weights[:]
-        while remaining:
-            if sum(remaining_weights) > 0:
-                event = random.choices(remaining, weights=remaining_weights, k=1)[0]
-            else:
-                event = random.choice(remaining)
-            idx = remaining.index(event)
-            order.append(event)
-            remaining.pop(idx)
-            remaining_weights.pop(idx)
-        if "visible_to_visible" not in order:
-            order.append("visible_to_visible")
-        return order
-
     def _srbt_anchor_ids(self, seq_info_dict, event_type,
                          min_id=None, max_id=None):
         present = torch.as_tensor(seq_info_dict["absent"], dtype=torch.bool)
@@ -311,25 +193,6 @@ class TrackingSampler(torch.utils.data.Dataset):
                 later_ids or event_ids, k=self.num_search_frames - 1)
         return [base_id] + prev_frame_ids, search_frame_ids
 
-    def _sample_c3_event_causal_frame_ids(self, visible, seq_info_dict, preferred_events=None):
-        if "absent" not in seq_info_dict:
-            return None, None, None
-        events = preferred_events or self._c3_event_order()
-        max_id = len(seq_info_dict["absent"])
-        for event_type in events:
-            event_ids = self._c3_event_ids(
-                visible, seq_info_dict, event_type,
-                min_id=self.num_template_frames,
-                max_id=max_id,
-            )
-            random.shuffle(event_ids)
-            for search_id in event_ids:
-                frame_ids = self._causal_frame_ids_for_anchor(
-                    visible, search_id, event_ids)
-                if frame_ids is not None:
-                    return *frame_ids, event_type
-        return None, None, None
-
     def _sample_srbt_event_causal_frame_ids(self, visible, seq_info_dict):
         if "absent" not in seq_info_dict:
             return None, None, None
@@ -366,118 +229,6 @@ class TrackingSampler(torch.utils.data.Dataset):
         for idx in range(frame_id - 1, -1, -1):
             if visible[idx]:
                 return idx
-        return None
-
-    @staticmethod
-    def _bbox_item(seq_info_dict, frame_id):
-        bbox = seq_info_dict["bbox"][frame_id]
-        if hasattr(bbox, "detach"):
-            bbox = bbox.detach().cpu().tolist()
-        return [float(item) for item in bbox]
-
-    def _causal_route_motion_for_frame(self, seq_info_dict, frame_id,
-                                       image_shape):
-        previous_id = self._previous_visible_id(
-            seq_info_dict.get("visible", []), frame_id)
-        if previous_id is None:
-            return torch.zeros(ROUTE_MOTION_DIM, dtype=torch.float32)
-        prior_id = self._previous_visible_id(
-            seq_info_dict.get("visible", []), previous_id)
-        if prior_id is None:
-            return torch.zeros(ROUTE_MOTION_DIM, dtype=torch.float32)
-        return causal_route_motion_cues(
-            self._bbox_item(seq_info_dict, prior_id),
-            self._bbox_item(seq_info_dict, previous_id),
-            image_shape[:2],
-        )
-
-    def _motion_candidate_ids_for_sequence(
-            self, dataset, seq_id, seq_info_dict, image_shape):
-        cache_key = (id(dataset), int(seq_id))
-        cached = self._motion_candidate_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        visible = self._to_bool_list(seq_info_dict.get("visible", []))
-        boxes = torch.as_tensor(seq_info_dict["bbox"], dtype=torch.float32)
-        sequence_length = min(len(visible), int(boxes.shape[0]))
-        visible_ids = torch.nonzero(
-            torch.as_tensor(visible[:sequence_length], dtype=torch.bool),
-            as_tuple=False,
-        ).flatten()
-        candidates = []
-        if visible_ids.numel() >= 2 and sequence_length > 0:
-            history_boxes = boxes[visible_ids]
-            image_hw = torch.as_tensor(image_shape[:2], dtype=torch.float32)
-            height, width = image_hw
-            image_scale = torch.stack([width, height]).clamp_min(1.0)
-            centers = history_boxes[:, :2] + 0.5 * history_boxes[:, 2:]
-            displacement = (
-                (centers[1:] - centers[:-1]) / image_scale
-            ).clamp(-1.0, 1.0)
-            speeds = displacement.square().sum(dim=1).sqrt().clamp_max(1.0)
-            pair_valid = (
-                (history_boxes[:-1, 2:] > 0).all(dim=1)
-                & (history_boxes[1:, 2:] > 0).all(dim=1)
-                & (height > 0)
-                & (width > 0)
-            )
-
-            frame_ids = torch.arange(sequence_length)
-            visible_before = torch.searchsorted(
-                visible_ids, frame_ids, right=False)
-            has_history = (
-                (frame_ids >= self.num_template_frames)
-                & (visible_before >= 2)
-            )
-            eligible_frames = frame_ids[has_history]
-            pair_ids = visible_before[has_history] - 2
-            selected = (
-                pair_valid[pair_ids]
-                & (speeds[pair_ids] >= self.motion_causal_speed_threshold)
-            )
-            candidates = eligible_frames[selected].tolist()
-        self._motion_candidate_cache[cache_key] = candidates
-        return candidates
-
-    def _sample_motion_causal_example(self, dataset, is_video_dataset):
-        if not is_video_dataset or not hasattr(dataset, "get_frame_shape"):
-            return None
-        sequence_ids = self._motion_sequence_ids.get(id(dataset), [])
-        for _ in range(max(self.motion_causal_max_tries, 1)):
-            if not sequence_ids:
-                return None
-            seq_id = random.choice(sequence_ids)
-            seq_info_dict = dataset.get_sequence_info(seq_id)
-            visible = seq_info_dict["visible"]
-            if (visible.type(torch.int64).sum().item()
-                    <= 2 * (self.num_search_frames + self.num_template_frames)):
-                continue
-            image_shape = dataset.get_frame_shape(seq_id)
-            candidates = self._motion_candidate_ids_for_sequence(
-                dataset, seq_id, seq_info_dict, image_shape)
-            if not candidates:
-                continue
-            search_id = random.choice(candidates)
-            base_id = self._previous_visible_id(visible, search_id)
-            if base_id is None:
-                continue
-            previous_ids = self._sample_visible_ids(
-                visible, num_ids=self.num_template_frames - 1,
-                min_id=base_id - self.max_gap, max_id=base_id)
-            if previous_ids is None:
-                continue
-            search_ids = [search_id]
-            if self.num_search_frames > 1:
-                later_candidates = [
-                    candidate for candidate in candidates
-                    if candidate >= search_id
-                ]
-                search_ids += random.choices(
-                    later_candidates or [search_id],
-                    k=self.num_search_frames - 1)
-            return (seq_id, visible, seq_info_dict,
-                    [base_id] + previous_ids, search_ids)
         return None
 
     def _replace_absent_search_boxes_for_crop(self, search_anno, search_frame_ids, seq_info_dict):
@@ -536,13 +287,20 @@ class TrackingSampler(torch.utils.data.Dataset):
 
     def _add_srbt_history_fields(self, data, dataset, seq_id, seq_info_dict,
                                  anchor):
-        start = max(0, anchor - self.srbt_history_length + 1)
-        history_frame_ids = list(range(start, anchor + 1))
-        history_images, history_event_images, history_anno, _ = dataset.get_frames(
-            seq_id, history_frame_ids, seq_info_dict)
-        height, width = history_images[0].shape[:2]
-        history_masks = history_anno.get(
-            "mask", [torch.zeros((height, width))] * len(history_frame_ids))
+        start = max(0, anchor - self.srbt_history_length)
+        history_frame_ids = list(range(start, anchor))
+        if history_frame_ids:
+            history_images, history_event_images, history_anno, _ = \
+                dataset.get_frames(seq_id, history_frame_ids, seq_info_dict)
+            height, width = history_images[0].shape[:2]
+            history_boxes = history_anno["bbox"]
+            history_masks = history_anno.get(
+                "mask", [torch.zeros((height, width))] * len(history_frame_ids))
+        else:
+            history_images = []
+            history_event_images = []
+            history_boxes = []
+            history_masks = []
 
         present = seq_info_dict.get("absent", seq_info_dict["visible"]).to(torch.bool)
         if "valid" in seq_info_dict:
@@ -562,7 +320,7 @@ class TrackingSampler(torch.utils.data.Dataset):
         data.update({
             "history_images": history_images,
             "history_event_images": history_event_images,
-            "history_anno": history_anno["bbox"],
+            "history_anno": history_boxes,
             "history_masks": history_masks,
             "history_frame_ids": padded_ids,
             "history_present": history_present,
@@ -590,22 +348,10 @@ class TrackingSampler(torch.utils.data.Dataset):
         while not valid:
             dataset = random.choices(self.datasets, self.p_datasets)[0]
             is_video_dataset = dataset.is_video_sequence()
-            motion_example = None
-            if (horizon is None
-                    and self.motion_causal_sampling
-                    and random.random() < self.motion_causal_sample_prob):
-                motion_example = self._sample_motion_causal_example(
-                    dataset, is_video_dataset)
-            if motion_example is not None:
-                (seq_id, visible, seq_info_dict,
-                 template_frame_ids, search_frame_ids) = motion_example
-            else:
-                seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(
-                    dataset, is_video_dataset)
+            seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(
+                dataset, is_video_dataset)
             if is_video_dataset:
-                if motion_example is not None:
-                    sampler_event_type = "motion_causal"
-                elif self.frame_sample_mode == 'causal':
+                if self.frame_sample_mode == 'causal':
                     template_frame_ids, search_frame_ids = None, None
                     sampler_event_type = None
                     gap_increase = 0
@@ -614,9 +360,6 @@ class TrackingSampler(torch.utils.data.Dataset):
                         template_frame_ids, search_frame_ids, sampler_event_type = \
                             self._sample_srbt_event_causal_frame_ids(
                                 visible, seq_info_dict)
-                    elif self.c3_event_sampling and random.random() < self.c3_event_sample_prob:
-                        template_frame_ids, search_frame_ids, sampler_event_type = \
-                            self._sample_c3_event_causal_frame_ids(visible, seq_info_dict)
                     while search_frame_ids is None:
                         base_frame_id = self._sample_visible_ids(visible, num_ids=1,
                                                                  min_id=self.num_template_frames - 1,
@@ -659,9 +402,6 @@ class TrackingSampler(torch.utils.data.Dataset):
                 H, W, _ = template_aps_frame_list[0].shape
                 template_masks = template_anno['mask'] if 'mask' in template_anno else [torch.zeros((H, W))] * self.num_template_frames
                 search_masks = search_anno['mask'] if 'mask' in search_anno else [torch.zeros((H, W))] * self.num_search_frames
-                route_motion_cues = self._causal_route_motion_for_frame(
-                    seq_info_dict, search_frame_ids[-1],
-                    search_aps_frame_list[-1].shape)
 
                 data = TensorDict({'template_images': template_aps_frame_list,
                                    'template_anno': template_anno['bbox'],
@@ -669,18 +409,12 @@ class TrackingSampler(torch.utils.data.Dataset):
                                    'search_images': search_aps_frame_list,
                                    'search_anno': search_anno['bbox'],
                                    'search_masks': search_masks,
-                                   'redetect_search_images': search_aps_frame_list,
-                                   'redetect_search_event_images': search_dvs_frame_list,
-                                   'redetect_search_anno': [box.clone() if hasattr(box, "clone") else torch.tensor(box)
-                                                            for box in search_anno['bbox']],
-                                   'redetect_search_masks': search_masks,
                                    'dataset': dataset.get_name(),
                                    'test_class': meta_obj_test.get('object_class_name'),
                                     'template_event_images': template_dvs_frame_list,
                                    'search_event_images': search_dvs_frame_list,
-                                   'route_motion_cues': route_motion_cues,
                                 })
-                if horizon is not None:
+                if self.srbt_enabled and is_video_dataset:
                     self._add_srbt_history_fields(
                         data,
                         dataset,
@@ -688,6 +422,7 @@ class TrackingSampler(torch.utils.data.Dataset):
                         seq_info_dict,
                         anchor=search_frame_ids[-1],
                     )
+                if horizon is not None:
                     self._add_srbt_future_fields(
                         data,
                         dataset,

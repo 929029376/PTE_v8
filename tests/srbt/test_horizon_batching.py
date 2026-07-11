@@ -213,6 +213,31 @@ def test_future_tensors_are_padded_to_the_declared_horizon():
     assert batch["search_images"].shape == (1, 2, 3, 4, 4)
 
 
+def test_srbt_scalar_targets_collate_on_the_batch_dimension():
+    first = TensorDict({
+        "hazard_target": torch.tensor(3),
+        "hazard_mask": torch.tensor(True),
+        "censor_mask": torch.tensor(False),
+        "duration": torch.tensor(4),
+        "state_target": torch.tensor(2),
+    })
+    second = TensorDict({
+        "hazard_target": torch.tensor(5),
+        "hazard_mask": torch.tensor(False),
+        "censor_mask": torch.tensor(True),
+        "duration": torch.tensor(6),
+        "state_target": torch.tensor(3),
+    })
+
+    batch = ltr_collate_stack1([first, second])
+
+    assert torch.equal(batch["hazard_target"], torch.tensor([3, 5]))
+    assert torch.equal(batch["hazard_mask"], torch.tensor([True, False]))
+    assert torch.equal(batch["censor_mask"], torch.tensor([False, True]))
+    assert torch.equal(batch["duration"], torch.tensor([4, 6]))
+    assert torch.equal(batch["state_target"], torch.tensor([2, 3]))
+
+
 class _FakeFeltDataset:
     def __init__(self):
         present = torch.tensor([1, 1, 1, 1, 0, 0, 1, 1], dtype=torch.uint8)
@@ -248,12 +273,8 @@ class _FakeFeltDataset:
 
 def _sampler_config():
     return SimpleNamespace(
-        TRAIN=SimpleNamespace(STAGE="all"),
+        TRAIN=SimpleNamespace(STAGE="srbt"),
         DATA=SimpleNamespace(
-            C3_EVENT_SAMPLING=True,
-            C3_EVENT_SAMPLE_PROB=1.0,
-            C3_EVENT_WEIGHTS=None,
-            MOTION_CAUSAL_SAMPLING=False,
             SRBT=SimpleNamespace(
                 ENABLE=True,
                 HISTORY_LENGTH=8,
@@ -289,13 +310,6 @@ def test_tracking_sampler_loads_a_continuous_future_clip_and_targets():
         dataset.info["visible"],
         dataset.info,
     )
-    sampler._sample_c3_event_causal_frame_ids = (
-        lambda visible, info, preferred_events=None: (
-            [2],
-            [3],
-            "visible_to_absent",
-        )
-    )
     sampler._sample_srbt_event_causal_frame_ids = (
         lambda visible, info: ([2], [3], "visible_to_absent")
     )
@@ -304,13 +318,13 @@ def test_tracking_sampler_loads_a_continuous_future_clip_and_targets():
 
     assert torch.equal(
         sample["history_frame_ids"],
-        torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3]),
+        torch.tensor([-1, -1, -1, -1, -1, 0, 1, 2]),
     )
-    assert [int(image[0, 0, 0]) for image in sample["history_images"]] == [0, 1, 2, 3]
-    assert [int(image[0, 0, 0]) for image in sample["history_event_images"]] == [100, 101, 102, 103]
+    assert [int(image[0, 0, 0]) for image in sample["history_images"]] == [0, 1, 2]
+    assert [int(image[0, 0, 0]) for image in sample["history_event_images"]] == [100, 101, 102]
     assert torch.equal(
         sample["history_valid"],
-        torch.tensor([False, False, False, False, True, True, True, True]),
+        torch.tensor([False, False, False, False, False, True, True, True]),
     )
     assert torch.equal(sample["future_frame_ids"], torch.tensor([4, 5, 6, 7]))
     assert [int(image[0, 0, 0]) for image in sample["future_images"]] == [4, 5, 6, 7]
@@ -346,25 +360,22 @@ def test_srbt_sampling_is_used_only_for_horizon_index_pairs():
         dataset.info["visible"],
         dataset.info,
     )
-    legacy_preferred_events = []
     srbt_calls = []
-
-    def legacy_sample(visible, info, preferred_events=None):
-        legacy_preferred_events.append(preferred_events)
-        return [2], [3], "legacy"
 
     def srbt_sample(visible, info):
         srbt_calls.append(True)
         return [2], [3], "visible_to_absent"
 
-    sampler._sample_c3_event_causal_frame_ids = legacy_sample
     sampler._sample_srbt_event_causal_frame_ids = srbt_sample
 
-    sampler[0]
-    sampler[(0, 4)]
+    default_sample = sampler[0]
+    horizon_sample = sampler[(0, 4)]
 
-    assert legacy_preferred_events == [None]
     assert srbt_calls == [True]
+    assert "future_frame_ids" not in default_sample
+    assert "history_images" in default_sample
+    assert "history_valid" in default_sample
+    assert torch.equal(horizon_sample["future_frame_ids"], torch.tensor([4, 5, 6, 7]))
 
 
 def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event(monkeypatch):
@@ -382,10 +393,6 @@ def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event(monkeyp
         "search_event_images": [image.copy()],
         "search_anno": [box.clone()],
         "search_masks": [mask.clone()],
-        "redetect_search_images": [image.copy()],
-        "redetect_search_event_images": [image.copy()],
-        "redetect_search_anno": [box.clone()],
-        "redetect_search_masks": [mask.clone()],
         "history_images": [image.copy(), image.copy()],
         "history_event_images": [image.copy(), image.copy()],
         "history_anno": [box.clone(), torch.zeros(4)],
@@ -419,10 +426,6 @@ def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event(monkeyp
     assert processed["future_anno"].shape == (2, 4)
     assert torch.equal(processed["future_images"], processed["future_event_images"])
     assert torch.equal(processed["history_images"], processed["future_images"])
-    assert torch.equal(
-        processed["redetect_search_images"][0],
-        processed["history_images"][0],
-    )
     assert processed["search_images"].shape == (1, 3, 16, 16)
 
 

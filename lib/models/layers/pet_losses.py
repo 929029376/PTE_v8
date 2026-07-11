@@ -252,9 +252,11 @@ class PetTrackLoss(nn.Module):
     def _teacher_supervision_loss(self, teacher, targets):
         terms = []
         if "existence" in teacher and "presence" in targets:
-            terms.append(F.binary_cross_entropy(
-                teacher["existence"].float().clamp(1e-7, 1 - 1e-7),
-                targets["presence"].to(teacher["existence"].device).float()))
+            existence = teacher["existence"]
+            with torch.autocast(device_type=existence.device.type, enabled=False):
+                terms.append(F.binary_cross_entropy(
+                    existence.float().clamp(1e-7, 1 - 1e-7),
+                    targets["presence"].to(existence.device).float()))
         if "hazard" in teacher and all(name in targets for name in (
                 "hazard_target", "hazard_mask", "censor_mask")):
             terms.append(self._survival_probability_loss(

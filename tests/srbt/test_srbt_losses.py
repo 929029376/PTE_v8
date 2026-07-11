@@ -312,6 +312,37 @@ def test_actor_rejects_an_incomplete_srbt_prediction_contract():
         actor.compute_losses(pred_dict, {})
 
 
+def test_actor_rejects_extra_srbt_prediction_outputs():
+    local_cfg = copy.deepcopy(cfg)
+    local_cfg.MODEL.SRBT.ENABLE = True
+    actor = PETTrackActor(
+        nn.Identity(), objective={},
+        loss_weight={"giou": 2.0, "l1": 5.0, "focal": 1.0},
+        settings=SimpleNamespace(batchsize=1), cfg=local_cfg,
+    )
+    predictions = {
+        "existence_logits": torch.zeros(1),
+        "hazard_logits": torch.zeros(1, 129),
+        "field_logits": torch.zeros(1, 1, 2, 2),
+        "candidate_logits": torch.zeros(1, 1, 2, 2),
+        "hypothesis_boxes": torch.zeros(1, 2, 4),
+        "hypothesis_scores": torch.zeros(1, 2),
+        "identity_embeddings": torch.zeros(1, 2, 4),
+        "template_identity": torch.zeros(1, 4),
+        "legacy_route_logits": torch.zeros(1),
+    }
+    pred_dict = {
+        "pred_boxes": torch.zeros(1, 1, 4),
+        "srbt_predictions": predictions,
+    }
+
+    with patch.object(
+            PETTrackBaseActor, "compute_losses",
+            return_value=(torch.tensor(2.0), {"Loss/total": 2.0})), \
+            pytest.raises(RuntimeError, match="exactly eight outputs"):
+        actor.compute_losses(pred_dict, {})
+
+
 def test_default_and_canonical_loss_configuration_has_no_legacy_stack():
     expected = {
         "EXISTENCE_WEIGHT": 1.0,
@@ -340,11 +371,63 @@ def test_default_and_canonical_loss_configuration_has_no_legacy_stack():
     assert "PET_LOSS" not in configured["TRAIN"]
 
 
-def test_legacy_generated_stage_configuration_fails_fast():
-    config_path = (
-        Path(__file__).resolve().parents[2]
-        / "experiments" / "pet_track" / "generated"
-        / "felt_pet_track_v8_stage2_router.yaml"
-    )
-    with pytest.raises(ValueError, match="legacy TRAIN.PET_LOSS"):
-        update_config_from_file(config_path, base_cfg=copy.deepcopy(cfg))
+def test_generated_configuration_is_srbt_only(tmp_path):
+    from tracking.create_pettrack_ablation_configs import generate
+
+    generated = generate(tmp_path)
+    configured = yaml.safe_load(generated.read_text(encoding="utf-8"))
+    assert configured["MODEL"]["SRBT"]["ENABLE"] is True
+    assert configured["TRAIN"]["STAGE"] == "srbt"
+    assert "EXPERT_STAGE" not in configured["TRAIN"]
+    assert "C3_EVENT_SAMPLING" not in configured["DATA"]
+
+
+def test_loss_rejects_old_probability_and_nested_hypothesis_contract():
+    loss_fn = PetTrackLoss(teacher_weight=0.0)
+    teacher = {
+        "hazard": torch.full((1, 129), 1.0 / 129.0),
+        "field": torch.full((1, 1, 2, 2), 0.25),
+        "candidate_map": torch.full((1, 1, 2, 2), 0.25),
+    }
+    targets = {
+        "hazard_target": torch.tensor([1]),
+        "hazard_mask": torch.tensor([True]),
+        "censor_mask": torch.tensor([False]),
+        "field_target": torch.ones(1, 1, 2, 2),
+        "field_mask": torch.tensor([True]),
+        "target_box": torch.zeros(1, 4),
+        "hypothesis_mask": torch.tensor([True]),
+    }
+    old_predictions = {
+        "hazard": torch.full((1, 129), 1.0 / 129.0, requires_grad=True),
+        "field": torch.full((1, 1, 2, 2), 0.25, requires_grad=True),
+        "candidate_map": torch.full((1, 1, 2, 2), 0.25, requires_grad=True),
+        "hypotheses": {
+            "boxes": torch.zeros(1, 2, 4, requires_grad=True),
+            "posterior": torch.full((1, 2), 0.5, requires_grad=True),
+        },
+    }
+
+    loss, stats = loss_fn.srbt_loss(
+        old_predictions, targets, teacher=teacher, progress=1.0)
+
+    assert loss.item() == 0.0
+    assert stats["Loss/srbt_survival"] == 0.0
+    assert stats["Loss/srbt_field"] == 0.0
+    assert stats["Loss/srbt_hypothesis"] == 0.0
+    assert stats["Loss/srbt_distill"] == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast required")
+def test_teacher_probability_supervision_is_safe_under_bfloat16_autocast():
+    logits = torch.randn(2, device="cuda", requires_grad=True)
+    teacher = {"existence": torch.sigmoid(logits)}
+    targets = {"presence": torch.tensor([1.0, 0.0], device="cuda")}
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = PetTrackLoss()._teacher_supervision_loss(teacher, targets)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()

@@ -168,10 +168,11 @@ def ltr_collate_stack1(batch):
     error_msg = "batch must contain tensors, numbers, dicts or lists; found {}"
     elem_type = type(batch[0])
     if isinstance(batch[0], torch.Tensor):
+        stack_dim = 0 if batch[0].ndim == 0 else 1
         out = None
         if _check_use_shared_memory():
-            out = _new_shared_stack_output(batch, 1)
-        return torch.stack(batch, 1, out=out)
+            out = _new_shared_stack_output(batch, stack_dim)
+        return torch.stack(batch, stack_dim, out=out)
         # if batch[0].dim() < 4:
         #     return torch.stack(batch, 0, out=out)
         # return torch.cat(batch, 0, out=out)
