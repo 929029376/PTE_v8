@@ -5,13 +5,13 @@ import pytest
 import torch
 from torch import nn
 
-warnings.filterwarnings(
-    "ignore",
-    message=r"Importing from timm\..* is deprecated.*",
-    category=FutureWarning,
-)
-
-from lib.models.pet_track.pet_track import _load_filtered_baseline_checkpoint
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Importing from timm\..* is deprecated.*",
+        category=FutureWarning,
+    )
+    from lib.models.pet_track.pet_track import _load_filtered_baseline_checkpoint
 
 
 class _TinyTracker(nn.Module):
@@ -21,6 +21,10 @@ class _TinyTracker(nn.Module):
         self.memory = nn.Linear(2, 2)
         self.box_head = nn.Linear(2, 1)
         self.srbt = nn.Linear(2, 2)
+
+
+class _LegacyMetadata:
+    pass
 
 
 def _inherited_state(model, *, module_prefix=False):
@@ -93,3 +97,22 @@ def test_rejects_checkpoint_without_a_state_mapping(tmp_path):
 
     with pytest.raises(RuntimeError, match="state mapping"):
         _load_filtered_baseline_checkpoint(_TinyTracker(), checkpoint_path)
+
+
+def test_legacy_pickle_requires_an_explicit_trust_boundary(tmp_path):
+    model = _TinyTracker()
+    checkpoint_path = Path(tmp_path) / "legacy.pth.tar"
+    torch.save(
+        {"net": _inherited_state(model), "legacy": _LegacyMetadata()},
+        checkpoint_path,
+    )
+
+    with pytest.raises(RuntimeError, match="trusted_legacy_pickle=True"):
+        _load_filtered_baseline_checkpoint(model, checkpoint_path)
+
+    report = _load_filtered_baseline_checkpoint(
+        model,
+        checkpoint_path,
+        trusted_legacy_pickle=True,
+    )
+    assert report["loaded_count"] == 6

@@ -21,6 +21,7 @@ This module is importable / constructible without a GPU (lazy .cuda() in the
 training script), and it is exercised by tests/test_pet_track_model.py.
 """
 import os
+import pickle
 from collections.abc import Mapping
 
 import torch
@@ -955,7 +956,11 @@ def build_pet_track(cfg, training=True):
     if training:
         baseline_ckpt = getattr(cfg.MODEL, "PRETRAINED_BASELINE_CKPT", "")
         if baseline_ckpt:
-            _load_filtered_baseline_checkpoint(model, baseline_ckpt)
+            _load_filtered_baseline_checkpoint(
+                model,
+                baseline_ckpt,
+                trusted_legacy_pickle=True,
+            )
         stage = getattr(cfg.TRAIN, "STAGE", "") or getattr(cfg.TRAIN, "EXPERT_STAGE", "all")
         model.set_expert_training_stage(stage)
         _print_stage_report(model)
@@ -971,12 +976,27 @@ def build_pet_track(cfg, training=True):
     return model
 
 
-def _load_filtered_baseline_checkpoint(model, checkpoint_path):
+def _load_filtered_baseline_checkpoint(
+        model, checkpoint_path, *, trusted_legacy_pickle=False):
+    """Load an audited AMTTrack core from a local checkpoint.
+
+    Legacy pickle fallback can execute arbitrary code and must only be enabled
+    for an operator-controlled checkpoint, never for a user-supplied path.
+    """
     checkpoint_path = os.path.expanduser(checkpoint_path)
-    # Legacy AMTTrack artifacts include trainer metadata rejected by weights_only.
-    checkpoint = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=False
-    )
+    try:
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True
+        )
+    except pickle.UnpicklingError as error:
+        if not trusted_legacy_pickle:
+            raise RuntimeError(
+                "Checkpoint requires unsafe legacy pickle deserialization; "
+                "pass trusted_legacy_pickle=True only for an operator-controlled path"
+            ) from error
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
     if isinstance(checkpoint, Mapping) and "net" in checkpoint:
         source = checkpoint["net"]
     else:

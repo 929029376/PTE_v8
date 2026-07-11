@@ -4,17 +4,17 @@ import warnings
 
 import torch
 
-warnings.filterwarnings(
-    "ignore",
-    message=r"Importing from timm\..* is deprecated.*",
-    category=FutureWarning,
-)
-
-from lib.config.pet_track.config import cfg
-from lib.models.pet_track.pet_track import (
-    _load_filtered_baseline_checkpoint,
-    build_pet_track,
-)
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Importing from timm\..* is deprecated.*",
+        category=FutureWarning,
+    )
+    from lib.config.pet_track.config import cfg
+    from lib.models.pet_track.pet_track import (
+        _load_filtered_baseline_checkpoint,
+        build_pet_track,
+    )
 
 
 BASELINE_CHECKPOINT = Path(
@@ -56,7 +56,11 @@ def test_real_amttrack_checkpoint_preserves_baseline_eval_path():
     del checkpoint, source
 
     model = build_pet_track(_baseline_config(), training=False)
-    report = _load_filtered_baseline_checkpoint(model, BASELINE_CHECKPOINT)
+    report = _load_filtered_baseline_checkpoint(
+        model,
+        BASELINE_CHECKPOINT,
+        trusted_legacy_pickle=True,
+    )
 
     assert report["loaded_count"] == 288
     assert len(report["loaded_keys"]) == 288
