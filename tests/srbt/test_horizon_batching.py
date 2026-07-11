@@ -96,8 +96,83 @@ def test_tracking_sampler_accepts_index_horizon_pairs_without_changing_ints():
     assert sampler[(7, 32)] == 32
 
 
+def test_srbt_anchor_candidates_follow_frame_level_state_boundaries():
+    sampler = TrackingSampler.__new__(TrackingSampler)
+    present = torch.tensor([1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1])
+    info = {
+        "absent": present,
+        "valid": torch.ones_like(present, dtype=torch.bool),
+    }
+
+    assert sampler._srbt_anchor_ids(
+        info, "visible_to_visible", min_id=1, max_id=10) == [2, 9]
+    assert sampler._srbt_anchor_ids(
+        info, "visible_to_absent", min_id=1, max_id=10) == [3]
+    assert sampler._srbt_anchor_ids(
+        info, "absent_to_absent", min_id=1, max_id=10) == [4, 5]
+    assert sampler._srbt_anchor_ids(
+        info, "absent_to_present", min_id=1, max_id=10) == [6]
+
+
+def test_srbt_anchor_weights_select_the_requested_available_event():
+    sampler = TrackingSampler.__new__(TrackingSampler)
+    sampler.srbt_anchor_weights = {
+        "visible_to_visible": 0.0,
+        "visible_to_absent": 1.0,
+        "absent_to_absent": 0.0,
+        "absent_to_present": 0.0,
+    }
+    sampler.num_template_frames = 1
+    sampler.num_search_frames = 1
+    sampler.max_gap = 4
+    present = torch.tensor([1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1])
+    info = {
+        "absent": present,
+        "valid": torch.ones_like(present, dtype=torch.bool),
+    }
+
+    template_ids, search_ids, event_type = (
+        sampler._sample_srbt_event_causal_frame_ids(present, info)
+    )
+
+    assert event_type == "visible_to_absent"
+    assert template_ids == [2]
+    assert search_ids == [3]
+    assert bool(present[search_ids[0]])
+    assert not bool(present[search_ids[0] + 1])
+
+
+def test_srbt_anchor_weights_redistribute_when_a_class_is_unavailable():
+    sampler = TrackingSampler.__new__(TrackingSampler)
+    sampler.srbt_anchor_weights = {
+        "visible_to_visible": 0.0,
+        "visible_to_absent": 1.0,
+        "absent_to_absent": 0.0,
+        "absent_to_present": 0.0,
+    }
+    sampler.num_template_frames = 1
+    sampler.num_search_frames = 1
+    sampler.max_gap = 4
+    present = torch.ones(8, dtype=torch.uint8)
+    info = {
+        "absent": present,
+        "valid": torch.ones_like(present, dtype=torch.bool),
+    }
+
+    _, search_ids, event_type = sampler._sample_srbt_event_causal_frame_ids(
+        present, info)
+
+    assert event_type == "visible_to_visible"
+    assert search_ids[0] in {2, 3, 4, 5, 6}
+
+
 def test_future_tensors_are_padded_to_the_declared_horizon():
     first = TensorDict({
+        "history_images": torch.ones(2, 3, 4, 4),
+        "history_event_images": torch.full((2, 3, 4, 4), 2.0),
+        "history_anno": torch.ones(2, 4),
+        "history_valid": torch.tensor([False, False, True, True]),
+        "history_present": torch.tensor([0, 0, 1, 1]),
         "future_images": torch.ones(2, 3, 4, 4),
         "future_event_images": torch.full((2, 3, 4, 4), 2.0),
         "future_anno": torch.ones(2, 4),
@@ -106,6 +181,11 @@ def test_future_tensors_are_padded_to_the_declared_horizon():
         "search_images": torch.ones(1, 3, 4, 4),
     })
     second = TensorDict({
+        "history_images": torch.full((4, 3, 4, 4), 3.0),
+        "history_event_images": torch.full((4, 3, 4, 4), 4.0),
+        "history_anno": torch.full((4, 4), 5.0),
+        "history_valid": torch.ones(4, dtype=torch.bool),
+        "history_present": torch.ones(4, dtype=torch.long),
         "future_images": torch.full((4, 3, 4, 4), 3.0),
         "future_event_images": torch.full((4, 3, 4, 4), 4.0),
         "future_anno": torch.full((4, 4), 5.0),
@@ -116,6 +196,13 @@ def test_future_tensors_are_padded_to_the_declared_horizon():
 
     batch = ltr_collate_stack1([first, second])
 
+    assert batch["history_images"].shape == (4, 2, 3, 4, 4)
+    assert batch["history_event_images"].shape == (4, 2, 3, 4, 4)
+    assert batch["history_anno"].shape == (4, 2, 4)
+    assert not batch["history_images"][:2, 0].any()
+    assert not batch["history_event_images"][:2, 0].any()
+    assert not batch["history_anno"][:2, 0].any()
+    assert batch["history_valid"].shape == (4, 2)
     assert batch["future_images"].shape == (4, 2, 3, 4, 4)
     assert batch["future_event_images"].shape == (4, 2, 3, 4, 4)
     assert batch["future_anno"].shape == (4, 2, 4)
@@ -169,6 +256,7 @@ def _sampler_config():
             MOTION_CAUSAL_SAMPLING=False,
             SRBT=SimpleNamespace(
                 ENABLE=True,
+                HISTORY_LENGTH=8,
                 HORIZONS=[8, 32, 128],
                 HORIZON_WEIGHTS=[0.4, 0.35, 0.25],
                 MAX_HAZARD=128,
@@ -208,9 +296,22 @@ def test_tracking_sampler_loads_a_continuous_future_clip_and_targets():
             "visible_to_absent",
         )
     )
+    sampler._sample_srbt_event_causal_frame_ids = (
+        lambda visible, info: ([2], [3], "visible_to_absent")
+    )
 
     sample = sampler[(0, 4)]
 
+    assert torch.equal(
+        sample["history_frame_ids"],
+        torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3]),
+    )
+    assert [int(image[0, 0, 0]) for image in sample["history_images"]] == [0, 1, 2, 3]
+    assert [int(image[0, 0, 0]) for image in sample["history_event_images"]] == [100, 101, 102, 103]
+    assert torch.equal(
+        sample["history_valid"],
+        torch.tensor([False, False, False, False, True, True, True, True]),
+    )
     assert torch.equal(sample["future_frame_ids"], torch.tensor([4, 5, 6, 7]))
     assert [int(image[0, 0, 0]) for image in sample["future_images"]] == [4, 5, 6, 7]
     assert [int(image[0, 0, 0]) for image in sample["future_event_images"]] == [104, 105, 106, 107]
@@ -221,10 +322,57 @@ def test_tracking_sampler_loads_a_continuous_future_clip_and_targets():
     assert sample["hazard_mask"].item() is True
 
 
-def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event():
+def test_srbt_sampling_is_used_only_for_horizon_index_pairs():
+    dataset = _FakeFeltDataset()
+
+    def identity_processing(data):
+        data["valid"] = True
+        return data
+
+    sampler = TrackingSampler(
+        datasets=[dataset],
+        p_datasets=[1],
+        samples_per_epoch=1,
+        max_gap=4,
+        num_search_frames=1,
+        num_template_frames=1,
+        processing=identity_processing,
+        frame_sample_mode="causal",
+        cfg=_sampler_config(),
+        training=True,
+    )
+    sampler.sample_seq_from_dataset = lambda dataset, is_video: (
+        0,
+        dataset.info["visible"],
+        dataset.info,
+    )
+    legacy_preferred_events = []
+    srbt_calls = []
+
+    def legacy_sample(visible, info, preferred_events=None):
+        legacy_preferred_events.append(preferred_events)
+        return [2], [3], "legacy"
+
+    def srbt_sample(visible, info):
+        srbt_calls.append(True)
+        return [2], [3], "visible_to_absent"
+
+    sampler._sample_c3_event_causal_frame_ids = legacy_sample
+    sampler._sample_srbt_event_causal_frame_ids = srbt_sample
+
+    sampler[0]
+    sampler[(0, 4)]
+
+    assert legacy_preferred_events == [None]
+    assert srbt_calls == [True]
+
+
+def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event(monkeypatch):
     image = np.arange(32 * 32 * 3, dtype=np.uint8).reshape(32, 32, 3)
     box = torch.tensor([12, 12, 8, 8], dtype=torch.float32)
     mask = torch.zeros(32, 32)
+    rolls = iter([0.9, 0.9, 0.1, 0.9, 0.1, 0.9, 0.1])
+    monkeypatch.setattr(tfm.random, "random", lambda: next(rolls))
     data = TensorDict({
         "template_images": [image.copy()],
         "template_event_images": [image.copy()],
@@ -234,6 +382,13 @@ def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event():
         "search_event_images": [image.copy()],
         "search_anno": [box.clone()],
         "search_masks": [mask.clone()],
+        "redetect_search_images": [image.copy()],
+        "redetect_search_event_images": [image.copy()],
+        "redetect_search_anno": [box.clone()],
+        "redetect_search_masks": [mask.clone()],
+        "history_images": [image.copy(), image.copy()],
+        "history_event_images": [image.copy(), image.copy()],
+        "history_anno": [box.clone(), torch.zeros(4)],
         "future_images": [image.copy(), image.copy()],
         "future_event_images": [image.copy(), image.copy()],
         "future_anno": [box.clone(), torch.zeros(4)],
@@ -244,7 +399,10 @@ def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event():
         center_jitter_factor={"template": 0.0, "search": 0.0},
         scale_jitter_factor={"template": 0.0, "search": 0.0},
         mode="sequence",
-        transform=tfm.Transform(tfm.ToTensor()),
+        transform=tfm.Transform(
+            tfm.ToTensor(),
+            tfm.RandomHorizontalFlip_Norm(0.5),
+        ),
         joint_transform=None,
         settings=SimpleNamespace(redetect_search_area_factor=4.0),
     )
@@ -252,15 +410,25 @@ def test_processing_uses_shared_full_frame_geometry_for_future_rgb_event():
     processed = processor(data)
 
     assert processed["valid"] is True
+    assert processed["history_images"].shape == (2, 3, 16, 16)
+    assert processed["history_event_images"].shape == (2, 3, 16, 16)
+    assert processed["history_anno"].shape == (2, 4)
+    assert torch.equal(processed["history_images"], processed["history_event_images"])
     assert processed["future_images"].shape == (2, 3, 16, 16)
     assert processed["future_event_images"].shape == (2, 3, 16, 16)
     assert processed["future_anno"].shape == (2, 4)
     assert torch.equal(processed["future_images"], processed["future_event_images"])
+    assert torch.equal(processed["history_images"], processed["future_images"])
+    assert torch.equal(
+        processed["redetect_search_images"][0],
+        processed["history_images"][0],
+    )
     assert processed["search_images"].shape == (1, 3, 16, 16)
 
 
 def test_default_and_canonical_srbt_horizon_configuration():
     assert default_cfg.DATA.SRBT.ENABLE is False
+    assert default_cfg.DATA.SRBT.HISTORY_LENGTH == 8
     assert default_cfg.DATA.SRBT.HORIZONS == [8, 32, 128]
     assert default_cfg.DATA.SRBT.HORIZON_WEIGHTS == [0.4, 0.35, 0.25]
     assert default_cfg.DATA.SRBT.MAX_HAZARD == 128
@@ -273,6 +441,7 @@ def test_default_and_canonical_srbt_horizon_configuration():
 
     assert configured["DATA"]["SRBT"] == {
         "ENABLE": True,
+        "HISTORY_LENGTH": 8,
         "HORIZONS": [8, 32, 128],
         "HORIZON_WEIGHTS": [0.4, 0.35, 0.25],
         "MAX_HAZARD": 128,

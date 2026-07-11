@@ -56,7 +56,9 @@ def build_temporal_targets(present, anchor, horizon, max_hazard=128):
         and anchor + 1 < present.numel()
         and not bool(present[anchor + 1])
     )
-    hazard_mask = state in (UNCERTAIN, ABSENT) or enters_absence
+    hazard_mask = valid_length > 0 and (
+        state in (UNCERTAIN, ABSENT) or enters_absence
+    )
     hazard_target = 0
     censor_mask = False
     if hazard_mask:

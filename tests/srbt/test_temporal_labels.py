@@ -89,6 +89,16 @@ def test_sequence_end_is_right_censored_at_last_valid_future_frame():
     assert torch.equal(targets["future_valid"], torch.tensor([True, False, False, False]))
 
 
+def test_absent_anchor_without_a_future_frame_has_no_hazard_supervision():
+    targets = build_temporal_targets([1, 0], anchor=1, horizon=8)
+
+    assert _value(targets, "state_target") == ABSENT
+    assert _value(targets, "hazard_target") == 0
+    assert _value(targets, "hazard_mask") is False
+    assert _value(targets, "censor_mask") is False
+    assert not targets["future_valid"].any()
+
+
 def test_reappearance_after_max_hazard_uses_overflow_bin():
     present = [0] * 130 + [1]
     targets = build_temporal_targets(

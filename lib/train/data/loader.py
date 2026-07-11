@@ -76,35 +76,39 @@ class HorizonBatchSampler:
         return [(index, horizon) for index in indices]
 
 
-_FUTURE_PAD_KEYS = {
-    "future_images",
-    "future_event_images",
-    "future_anno",
+_TEMPORAL_PAD_KEYS = {
+    "history_images": ("history_valid", True),
+    "history_event_images": ("history_valid", True),
+    "history_anno": ("history_valid", True),
+    "future_images": ("future_valid", False),
+    "future_event_images": ("future_valid", False),
+    "future_anno": ("future_valid", False),
 }
 
 
-def _pad_future_tensors(values, target_length, stack_dim):
+def _pad_temporal_tensors(values, target_length, stack_dim, pad_left):
     padded = []
     for value in values:
         if value.shape[0] > target_length:
-            raise ValueError("future tensor exceeds its declared horizon")
+            raise ValueError("temporal tensor exceeds its declared length")
         output = value.new_zeros((target_length, *value.shape[1:]))
-        output[:value.shape[0]] = value
+        offset = target_length - value.shape[0] if pad_left else 0
+        output[offset:offset + value.shape[0]] = value
         padded.append(output)
     return torch.stack(padded, dim=stack_dim)
 
 
 def _collate_tensor_dict(batch, collate, stack_dim):
-    target_length = max(
-        (int(item["future_valid"].numel()) for item in batch
-         if "future_valid" in item),
-        default=0,
-    )
     result = {}
     for key in batch[0]:
         values = [item[key] for item in batch]
-        if key in _FUTURE_PAD_KEYS and target_length:
-            result[key] = _pad_future_tensors(values, target_length, stack_dim)
+        pad_spec = _TEMPORAL_PAD_KEYS.get(key)
+        if pad_spec is not None:
+            valid_key, pad_left = pad_spec
+            target_length = max(
+                int(item[valid_key].numel()) for item in batch)
+            result[key] = _pad_temporal_tensors(
+                values, target_length, stack_dim, pad_left)
         else:
             result[key] = collate(values)
     return TensorDict(result)
