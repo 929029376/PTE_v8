@@ -130,53 +130,38 @@ class Tracker:
                 if key in tracker_out or val is not None:
                     output[key].append(val)
 
-        right_template = False  # flag for while
-        i = 0  # template  index,
-        while not right_template:
-            aps_frame = self._read_image(seq.aps_frame_list[i])
-            dvs_frame = self._read_image(seq.dvs_frame_list[i])
-            gt_bbox = seq.ground_truth_rect[i]
-            if gt_bbox[2]*gt_bbox[3] < 1:
-                right_template = False
-                print('idx bbox zero, without any target or too small.')
-                i += 1
-            else:
-                right_template = True
-                init_info['init_bbox'] = gt_bbox
+        init_bbox = init_info.get('init_bbox')
+        if init_bbox is None or len(init_bbox) != 4 \
+                or float(init_bbox[2]) * float(init_bbox[3]) < 1:
+            raise RuntimeError(
+                'Sequence initial bounding box must be valid; evaluation '
+                'cannot scan future ground truth for a replacement template')
+        aps_frame = self._read_image(seq.aps_frame_list[0])
+        dvs_frame = self._read_image(seq.dvs_frame_list[0])
 
         start_time = time.time()
 
-        out = tracker.initialize(aps_frame, dvs_frame, init_info, idx=i)  # out is None
+        out = tracker.initialize(aps_frame, dvs_frame, init_info, idx=0)
         if out is None: 
             out = {}
         prev_output = OrderedDict(out) 
         
-        if i != 0:
-            for idx in range(0, i+1):
-                target_box_template = seq.ground_truth_rect[idx]
-                init_info = {'target_bbox': target_box_template, 'time': 0}
-                _store_outputs(out, init_info)
-        else:
-            target_box_template = init_info.get('init_bbox')
-            init_default = {'target_bbox': target_box_template,
-                            'time': time.time() - start_time}
-            _store_outputs(out, init_default)
+        init_default = {
+            'target_bbox': init_bbox,
+            'time': time.time() - start_time,
+        }
+        _store_outputs(out, init_default)
 
-        for frame_num, (aps_frame_path, dvs_frame_path) in enumerate(zip(seq.aps_frame_list[i+1:], seq.dvs_frame_list[i+1:]), start=1):
+        for frame_num, (aps_frame_path, dvs_frame_path) in enumerate(
+                zip(seq.aps_frame_list[1:], seq.dvs_frame_list[1:]), start=1):
             aps_frame = self._read_image(aps_frame_path)
             dvs_frame = self._read_image(dvs_frame_path)
             start_time = time.time()
             info = seq.frame_info(frame_num)
             info['previous_output'] = prev_output
-            if len(seq.ground_truth_rect) > 1:
-                info['gt_bbox'] = seq.ground_truth_rect[frame_num]  
-            ##################################################################################
-            # Track
-            # info.keys(): 'previous_output', 'gt_bbox'
             out = tracker.track(aps_frame, dvs_frame, info)
             prev_output = OrderedDict(out)
             _store_outputs(out, {'time': time.time() - start_time})
-            ##################################################################################
 
         #################################################################
         # THOR info
@@ -328,4 +313,3 @@ class Tracker:
             return decode_img(image_file[0], image_file[1])
         else:
             raise ValueError("type of image_file should be str or list")
-

@@ -10,6 +10,7 @@ from lib.train.actors.pet_track import PETTrackActor
 from lib.train.data.sampler import TrackingSampler
 from lib.train.trainers import BaseTrainer, base_trainer
 from lib.test.evaluation.tracker import Tracker
+from lib.test.evaluation.running import _save_tracker_output
 from lib.test.tracker.pet_track import _load_srbt_eval_checkpoint
 from tests.srbt.test_srbt_model_integration import _cfg as _tiny_cfg
 from tests.srbt.test_srbt_model_integration import _model
@@ -27,6 +28,10 @@ def _state():
         "best_val_epoch": 4,
         "config_summary": {"MODEL.SRBT.ENABLE": True},
     }
+
+
+class _UnsafeCheckpointPayload:
+    pass
 
 
 def test_srbt_checkpoint_schema_version_one_is_strict():
@@ -84,7 +89,10 @@ def test_srbt_checkpoint_round_trip_saves_scaler_state_dict(tmp_path):
         cfg=_srbt_cfg(),
     )
     actor = TinyActor()
-    optimizer = torch.optim.SGD(actor.net.parameters(), lr=0.1)
+    optimizer = torch.optim.AdamW(actor.net.parameters(), lr=0.1)
+    actor.net(torch.ones(1, 1)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1)
     trainer = BaseTrainer(actor, [], optimizer, settings, scheduler)
     trainer.epoch = 3
@@ -97,12 +105,14 @@ def test_srbt_checkpoint_round_trip_saves_scaler_state_dict(tmp_path):
     state = torch.load(
         tmp_path / "checkpoints" / "srbt" / "Linear_latest.pth.tar",
         map_location="cpu",
+        weights_only=True,
     )
     assert state["schema_version"] == 1
     assert state["amp_scaler"] == {"scale": 128.0}
+    assert {"stats", "constructor", "net_info"}.isdisjoint(state)
 
     restored_actor = TinyActor()
-    restored_optimizer = torch.optim.SGD(
+    restored_optimizer = torch.optim.AdamW(
         restored_actor.net.parameters(), lr=0.1)
     restored_scheduler = torch.optim.lr_scheduler.StepLR(
         restored_optimizer, 1)
@@ -136,9 +146,150 @@ def test_eval_checkpoint_loader_rejects_partial_or_legacy_state(tmp_path):
     _load_srbt_eval_checkpoint(model, strict)
 
 
+def test_eval_checkpoint_loader_rejects_custom_objects_before_schema_use(tmp_path):
+    model = _model()
+    unsafe = tmp_path / "unsafe.pth.tar"
+    state = _state()
+    state["payload"] = _UnsafeCheckpointPayload()
+    torch.save(state, unsafe)
+
+    with pytest.raises(RuntimeError, match="weights-only"):
+        _load_srbt_eval_checkpoint(model, unsafe)
+
+
+def test_training_resume_rejects_custom_objects_before_schema_use(tmp_path):
+    class TinyActor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = torch.nn.Linear(1, 1)
+
+    settings = SimpleNamespace(
+        env=SimpleNamespace(workspace_dir=str(tmp_path)),
+        save_dir=None,
+        local_rank=0,
+        project_path="srbt",
+        use_gpu=False,
+    )
+    actor = TinyActor()
+    trainer = BaseTrainer(
+        actor, [], torch.optim.SGD(actor.net.parameters(), lr=0.1), settings)
+    unsafe = tmp_path / "unsafe_resume.pth.tar"
+    state = _state()
+    state.update({
+        "net_type": "Linear",
+        "net": actor.net.state_dict(),
+        "payload": _UnsafeCheckpointPayload(),
+    })
+    torch.save(state, unsafe)
+
+    with pytest.raises(RuntimeError, match="weights-only"):
+        trainer.load_checkpoint(str(unsafe))
+
+
 def test_felt_result_contract_keeps_absent_and_drops_c3_debug():
     output = Tracker._default_result_container()
     assert output == {"target_bbox": [], "time": [], "absent": []}
+
+
+def test_felt_result_writer_preserves_official_sequence_txt_protocol(tmp_path):
+    sequence = SimpleNamespace(name="felt_sequence", dataset="FELT")
+    tracker = SimpleNamespace(results_dir=str(tmp_path))
+    output = {
+        "target_bbox": [[1.2, 2.8, 3.0, 4.9], [5.0, 6.0, 7.0, 8.0]],
+        "time": [0.1, 0.2],
+        "absent": [False, True],
+    }
+
+    _save_tracker_output(sequence, tracker, output)
+
+    assert np.loadtxt(tmp_path / "felt_sequence.txt", delimiter="\t").tolist() == [
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+    ]
+    assert np.loadtxt(
+        tmp_path / "felt_sequence_absent.txt", delimiter="\t").tolist() == [0.0, 1.0]
+    assert np.loadtxt(
+        tmp_path / "felt_sequence_time.txt", delimiter="\t").tolist() == [0.1, 0.2]
+
+
+class _CausalEvalSequence:
+    name = "causal_eval"
+    dataset = "FELT"
+    object_ids = None
+
+    def __init__(self, initial_box):
+        self.aps_frame_list = ["aps0", "aps1", "aps2"]
+        self.dvs_frame_list = ["dvs0", "dvs1", "dvs2"]
+        self.ground_truth_rect = np.array([
+            initial_box,
+            [100.0, 100.0, 20.0, 20.0],
+            [200.0, 200.0, 30.0, 30.0],
+        ])
+
+    def init_info(self, _frame_num):
+        return {"init_bbox": self.ground_truth_rect[0].tolist()}
+
+    @staticmethod
+    def frame_info(frame_num):
+        return {"frame_id": frame_num}
+
+
+class _CausalEvalTracker:
+    def __init__(self):
+        self.initialize_calls = []
+        self.track_infos = []
+
+    def initialize(self, aps, dvs, info, idx=0):
+        self.initialize_calls.append((aps, dvs, dict(info), idx))
+        return {"target_bbox": info["init_bbox"], "absent": False}
+
+    def track(self, _aps, _dvs, info):
+        self.track_infos.append(dict(info))
+        return {"target_bbox": [1, 2, 3, 4], "absent": False}
+
+    @staticmethod
+    def get_update_count():
+        return 0, 0, 3
+
+    @staticmethod
+    def get_sample_count():
+        return 0, 3
+
+
+def _evaluation_runner():
+    runner = object.__new__(Tracker)
+    runner._read_image = lambda path: path
+    return runner
+
+
+def test_evaluation_runner_passes_only_first_frame_gt_and_no_frame_gt_info():
+    sequence = _CausalEvalSequence([10.0, 10.0, 12.0, 8.0])
+    tracker = _CausalEvalTracker()
+
+    output = _evaluation_runner()._track_sequence(
+        tracker, sequence, sequence.init_info(0))
+
+    assert len(tracker.initialize_calls) == 1
+    aps, dvs, info, idx = tracker.initialize_calls[0]
+    assert (aps, dvs, idx) == ("aps0", "dvs0", 0)
+    assert set(info) == {"init_bbox"}
+    np.testing.assert_array_equal(
+        info["init_bbox"], [10.0, 10.0, 12.0, 8.0])
+    assert len(tracker.track_infos) == 2
+    assert all("gt_bbox" not in info for info in tracker.track_infos)
+    assert [info["frame_id"] for info in tracker.track_infos] == [1, 2]
+    assert len(output["target_bbox"]) == 3
+
+
+def test_evaluation_runner_rejects_invalid_initial_box_without_scanning_future_gt():
+    sequence = _CausalEvalSequence([0.0, 0.0, 0.0, 0.0])
+    tracker = _CausalEvalTracker()
+
+    with pytest.raises(RuntimeError, match="initial bounding box"):
+        _evaluation_runner()._track_sequence(
+            tracker, sequence, sequence.init_info(0))
+
+    assert tracker.initialize_calls == []
 
 
 class _FakeSrbtVideo:

@@ -1,7 +1,9 @@
 import os
 import glob
+import pickle
 import torch
 import traceback
+from collections.abc import Mapping
 from lib.train.admin import multigpu
 from torch.utils.data.distributed import DistributedSampler
 
@@ -20,7 +22,30 @@ SRBT_CHECKPOINT_REQUIRED_KEYS = (
 )
 
 
+def _validate_weights_only_tree(value, path="checkpoint"):
+    if value is None or isinstance(value, (bool, int, float, str, bytes, torch.Tensor)):
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, (bool, int, float, str, bytes)):
+                raise RuntimeError(
+                    f"SRBT checkpoint has unsafe key type at {path}: "
+                    f"{type(key).__name__}")
+            _validate_weights_only_tree(item, f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_weights_only_tree(item, f"{path}[{index}]")
+        return
+    raise RuntimeError(
+        f"SRBT checkpoint contains unsafe object at {path}: "
+        f"{type(value).__name__}")
+
+
 def validate_srbt_checkpoint_schema(state):
+    if not isinstance(state, Mapping):
+        raise RuntimeError("SRBT checkpoint must be a weights-only state mapping")
+    _validate_weights_only_tree(state)
     missing = [key for key in SRBT_CHECKPOINT_REQUIRED_KEYS if key not in state]
     if missing:
         raise RuntimeError(
@@ -44,6 +69,18 @@ def validate_srbt_checkpoint_schema(state):
                            "memory_policy.")) for key in net):
         raise RuntimeError("Legacy PET route checkpoint is not a valid SRBT resume")
     return True
+
+
+def load_srbt_checkpoint_file(checkpoint_path):
+    try:
+        state = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True)
+    except (pickle.UnpicklingError, RuntimeError, TypeError) as error:
+        raise RuntimeError(
+            "SRBT checkpoint weights-only load failed; unsafe legacy objects "
+            "are not accepted") from error
+    validate_srbt_checkpoint_schema(state)
+    return state
 
 
 def _config_summary(settings):
@@ -324,13 +361,10 @@ class BaseTrainer:
             'actor_type': actor_type,
             'net_type': net_type,
             'net': net.state_dict(),
-            'net_info': getattr(net, 'info', None),
-            'constructor': getattr(net, 'constructor', None),
             'optimizer': self.optimizer.state_dict(),
             'lr_scheduler': (
                 None if self.lr_scheduler is None else self.lr_scheduler.state_dict()),
             'amp_scaler': _scaler_state(self),
-            'stats': self.stats,
             'best_val_score': getattr(self, 'best_val_score', None),
             'best_val_epoch': getattr(self, 'best_val_epoch', 0),
             'schema_version': SRBT_SCHEMA_VERSION,
@@ -356,7 +390,7 @@ class BaseTrainer:
         # Atomically replace the checkpoint when refreshing best.
         os.replace(tmp_file_path, file_path)
 
-    def load_checkpoint(self, checkpoint=None, load_constructor=False):
+    def load_checkpoint(self, checkpoint=None):
         """Loads a network checkpoint file.
 
         Can be called in three different ways:
@@ -404,8 +438,7 @@ class BaseTrainer:
             raise TypeError
 
         # Load network
-        checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-        validate_srbt_checkpoint_schema(checkpoint_dict)
+        checkpoint_dict = load_srbt_checkpoint_file(checkpoint_path)
 
         assert net_type == checkpoint_dict['net_type'], 'Network is not of correct type.'
 
@@ -430,10 +463,6 @@ class BaseTrainer:
         self.best_val_score = checkpoint_dict['best_val_score']
         self.best_val_epoch = checkpoint_dict['best_val_epoch']
         self.config_summary = checkpoint_dict['config_summary']
-        if load_constructor and checkpoint_dict.get('constructor') is not None:
-            net.constructor = checkpoint_dict['constructor']
-        if checkpoint_dict.get('net_info') is not None:
-            net.info = checkpoint_dict['net_info']
         for loader in self.loaders:
             if isinstance(loader.sampler, DistributedSampler):
                 loader.sampler.set_epoch(self.epoch)

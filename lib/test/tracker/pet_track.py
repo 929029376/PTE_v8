@@ -26,13 +26,11 @@ from lib.models.layers.srbt_controller import (
     Action as BeliefAction,
     build_belief_controller,
 )
-from lib.train.trainers.base_trainer import validate_srbt_checkpoint_schema
+from lib.train.trainers.base_trainer import load_srbt_checkpoint_file
 
 
 def _load_srbt_eval_checkpoint(network, checkpoint_path):
-    checkpoint = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=False)
-    validate_srbt_checkpoint_schema(checkpoint)
+    checkpoint = load_srbt_checkpoint_file(checkpoint_path)
     network.load_state_dict(checkpoint["net"], strict=True)
     return checkpoint
 
