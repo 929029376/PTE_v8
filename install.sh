@@ -1,0 +1,83 @@
+echo "****************** Installing pytorch ******************"
+# conda install pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.12.1  -c pytorch
+
+echo ""
+echo ""
+echo "****************** Installing yaml ******************"
+pip install PyYAML
+
+echo ""
+echo ""
+echo "****************** Installing easydict ******************"
+pip install easydict
+
+echo ""
+echo ""
+echo "****************** Installing cython ******************"
+pip install cython
+
+echo ""
+echo ""
+echo "****************** Installing opencv-python ******************"
+pip install opencv-python 
+
+echo ""
+echo ""
+echo "****************** Installing pandas ******************"
+pip install pandas
+
+echo ""
+echo ""
+echo "****************** Installing tqdm ******************"
+pip install tqdm
+
+echo ""
+echo ""
+echo "****************** Installing jpeg4py python wrapper ******************"
+pip install jpeg4py
+
+echo ""
+echo ""
+echo "****************** Installing tensorboard ******************"
+pip install tb-nightly
+
+echo ""
+echo ""
+echo "****************** Installing colorama ******************"
+pip install colorama
+
+echo ""
+echo ""
+echo "****************** Installing lmdb ******************"
+pip install lmdb
+
+echo ""
+echo ""
+echo "****************** Installing scipy ******************"
+pip install scipy
+
+echo ""
+echo ""
+echo "****************** Installing tensorboardX ******************"
+pip install tensorboardX
+
+
+echo ""
+echo ""
+echo "****************** Downgrade setuptools ******************"
+pip install setuptools==59.5.0
+
+
+echo ""
+echo ""
+echo "****************** Installing wandb ******************"
+pip install "wandb<0.20"
+
+echo ""
+echo ""
+echo "****************** Installing timm ******************"
+pip install timm 
+
+echo ""
+echo ""
+echo "****************** Installation complete! ******************"

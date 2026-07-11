@@ -1,0 +1,695 @@
+import random
+import torch.utils.data
+import torch
+from lib.utils import TensorDict
+from lib.utils.route_motion import ROUTE_MOTION_DIM, causal_route_motion_cues
+
+def no_processing(data):
+    return data
+
+
+class TrackingSampler(torch.utils.data.Dataset):
+    """ Class responsible for sampling frames from training sequences to form batches.
+
+    The sampling is done in the following ways. First a dataset is selected at random. Next, a sequence is selected
+    from that dataset. A base frame is then sampled randomly from the sequence. Next, a set of 'train frames' and
+    'test frames' are sampled from the sequence from the range [base_frame_id - max_gap, base_frame_id]  and
+    (base_frame_id, base_frame_id + max_gap] respectively. Only the frames in which the target is visible are sampled.
+    If enough visible frames are not found, the 'max_gap' is increased gradually till enough frames are found.
+
+    The sampled frames are then passed through the input 'processing' function for the necessary processing-
+    """
+
+    def __init__(self, datasets, p_datasets, samples_per_epoch, max_gap,
+                 num_search_frames, num_template_frames=1, processing=no_processing, frame_sample_mode='causal',
+                 train_cls=False, pos_prob=0.5, cfg=None, training=True):
+        """
+        args:
+            datasets - List of datasets to be used for training
+            p_datasets - List containing the probabilities by which each dataset will be sampled
+            samples_per_epoch - Number of training samples per epoch
+            max_gap - Maximum gap, in frame numbers, between the train frames and the test frames.
+            num_search_frames - Number of search frames to sample.
+            num_template_frames - Number of template frames to sample.
+            processing - An instance of Processing class which performs the necessary processing of the data.
+            frame_sample_mode - Either 'causal' or 'interval'. If 'causal', then the test frames are sampled in a causally,
+                                otherwise randomly within the interval.
+        """
+        self.datasets = datasets
+        self.train_cls = train_cls
+        self.pos_prob = pos_prob
+
+        # If p not provided, sample uniformly from all videos
+        if p_datasets is None:
+            p_datasets = [len(d) for d in self.datasets]
+
+        # Normalize
+        p_total = sum(p_datasets)
+        self.p_datasets = [x / p_total for x in p_datasets]
+
+        self.samples_per_epoch = samples_per_epoch
+        self.max_gap = max_gap
+        self.num_search_frames = num_search_frames
+        self.num_template_frames = num_template_frames
+        self.processing = processing
+        self.frame_sample_mode = frame_sample_mode
+        self.cfg = cfg
+        self.training = bool(training)
+        train_cfg = getattr(cfg, "TRAIN", None)
+        data_cfg = getattr(cfg, "DATA", None)
+        stage = getattr(train_cfg, "STAGE", None) or getattr(train_cfg, "EXPERT_STAGE", "all")
+        stage = "all" if stage in (None, "", "all") else str(stage).lower()
+        self.stage = stage
+        self.c3_event_sampling = (
+            self.stage in ("c3", "all")
+            and bool(getattr(data_cfg, "C3_EVENT_SAMPLING", False))
+            and self.frame_sample_mode == "causal"
+        )
+        self.c3_event_sample_prob = float(getattr(data_cfg, "C3_EVENT_SAMPLE_PROB", 0.8))
+        weights = getattr(data_cfg, "C3_EVENT_WEIGHTS", None)
+        self.c3_event_weights = {
+            "absent_to_present": float(getattr(weights, "ABSENT_TO_PRESENT", 0.35)),
+            "visible_to_absent": float(getattr(weights, "VISIBLE_TO_ABSENT", 0.25)),
+            "absent_to_absent": float(getattr(weights, "ABSENT_TO_ABSENT", 0.25)),
+            "hard_visible": float(getattr(weights, "HARD_VISIBLE", 0.15)),
+        }
+        self.motion_causal_sampling = (
+            self.training
+            and self.stage in ("router", "all")
+            and self.frame_sample_mode == "causal"
+            and bool(getattr(data_cfg, "MOTION_CAUSAL_SAMPLING", False))
+        )
+        self.motion_causal_sample_prob = float(getattr(
+            data_cfg, "MOTION_CAUSAL_SAMPLE_PROB", 0.0))
+        self.motion_causal_speed_threshold = float(getattr(
+            data_cfg, "MOTION_CAUSAL_SPEED_THRESHOLD", 0.08))
+        self.motion_causal_max_tries = int(getattr(
+            data_cfg, "MOTION_CAUSAL_MAX_TRIES", 8))
+        self._motion_candidate_cache = {}
+        self._motion_sequence_ids = {
+            id(dataset): list(range(dataset.get_num_sequences()))
+            for dataset in self.datasets
+        }
+        # self.batch_size = batch_size
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def _sample_visible_ids(self, visible, num_ids=1, min_id=None, max_id=None,
+                            allow_invisible=False, force_invisible=False):
+        """ Samples num_ids frames between min_id and max_id for which target is visible
+        """
+        if num_ids == 0:
+            return []
+        if min_id is None or min_id < 0:
+            min_id = 0
+        if max_id is None or max_id > len(visible):
+            max_id = len(visible)
+
+        if force_invisible:
+            valid_ids = [i for i in range(min_id, max_id) if not visible[i]]
+        else:
+            if allow_invisible:
+                valid_ids = [i for i in range(min_id, max_id)]
+            else:
+                valid_ids = [i for i in range(min_id, max_id) if visible[i]]
+
+        if len(valid_ids) == 0:
+            return None
+
+        return random.choices(valid_ids, k=num_ids)
+
+    @staticmethod
+    def _to_bool_list(values):
+        if hasattr(values, "detach"):
+            values = values.detach().cpu().tolist()
+        return [bool(item) for item in values]
+
+    def _add_presence_transition_fields(self, data, seq_info_dict, template_frame_ids, search_frame_ids,
+                                        template_anno=None, search_anno=None, sampler_event_type=None):
+        data['template_frame_ids'] = torch.tensor(template_frame_ids, dtype=torch.long)
+        data['search_frame_ids'] = torch.tensor(search_frame_ids, dtype=torch.long)
+        data['sampler_event_type'] = sampler_event_type or "default"
+        if template_anno is not None and 'absent' in template_anno:
+            data['template_absent'] = template_anno['absent']
+        if search_anno is not None and 'absent' in search_anno:
+            data['search_absent'] = search_anno['absent']
+        if 'absent' not in seq_info_dict:
+            return data
+
+        # FELT absent.txt is stored as a present flag in this codebase:
+        # 1 means target present, 0 means target absent.
+        present_flags = self._to_bool_list(seq_info_dict['absent'])
+        previous_present = []
+        current_present = []
+        for frame_id in search_frame_ids:
+            frame_id = int(frame_id)
+            cur = present_flags[frame_id] if frame_id < len(present_flags) else True
+            prev_id = max(frame_id - 1, 0)
+            prev = present_flags[prev_id] if prev_id < len(present_flags) else cur
+            previous_present.append(prev)
+            current_present.append(cur)
+        previous_present = torch.tensor(previous_present, dtype=torch.uint8)
+        current_present = torch.tensor(current_present, dtype=torch.uint8)
+        data['previous_present'] = previous_present
+        data['current_present'] = current_present
+        data['is_reappear'] = ((~previous_present.bool()) & current_present.bool()).to(torch.uint8)
+        return data
+
+    def _absence_boundary_ids(self, visible, absent, min_id=None, max_id=None):
+        visible = self._to_bool_list(visible)
+        absent = self._to_bool_list(absent)
+        if min_id is None or min_id < 0:
+            min_id = 0
+        if max_id is None or max_id > len(visible):
+            max_id = len(visible)
+
+        window = max(1, int(getattr(self, "visibility_boundary_window", 8)))
+        ids = []
+        for frame_id in range(min_id, max_id):
+            if not visible[frame_id]:
+                continue
+            left = max(0, frame_id - window)
+            right = min(len(absent), frame_id + window + 1)
+            if any(not absent[idx] for idx in range(left, right)):
+                ids.append(frame_id)
+        return ids
+
+    def _absence_ids(self, present_flags, min_id=None, max_id=None):
+        """Return frame ids where the legacy FELT presence flag is zero."""
+        present_flags = self._to_bool_list(present_flags)
+        if min_id is None or min_id < 0:
+            min_id = 0
+        if max_id is None or max_id > len(present_flags):
+            max_id = len(present_flags)
+        return [
+            idx for idx in range(min_id, max_id) if not present_flags[idx]
+        ]
+
+    def _c3_event_ids(self, visible, seq_info_dict, event_type, min_id=None, max_id=None):
+        if "absent" not in seq_info_dict:
+            return []
+        visible = self._to_bool_list(visible)
+        present = self._to_bool_list(seq_info_dict["absent"])
+        if min_id is None or min_id < 1:
+            min_id = 1
+        if max_id is None or max_id > len(present):
+            max_id = len(present)
+
+        ids = []
+        window = max(1, int(getattr(self, "visibility_boundary_window", 8)))
+        for frame_id in range(min_id, max_id):
+            prev = present[frame_id - 1]
+            cur = present[frame_id]
+            if event_type == "visible_to_visible" and prev and cur:
+                ids.append(frame_id)
+            elif event_type == "visible_to_absent" and prev and not cur:
+                ids.append(frame_id)
+            elif event_type == "absent_to_absent" and not prev and not cur:
+                ids.append(frame_id)
+            elif event_type == "absent_to_present" and not prev and cur:
+                ids.append(frame_id)
+            elif event_type == "hard_visible" and cur and visible[frame_id]:
+                left = max(0, frame_id - window)
+                right = min(len(present), frame_id + window + 1)
+                if any(not present[idx] for idx in range(left, right)):
+                    ids.append(frame_id)
+        return ids
+
+    def _c3_event_order(self):
+        events = list(self.c3_event_weights.keys())
+        weights = [max(0.0, self.c3_event_weights[event]) for event in events]
+        order = []
+        remaining = events[:]
+        remaining_weights = weights[:]
+        while remaining:
+            if sum(remaining_weights) > 0:
+                event = random.choices(remaining, weights=remaining_weights, k=1)[0]
+            else:
+                event = random.choice(remaining)
+            idx = remaining.index(event)
+            order.append(event)
+            remaining.pop(idx)
+            remaining_weights.pop(idx)
+        if "visible_to_visible" not in order:
+            order.append("visible_to_visible")
+        return order
+
+    def _sample_c3_event_causal_frame_ids(self, visible, seq_info_dict, preferred_events=None):
+        if "absent" not in seq_info_dict:
+            return None, None, None
+        events = preferred_events or self._c3_event_order()
+        max_id = len(seq_info_dict["absent"])
+        for event_type in events:
+            event_ids = self._c3_event_ids(
+                visible, seq_info_dict, event_type,
+                min_id=self.num_template_frames,
+                max_id=max_id,
+            )
+            random.shuffle(event_ids)
+            for search_id in event_ids:
+                # Mirror inference's clean-template snapshot: the first
+                # template is the most recent trusted visible frame before the
+                # event. Remaining templates provide older causal history.
+                base_id = self._previous_visible_id(visible, search_id)
+                if base_id is None:
+                    continue
+                base_frame_id = [base_id]
+                prev_frame_ids = self._sample_visible_ids(
+                    visible,
+                    num_ids=self.num_template_frames - 1,
+                    min_id=base_frame_id[0] - self.max_gap,
+                    max_id=base_frame_id[0],
+                )
+                if prev_frame_ids is None:
+                    continue
+                search_frame_ids = [search_id]
+                if self.num_search_frames > 1:
+                    same_event_ids = [idx for idx in event_ids if idx >= search_id]
+                    search_frame_ids += random.choices(
+                        same_event_ids or event_ids, k=self.num_search_frames - 1)
+                return base_frame_id + prev_frame_ids, search_frame_ids, event_type
+        return None, None, None
+
+    def _previous_visible_id(self, visible, frame_id):
+        visible = self._to_bool_list(visible)
+        for idx in range(frame_id - 1, -1, -1):
+            if visible[idx]:
+                return idx
+        return None
+
+    @staticmethod
+    def _bbox_item(seq_info_dict, frame_id):
+        bbox = seq_info_dict["bbox"][frame_id]
+        if hasattr(bbox, "detach"):
+            bbox = bbox.detach().cpu().tolist()
+        return [float(item) for item in bbox]
+
+    def _causal_route_motion_for_frame(self, seq_info_dict, frame_id,
+                                       image_shape):
+        previous_id = self._previous_visible_id(
+            seq_info_dict.get("visible", []), frame_id)
+        if previous_id is None:
+            return torch.zeros(ROUTE_MOTION_DIM, dtype=torch.float32)
+        prior_id = self._previous_visible_id(
+            seq_info_dict.get("visible", []), previous_id)
+        if prior_id is None:
+            return torch.zeros(ROUTE_MOTION_DIM, dtype=torch.float32)
+        return causal_route_motion_cues(
+            self._bbox_item(seq_info_dict, prior_id),
+            self._bbox_item(seq_info_dict, previous_id),
+            image_shape[:2],
+        )
+
+    def _motion_candidate_ids_for_sequence(
+            self, dataset, seq_id, seq_info_dict, image_shape):
+        cache_key = (id(dataset), int(seq_id))
+        cached = self._motion_candidate_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        visible = self._to_bool_list(seq_info_dict.get("visible", []))
+        boxes = torch.as_tensor(seq_info_dict["bbox"], dtype=torch.float32)
+        sequence_length = min(len(visible), int(boxes.shape[0]))
+        visible_ids = torch.nonzero(
+            torch.as_tensor(visible[:sequence_length], dtype=torch.bool),
+            as_tuple=False,
+        ).flatten()
+        candidates = []
+        if visible_ids.numel() >= 2 and sequence_length > 0:
+            history_boxes = boxes[visible_ids]
+            image_hw = torch.as_tensor(image_shape[:2], dtype=torch.float32)
+            height, width = image_hw
+            image_scale = torch.stack([width, height]).clamp_min(1.0)
+            centers = history_boxes[:, :2] + 0.5 * history_boxes[:, 2:]
+            displacement = (
+                (centers[1:] - centers[:-1]) / image_scale
+            ).clamp(-1.0, 1.0)
+            speeds = displacement.square().sum(dim=1).sqrt().clamp_max(1.0)
+            pair_valid = (
+                (history_boxes[:-1, 2:] > 0).all(dim=1)
+                & (history_boxes[1:, 2:] > 0).all(dim=1)
+                & (height > 0)
+                & (width > 0)
+            )
+
+            frame_ids = torch.arange(sequence_length)
+            visible_before = torch.searchsorted(
+                visible_ids, frame_ids, right=False)
+            has_history = (
+                (frame_ids >= self.num_template_frames)
+                & (visible_before >= 2)
+            )
+            eligible_frames = frame_ids[has_history]
+            pair_ids = visible_before[has_history] - 2
+            selected = (
+                pair_valid[pair_ids]
+                & (speeds[pair_ids] >= self.motion_causal_speed_threshold)
+            )
+            candidates = eligible_frames[selected].tolist()
+        self._motion_candidate_cache[cache_key] = candidates
+        return candidates
+
+    def _sample_motion_causal_example(self, dataset, is_video_dataset):
+        if not is_video_dataset or not hasattr(dataset, "get_frame_shape"):
+            return None
+        sequence_ids = self._motion_sequence_ids.get(id(dataset), [])
+        for _ in range(max(self.motion_causal_max_tries, 1)):
+            if not sequence_ids:
+                return None
+            seq_id = random.choice(sequence_ids)
+            seq_info_dict = dataset.get_sequence_info(seq_id)
+            visible = seq_info_dict["visible"]
+            if (visible.type(torch.int64).sum().item()
+                    <= 2 * (self.num_search_frames + self.num_template_frames)):
+                continue
+            image_shape = dataset.get_frame_shape(seq_id)
+            candidates = self._motion_candidate_ids_for_sequence(
+                dataset, seq_id, seq_info_dict, image_shape)
+            if not candidates:
+                continue
+            search_id = random.choice(candidates)
+            base_id = self._previous_visible_id(visible, search_id)
+            if base_id is None:
+                continue
+            previous_ids = self._sample_visible_ids(
+                visible, num_ids=self.num_template_frames - 1,
+                min_id=base_id - self.max_gap, max_id=base_id)
+            if previous_ids is None:
+                continue
+            search_ids = [search_id]
+            if self.num_search_frames > 1:
+                later_candidates = [
+                    candidate for candidate in candidates
+                    if candidate >= search_id
+                ]
+                search_ids += random.choices(
+                    later_candidates or [search_id],
+                    k=self.num_search_frames - 1)
+            return (seq_id, visible, seq_info_dict,
+                    [base_id] + previous_ids, search_ids)
+        return None
+
+    def _replace_absent_search_boxes_for_crop(self, search_anno, search_frame_ids, seq_info_dict):
+        if "absent" not in search_anno or "bbox" not in search_anno:
+            return
+        for item_id, frame_id in enumerate(search_frame_ids):
+            absent_value = search_anno["absent"][item_id]
+            if hasattr(absent_value, "item"):
+                absent_value = absent_value.item()
+            if int(absent_value) != 0:
+                continue
+            anchor_id = self._previous_visible_id(seq_info_dict["visible"], frame_id)
+            if anchor_id is not None:
+                search_anno["bbox"][item_id] = seq_info_dict["bbox"][anchor_id].clone()
+
+    def __getitem__(self, index):
+        if self.train_cls:
+            batch_data = self.getitem_cls()
+        else:
+            batch_data = self.getitem()
+        return batch_data
+
+    def getitem(self):
+        """
+        returns:
+            TensorDict - dict containing all the data blocks
+        """
+        valid = False
+        while not valid:
+            dataset = random.choices(self.datasets, self.p_datasets)[0]
+            is_video_dataset = dataset.is_video_sequence()
+            motion_example = None
+            if (self.motion_causal_sampling
+                    and random.random() < self.motion_causal_sample_prob):
+                motion_example = self._sample_motion_causal_example(
+                    dataset, is_video_dataset)
+            if motion_example is not None:
+                (seq_id, visible, seq_info_dict,
+                 template_frame_ids, search_frame_ids) = motion_example
+            else:
+                seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(
+                    dataset, is_video_dataset)
+            if is_video_dataset:
+                if motion_example is not None:
+                    sampler_event_type = "motion_causal"
+                elif self.frame_sample_mode == 'causal':
+                    template_frame_ids, search_frame_ids = None, None
+                    sampler_event_type = None
+                    gap_increase = 0
+                    # Sample test and train frames in a causal manner, i.e. search_frame_ids > template_frame_ids
+                    if self.c3_event_sampling and random.random() < self.c3_event_sample_prob:
+                        template_frame_ids, search_frame_ids, sampler_event_type = \
+                            self._sample_c3_event_causal_frame_ids(visible, seq_info_dict)
+                    while search_frame_ids is None:
+                        base_frame_id = self._sample_visible_ids(visible, num_ids=1,
+                                                                 min_id=self.num_template_frames - 1,
+                                                                 max_id=len(visible) - self.num_search_frames)
+                        prev_frame_ids = self._sample_visible_ids(visible, num_ids=self.num_template_frames - 1,
+                                                                  min_id=base_frame_id[0] - self.max_gap - gap_increase,
+                                                                  max_id=base_frame_id[0])
+                        if prev_frame_ids is None:
+                            gap_increase += 5
+                            continue
+
+                        template_frame_ids = base_frame_id + prev_frame_ids
+                        search_frame_ids = self._sample_visible_ids(
+                            visible,
+                            num_ids=self.num_search_frames,
+                            min_id=template_frame_ids[0] + 1,
+                            max_id=template_frame_ids[0] + self.max_gap + gap_increase)
+                        sampler_event_type = sampler_event_type or "default"
+                        gap_increase += 5
+
+                elif self.frame_sample_mode == "trident" or self.frame_sample_mode == "trident_pro":
+                    template_frame_ids, search_frame_ids = self.get_frame_ids_trident(visible)
+                    sampler_event_type = "trident"
+                elif self.frame_sample_mode == "stark":
+                    template_frame_ids, search_frame_ids = self.get_frame_ids_stark(visible, seq_info_dict["valid"])
+                    sampler_event_type = "stark"
+                else:
+                    raise ValueError("Illegal frame sample mode")
+            else:
+                # In case of image dataset, just repeat the image to generate synthetic video
+                template_frame_ids = [1] * self.num_template_frames
+                search_frame_ids = [1] * self.num_search_frames
+                sampler_event_type = "image"
+            try:
+                # rgb + event
+                template_aps_frame_list, template_dvs_frame_list, template_anno, meta_obj_train = dataset.get_frames(seq_id, template_frame_ids, seq_info_dict)
+                search_aps_frame_list, search_dvs_frame_list, search_anno, meta_obj_test = dataset.get_frames(seq_id, search_frame_ids, seq_info_dict)
+                self._replace_absent_search_boxes_for_crop(search_anno, search_frame_ids, seq_info_dict)
+
+                H, W, _ = template_aps_frame_list[0].shape
+                template_masks = template_anno['mask'] if 'mask' in template_anno else [torch.zeros((H, W))] * self.num_template_frames
+                search_masks = search_anno['mask'] if 'mask' in search_anno else [torch.zeros((H, W))] * self.num_search_frames
+                route_motion_cues = self._causal_route_motion_for_frame(
+                    seq_info_dict, search_frame_ids[-1],
+                    search_aps_frame_list[-1].shape)
+
+                data = TensorDict({'template_images': template_aps_frame_list,
+                                   'template_anno': template_anno['bbox'],
+                                   'template_masks': template_masks,
+                                   'search_images': search_aps_frame_list,
+                                   'search_anno': search_anno['bbox'],
+                                   'search_masks': search_masks,
+                                   'redetect_search_images': search_aps_frame_list,
+                                   'redetect_search_event_images': search_dvs_frame_list,
+                                   'redetect_search_anno': [box.clone() if hasattr(box, "clone") else torch.tensor(box)
+                                                            for box in search_anno['bbox']],
+                                   'redetect_search_masks': search_masks,
+                                   'dataset': dataset.get_name(),
+                                   'test_class': meta_obj_test.get('object_class_name'),
+                                    'template_event_images': template_dvs_frame_list,
+                                   'search_event_images': search_dvs_frame_list,
+                                   'route_motion_cues': route_motion_cues,
+                                })
+                self._add_presence_transition_fields(
+                    data, seq_info_dict, template_frame_ids, search_frame_ids,
+                    template_anno, search_anno, sampler_event_type)
+                # make data augmentation
+                data = self.processing(data)
+
+                # check whether data is vali
+                valid = data['valid']
+            except RuntimeError:
+                print("Error loading sample.")
+                valid = False
+
+        return data
+
+    def getitem_cls(self):
+        """
+        args:
+            index (int): Index (Ignored since we sample randomly)
+            aux (bool): whether the current data is for auxiliary use (e.g. copy-and-paste)
+
+        returns:
+            TensorDict - dict containing all the data blocks
+        """
+        valid = False
+        label = None
+        while not valid:
+            # Select a dataset
+            dataset = random.choices(self.datasets, self.p_datasets)[0]
+
+            is_video_dataset = dataset.is_video_sequence()
+
+            # sample a sequence from the given dataset
+            seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(dataset, is_video_dataset)
+            # sample template and search frame ids
+            if is_video_dataset:
+                if self.frame_sample_mode in ["trident", "trident_pro"]:
+                    template_frame_ids, search_frame_ids = self.get_frame_ids_trident(visible)
+                elif self.frame_sample_mode == "stark":
+                    template_frame_ids, search_frame_ids = self.get_frame_ids_stark(visible, seq_info_dict["valid"])
+                else:
+                    raise ValueError("illegal frame sample mode")
+            else:
+                # In case of image dataset, just repeat the image to generate synthetic video
+                template_frame_ids = [1] * self.num_template_frames
+                search_frame_ids = [1] * self.num_search_frames
+            try:
+                # "try" is used to handle trackingnet data failure
+                # get images and bounding boxes (for templates)
+                template_frames, template_anno, meta_obj_train = dataset.get_frames(seq_id, template_frame_ids,
+                                                                                    seq_info_dict)
+                H, W, _ = template_frames[0].shape
+                template_masks = template_anno['mask'] if 'mask' in template_anno else [torch.zeros(
+                    (H, W))] * self.num_template_frames
+                # get images and bounding boxes (for searches)
+                # positive samples
+                if random.random() < self.pos_prob:
+                    label = torch.ones(1,)
+                    search_frames, search_anno, meta_obj_test = dataset.get_frames(seq_id, search_frame_ids, seq_info_dict)
+                    search_masks = search_anno['mask'] if 'mask' in search_anno else [torch.zeros(
+                        (H, W))] * self.num_search_frames
+                # negative samples
+                else:
+                    label = torch.zeros(1,)
+                    if is_video_dataset:
+                        search_frame_ids = self._sample_visible_ids(visible, num_ids=1, force_invisible=True)
+                        if search_frame_ids is None:
+                            search_frames, search_anno, meta_obj_test = self.get_one_search()
+                        else:
+                            search_frames, search_anno, meta_obj_test = dataset.get_frames(seq_id, search_frame_ids,
+                                                                                           seq_info_dict)
+                            search_anno["bbox"] = [self.get_center_box(H, W)]
+                    else:
+                        search_frames, search_anno, meta_obj_test = self.get_one_search()
+                    H, W, _ = search_frames[0].shape
+                    search_masks = search_anno['mask'] if 'mask' in search_anno else [torch.zeros(
+                        (H, W))] * self.num_search_frames
+
+                data = TensorDict({'template_images': template_frames,
+                                   'template_anno': template_anno['bbox'],
+                                   'template_masks': template_masks,
+                                   'search_images': search_frames,
+                                   'search_anno': search_anno['bbox'],
+                                   'search_masks': search_masks,
+                                   'dataset': dataset.get_name(),
+                                   'test_class': meta_obj_test.get('object_class_name')})
+                # make data augmentation
+                data = self.processing(data)
+                # add classification label
+                data["label"] = label
+                # check whether data is valid
+                valid = data['valid']
+            except:
+                valid = False
+
+        return data
+
+    def get_center_box(self, H, W, ratio=1/8):
+        cx, cy, w, h = W/2, H/2, W * ratio, H * ratio
+        return torch.tensor([int(cx-w/2), int(cy-h/2), int(w), int(h)])
+
+    def sample_seq_from_dataset(self, dataset, is_video_dataset):
+
+        # Sample a sequence with enough visible frames
+        enough_visible_frames = False
+        while not enough_visible_frames:
+            # Sample a sequence
+            seq_id = random.randint(0, dataset.get_num_sequences() - 1)
+
+            # Sample frames
+            seq_info_dict = dataset.get_sequence_info(seq_id)
+            visible = seq_info_dict['visible']
+
+            enough_visible_frames = visible.type(torch.int64).sum().item() > 2 * (
+                    self.num_search_frames + self.num_template_frames) and len(visible) >= 20
+
+            enough_visible_frames = enough_visible_frames or not is_video_dataset
+        return seq_id, visible, seq_info_dict
+
+    def get_one_search(self):
+        # Select a dataset
+        dataset = random.choices(self.datasets, self.p_datasets)[0]
+
+        is_video_dataset = dataset.is_video_sequence()
+        # sample a sequence
+        seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(dataset, is_video_dataset)
+        # sample a frame
+        if is_video_dataset:
+            if self.frame_sample_mode == "stark":
+                search_frame_ids = self._sample_visible_ids(seq_info_dict["valid"], num_ids=1)
+            else:
+                search_frame_ids = self._sample_visible_ids(visible, num_ids=1, allow_invisible=True)
+        else:
+            search_frame_ids = [1]
+        # get the image, bounding box and other info
+        search_frames, search_anno, meta_obj_test = dataset.get_frames(seq_id, search_frame_ids, seq_info_dict)
+
+        return search_frames, search_anno, meta_obj_test
+
+    def get_frame_ids_trident(self, visible):
+        # get template and search ids in a 'trident' manner
+        template_frame_ids_extra = []
+        while None in template_frame_ids_extra or len(template_frame_ids_extra) == 0:
+            template_frame_ids_extra = []
+            # first randomly sample two frames from a video
+            template_frame_id1 = self._sample_visible_ids(visible, num_ids=1)  # the initial template id
+            search_frame_ids = self._sample_visible_ids(visible, num_ids=1)  # the search region id
+            # get the dynamic template id
+            for max_gap in self.max_gap:
+                if template_frame_id1[0] >= search_frame_ids[0]:
+                    min_id, max_id = search_frame_ids[0], search_frame_ids[0] + max_gap
+                else:
+                    min_id, max_id = search_frame_ids[0] - max_gap, search_frame_ids[0]
+                if self.frame_sample_mode == "trident_pro":
+                    f_id = self._sample_visible_ids(visible, num_ids=1, min_id=min_id, max_id=max_id,
+                                                    allow_invisible=True)
+                else:
+                    f_id = self._sample_visible_ids(visible, num_ids=1, min_id=min_id, max_id=max_id)
+                if f_id is None:
+                    template_frame_ids_extra += [None]
+                else:
+                    template_frame_ids_extra += f_id
+
+        template_frame_ids = template_frame_id1 + template_frame_ids_extra
+        return template_frame_ids, search_frame_ids
+
+    def get_frame_ids_stark(self, visible, valid):
+        # get template and search ids in a 'stark' manner
+        template_frame_ids_extra = []
+        while None in template_frame_ids_extra or len(template_frame_ids_extra) == 0:
+            template_frame_ids_extra = []
+            # first randomly sample two frames from a video
+            template_frame_id1 = self._sample_visible_ids(visible, num_ids=1)  # the initial template id
+            search_frame_ids = self._sample_visible_ids(visible, num_ids=1)  # the search region id
+            # get the dynamic template id
+
+            for max_gap in self.max_gap:
+                if template_frame_id1[0] >= search_frame_ids[0]:
+                    min_id, max_id = search_frame_ids[0], search_frame_ids[0] + max_gap
+                else:
+                    min_id, max_id = search_frame_ids[0] - max_gap, search_frame_ids[0]
+                """we require the frame to be valid but not necessary visible"""
+                f_id = self._sample_visible_ids(valid, num_ids=1, min_id=min_id, max_id=max_id)
+                if f_id is None:
+                    template_frame_ids_extra += [None]
+                else:
+                    template_frame_ids_extra += f_id
+
+        template_frame_ids = template_frame_id1 + template_frame_ids_extra
+        return template_frame_ids, search_frame_ids
