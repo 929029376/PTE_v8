@@ -561,7 +561,7 @@ def test_canonical_training_strategy_matches_dual_4090_capacity():
 
     assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 4096
     assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 10000
-    assert configured.TRAIN.BATCH_SIZE == 8
+    assert configured.TRAIN.BATCH_SIZE == 7
     assert configured.TRAIN.NUM_WORKER == 14
     assert configured.TRAIN.EPOCH == 60
     assert configured.TRAIN.LR_DROP_EPOCH == 45
