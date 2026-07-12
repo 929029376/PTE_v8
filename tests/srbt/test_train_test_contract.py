@@ -548,3 +548,25 @@ def test_canonical_config_contains_no_legacy_route_or_c3_nodes():
     assert forbidden.isdisjoint(configured.MODEL)
     assert configured.MODEL.PRETRAINED_BASELINE_CKPT.endswith(
         "AMTTrack_ep0098.pth.tar")
+    assert configured.MODEL.PRETRAINED_BASELINE_CKPT == (
+        "pretrained_networks/AMTTrack_ep0098.pth.tar")
+
+
+def test_canonical_training_strategy_matches_dual_4090_capacity():
+    from copy import deepcopy
+    from lib.config.pet_track.config import cfg, update_config_from_file
+
+    configured = deepcopy(cfg)
+    update_config_from_file("experiments/pet_track/felt_pet_track.yaml", configured)
+
+    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 4096
+    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 10000
+    assert configured.TRAIN.BATCH_SIZE == 8
+    assert configured.TRAIN.NUM_WORKER == 14
+    assert configured.TRAIN.EPOCH == 60
+    assert configured.TRAIN.LR_DROP_EPOCH == 45
+    assert configured.TRAIN.VAL_START_EPOCH == 30
+    assert configured.TRAIN.VAL_SCHEDULE == [[30, 39, 5], [40, 49, 2], [50, -1, 1]]
+    assert configured.TRAIN.SAVE_EPOCHS == [20, 40, 50, 60]
+    assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
+    assert configured.TRAIN.SAVE_BEST is True
