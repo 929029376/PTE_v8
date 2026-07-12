@@ -533,6 +533,9 @@ def test_supervisor_exposes_only_the_srbt_training_entry_point():
     assert "expert" not in config.lower()
     assert "generated/felt_pet_track_v8" not in config
     assert 'PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"' in config
+    assert "[supervisord]" not in config
+    assert "autostart=true" in config
+    assert "[program:pettrack_srbt_watch_v8]" in config
 
 
 def test_canonical_config_contains_no_legacy_route_or_c3_nodes():
