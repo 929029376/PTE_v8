@@ -2,7 +2,7 @@ import random
 import torch.utils.data
 import torch
 from lib.utils import TensorDict
-from lib.train.data.srbt_labels import build_temporal_targets
+from lib.train.data.expert_ownership import load_manifest
 
 def no_processing(data):
     return data
@@ -58,10 +58,6 @@ class TrackingSampler(torch.utils.data.Dataset):
         data_cfg = getattr(cfg, "DATA", None)
         srbt_cfg = getattr(data_cfg, "SRBT", None)
         self.srbt_enabled = bool(getattr(srbt_cfg, "ENABLE", False))
-        self.srbt_history_length = int(getattr(srbt_cfg, "HISTORY_LENGTH", 8))
-        if self.srbt_history_length <= 0:
-            raise ValueError("SRBT history length must be positive")
-        self.srbt_max_hazard = int(getattr(srbt_cfg, "MAX_HAZARD", 128))
         anchor_weights = getattr(srbt_cfg, "ANCHOR_WEIGHTS", None)
         self.srbt_anchor_weights = {
             "visible_to_visible": float(getattr(anchor_weights, "VISIBLE", 0.25)),
@@ -69,10 +65,33 @@ class TrackingSampler(torch.utils.data.Dataset):
             "absent_to_absent": float(getattr(anchor_weights, "ABSENT", 0.25)),
             "absent_to_present": float(getattr(anchor_weights, "REAPPEARING", 0.25)),
         }
+        challenge_cfg = getattr(data_cfg, "CHALLENGE_SAMPLING", None)
+        self.expert_phase = str(getattr(
+            getattr(cfg, "TRAIN", None), "EXPERT_PHASE", "specialize")).lower()
+        self.precise_expert_sampling = (
+            self.training
+            and self.expert_phase == "specialize"
+            and bool(getattr(challenge_cfg, "ENABLE", False))
+            and bool(getattr(challenge_cfg, "PRECISE", False))
+        )
+        manifest_path = str(getattr(challenge_cfg, "MANIFEST", "")).strip()
+        if self.precise_expert_sampling and not manifest_path:
+            raise ValueError("precise expert sampling requires a manifest path")
+        self._expert_manifest = (
+            load_manifest(manifest_path)["sequences"]
+            if self.precise_expert_sampling else {}
+        )
         # self.batch_size = batch_size
 
     def __len__(self):
         return self.samples_per_epoch
+
+    def owner_for_index(self, index):
+        if self.samples_per_epoch % 5 != 0:
+            raise ValueError("samples_per_epoch must be divisible by five experts")
+        if index < 0 or index >= self.samples_per_epoch:
+            raise IndexError(index)
+        return min(index // (self.samples_per_epoch // 5), 4)
 
     def _sample_visible_ids(self, visible, num_ids=1, min_id=None, max_id=None,
                             allow_invisible=False, force_invisible=False):
@@ -224,6 +243,43 @@ class TrackingSampler(torch.utils.data.Dataset):
         template_frame_ids, search_frame_ids = examples[event_type]
         return template_frame_ids, search_frame_ids, event_type
 
+    def _expert_owner_labels(self, dataset, seq_id, seq_info_dict):
+        if not hasattr(dataset, "sequence_list"):
+            raise RuntimeError(
+                "precise expert sampling requires named video sequences")
+        sequence_name = dataset.sequence_list[int(seq_id)]
+        record = self._expert_manifest.get(sequence_name)
+        if record is None:
+            raise RuntimeError(
+                f"expert ownership manifest has no sequence {sequence_name}")
+        labels = torch.as_tensor(record["owners"], dtype=torch.int8)
+        if labels.numel() != len(seq_info_dict["bbox"]):
+            raise RuntimeError(
+                f"expert ownership length mismatch for {sequence_name}: "
+                f"manifest={labels.numel()} annotations={len(seq_info_dict['bbox'])}")
+        return labels
+
+    def _sample_expert_causal_frame_ids(
+            self, dataset, seq_id, visible, seq_info_dict, owner_id):
+        labels = self._expert_owner_labels(dataset, seq_id, seq_info_dict)
+        candidate_ids = torch.nonzero(
+            labels == owner_id, as_tuple=False).flatten().tolist()
+        random.shuffle(candidate_ids)
+        for search_id in candidate_ids:
+            frame_ids = self._causal_frame_ids_for_anchor(
+                visible, search_id, candidate_ids)
+            if frame_ids is not None:
+                template_frame_ids, search_frame_ids = frame_ids
+                return (
+                    template_frame_ids,
+                    search_frame_ids,
+                    f"expert_{owner_id}",
+                    owner_id,
+                )
+        if not candidate_ids:
+            return None, None, None, None
+        return None, None, None, None
+
     def _previous_visible_id(self, visible, frame_id):
         visible = self._to_bool_list(visible)
         for idx in range(frame_id - 1, -1, -1):
@@ -244,102 +300,18 @@ class TrackingSampler(torch.utils.data.Dataset):
             if anchor_id is not None:
                 search_anno["bbox"][item_id] = seq_info_dict["bbox"][anchor_id].clone()
 
-    def _add_srbt_future_fields(self, data, dataset, seq_id, seq_info_dict,
-                                anchor, horizon):
-        present = seq_info_dict.get("absent", seq_info_dict["visible"]).to(torch.bool)
-        if "valid" in seq_info_dict:
-            present = present & seq_info_dict["valid"].to(torch.bool)
-
-        targets = build_temporal_targets(
-            present,
-            anchor=anchor,
-            horizon=horizon,
-            max_hazard=self.srbt_max_hazard,
-        )
-        valid_length = int(targets["future_valid"].sum().item())
-        future_frame_ids = list(range(anchor + 1, anchor + 1 + valid_length))
-
-        if future_frame_ids:
-            future_images, future_event_images, future_anno, _ = dataset.get_frames(
-                seq_id, future_frame_ids, seq_info_dict)
-            height, width = future_images[0].shape[:2]
-            future_masks = future_anno.get(
-                "mask", [torch.zeros((height, width))] * valid_length)
-            future_boxes = future_anno["bbox"]
-        else:
-            future_images = []
-            future_event_images = []
-            future_boxes = []
-            future_masks = []
-
-        padded_ids = torch.full((int(horizon),), -1, dtype=torch.long)
-        if future_frame_ids:
-            padded_ids[:valid_length] = torch.tensor(future_frame_ids, dtype=torch.long)
-
-        data.update({
-            "future_images": future_images,
-            "future_event_images": future_event_images,
-            "future_anno": future_boxes,
-            "future_masks": future_masks,
-            "future_frame_ids": padded_ids,
-            **targets,
-        })
-
-    def _add_srbt_history_fields(self, data, dataset, seq_id, seq_info_dict,
-                                 anchor):
-        start = max(0, anchor - self.srbt_history_length)
-        history_frame_ids = list(range(start, anchor))
-        if history_frame_ids:
-            history_images, history_event_images, history_anno, _ = \
-                dataset.get_frames(seq_id, history_frame_ids, seq_info_dict)
-            height, width = history_images[0].shape[:2]
-            history_boxes = history_anno["bbox"]
-            history_masks = history_anno.get(
-                "mask", [torch.zeros((height, width))] * len(history_frame_ids))
-        else:
-            history_images = []
-            history_event_images = []
-            history_boxes = []
-            history_masks = []
-
-        present = seq_info_dict.get("absent", seq_info_dict["visible"]).to(torch.bool)
-        if "valid" in seq_info_dict:
-            present = present & seq_info_dict["valid"].to(torch.bool)
-        valid_length = len(history_frame_ids)
-        offset = self.srbt_history_length - valid_length
-        padded_ids = torch.full(
-            (self.srbt_history_length,), -1, dtype=torch.long)
-        history_valid = torch.zeros(
-            self.srbt_history_length, dtype=torch.bool)
-        history_present = torch.zeros(
-            self.srbt_history_length, dtype=torch.long)
-        padded_ids[offset:] = torch.tensor(history_frame_ids, dtype=torch.long)
-        history_valid[offset:] = True
-        history_present[offset:] = present[history_frame_ids].to(torch.long)
-
-        data.update({
-            "history_images": history_images,
-            "history_event_images": history_event_images,
-            "history_anno": history_boxes,
-            "history_masks": history_masks,
-            "history_frame_ids": padded_ids,
-            "history_present": history_present,
-            "history_valid": history_valid,
-        })
-
     def __getitem__(self, index):
-        horizon = None
-        if isinstance(index, tuple):
-            if len(index) != 2:
-                raise ValueError("sample index tuples must contain (index, horizon)")
-            _, horizon = index
         if self.train_cls:
             batch_data = self.getitem_cls()
         else:
-            batch_data = self.getitem(horizon=horizon)
+            owner_id = (
+                self.owner_for_index(index)
+                if self.precise_expert_sampling else None
+            )
+            batch_data = self.getitem(owner_id=owner_id)
         return batch_data
 
-    def getitem(self, horizon=None):
+    def getitem(self, owner_id=None):
         """
         returns:
             TensorDict - dict containing all the data blocks
@@ -350,13 +322,22 @@ class TrackingSampler(torch.utils.data.Dataset):
             is_video_dataset = dataset.is_video_sequence()
             seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(
                 dataset, is_video_dataset)
+            expert_owner_id = None
             if is_video_dataset:
                 if self.frame_sample_mode == 'causal':
                     template_frame_ids, search_frame_ids = None, None
                     sampler_event_type = None
                     gap_increase = 0
                     # Sample test and train frames in a causal manner, i.e. search_frame_ids > template_frame_ids
-                    if horizon is not None and self.srbt_enabled:
+                    if self.precise_expert_sampling:
+                        (template_frame_ids, search_frame_ids,
+                         sampler_event_type, expert_owner_id) = \
+                            self._sample_expert_causal_frame_ids(
+                                dataset, seq_id, visible, seq_info_dict,
+                                owner_id)
+                        if search_frame_ids is None:
+                            continue
+                    elif self.srbt_enabled:
                         template_frame_ids, search_frame_ids, sampler_event_type = \
                             self._sample_srbt_event_causal_frame_ids(
                                 visible, seq_info_dict)
@@ -389,6 +370,8 @@ class TrackingSampler(torch.utils.data.Dataset):
                 else:
                     raise ValueError("Illegal frame sample mode")
             else:
+                if self.precise_expert_sampling:
+                    continue
                 # In case of image dataset, just repeat the image to generate synthetic video
                 template_frame_ids = [1] * self.num_template_frames
                 search_frame_ids = [1] * self.num_search_frames
@@ -397,6 +380,9 @@ class TrackingSampler(torch.utils.data.Dataset):
                 # rgb + event
                 template_aps_frame_list, template_dvs_frame_list, template_anno, meta_obj_train = dataset.get_frames(seq_id, template_frame_ids, seq_info_dict)
                 search_aps_frame_list, search_dvs_frame_list, search_anno, meta_obj_test = dataset.get_frames(seq_id, search_frame_ids, seq_info_dict)
+                redetect_search_anno = [
+                    box.clone() for box in search_anno['bbox']
+                ]
                 self._replace_absent_search_boxes_for_crop(search_anno, search_frame_ids, seq_info_dict)
 
                 H, W, _ = template_aps_frame_list[0].shape
@@ -414,23 +400,16 @@ class TrackingSampler(torch.utils.data.Dataset):
                                     'template_event_images': template_dvs_frame_list,
                                    'search_event_images': search_dvs_frame_list,
                                 })
-                if self.srbt_enabled and is_video_dataset:
-                    self._add_srbt_history_fields(
-                        data,
-                        dataset,
-                        seq_id,
-                        seq_info_dict,
-                        anchor=search_frame_ids[-1],
-                    )
-                if horizon is not None:
-                    self._add_srbt_future_fields(
-                        data,
-                        dataset,
-                        seq_id,
-                        seq_info_dict,
-                        anchor=search_frame_ids[-1],
-                        horizon=int(horizon),
-                    )
+                if expert_owner_id is not None:
+                    data['expert_owner_id'] = torch.tensor(
+                        expert_owner_id, dtype=torch.long)
+                if self.srbt_enabled:
+                    data.update({
+                        'redetect_search_images': list(search_aps_frame_list),
+                        'redetect_search_event_images': list(search_dvs_frame_list),
+                        'redetect_search_anno': redetect_search_anno,
+                        'redetect_search_masks': list(search_masks),
+                    })
                 self._add_presence_transition_fields(
                     data, seq_info_dict, template_frame_ids, search_frame_ids,
                     template_anno, search_anno, sampler_event_type)

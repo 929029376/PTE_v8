@@ -4,8 +4,9 @@ import torch
 
 from lib.models.layers.srbt_controller import (
     Action,
-    BeliefController,
-    build_belief_controller,
+    VisibilityController,
+    VisibilityGate,
+    build_visibility_controller,
 )
 from lib.test.tracker.pet_track import PETTrack
 
@@ -33,142 +34,114 @@ def _candidate(identity=0.8, motion=0.8, score=0.85):
     }
 
 
-def test_track_requires_joint_presence_entropy_identity_and_motion_gate():
-    controller = BeliefController()
+def test_visibility_gate_detaches_shared_features_and_returns_binary_logits():
+    gate = VisibilityGate(feature_dim=8, response_dim=3, hidden_dim=4)
+    pooled = torch.randn(2, 8, requires_grad=True)
+    response_stats = torch.randn(2, 3, requires_grad=True)
 
-    accepted = controller.step(_posterior(), _candidate(), frame_index=1)
-    assert accepted.action is Action.TRACK
-    assert accepted.allow_recent_write
-    assert not accepted.output_absent
-    assert accepted.output_score == 0.85
+    logits = gate(pooled, response_stats)
+    logits.sum().backward()
 
-    cases = (
-        (_posterior(present=0.69), _candidate()),
-        (_posterior(entropy=0.36), _candidate()),
-        (_posterior(), _candidate(identity=0.59)),
-        (_posterior(), _candidate(motion=0.49)),
-    )
-    for frame_index, (posterior, candidate) in enumerate(cases, start=2):
-        controller.reset()
-        rejected = controller.step(posterior, candidate, frame_index)
-        assert rejected.action is Action.HOLD
-        assert not rejected.allow_recent_write
-        assert not rejected.allow_long_write
-        assert rejected.output_absent
-        assert rejected.output_score == 0.0
+    assert logits.shape == (2, 2)
+    assert pooled.grad is None
+    assert response_stats.grad is None
+    assert all(parameter.grad is not None for parameter in gate.parameters())
 
 
-def test_hazard_and_periodic_long_absence_trigger_redetection():
-    immediate = BeliefController().step(
-        _posterior(present=0.1, absent=0.7, hazard8=0.32, duration=2),
-        _candidate(identity=0.1, motion=0.1),
-        frame_index=7,
-    )
-    assert immediate.action is Action.REDETECT
-    assert immediate.output_absent
-    assert immediate.output_score == 0.0
+def test_weak_presence_progresses_from_track_to_suspect_to_absent():
+    controller = VisibilityController(
+        suspect_frames=2, absent_frames=4, long_stable_frames=3)
 
-    before_period = BeliefController().step(
-        _posterior(present=0.1, absent=0.7, hazard8=0.1, duration=14),
-        None,
-        frame_index=20,
-    )
-    on_period = BeliefController().step(
-        _posterior(present=0.1, absent=0.7, hazard8=0.1, duration=15),
-        None,
-        frame_index=21,
-    )
-    assert before_period.action is Action.HOLD
-    assert on_period.action is Action.REDETECT
+    first = controller.step(0.69)
+    second = controller.step(0.69)
+    third = controller.step(0.69)
+    fourth = controller.step(0.69)
+
+    assert first.action is Action.TRACK
+    assert not first.allow_recent_write
+    assert not first.output_absent
+    assert second.action is Action.SUSPECT
+    assert third.action is Action.SUSPECT
+    assert not second.output_absent
+    assert fourth.action is Action.ABSENT
+    assert fourth.output_absent
 
 
-def test_redetection_requires_three_consecutive_verified_frames():
-    controller = BeliefController()
-    entered = controller.step(
-        _posterior(present=0.1, absent=0.8, hazard8=0.4, duration=3),
-        None,
-        frame_index=1,
-    )
-    assert entered.action is Action.REDETECT
+def test_strong_presence_resets_suspicion_and_preserves_memory_stability_gate():
+    controller = VisibilityController(
+        suspect_frames=2, absent_frames=4, long_stable_frames=3)
+    controller.step(0.2)
+    assert controller.step(0.2).action is Action.SUSPECT
 
-    for frame_index in (2, 3):
-        verifying = controller.step(
-            _posterior(present=0.8, absent=0.05),
-            _candidate(),
-            frame_index,
-        )
-        assert verifying.action is Action.REDETECT
-        assert verifying.output_absent
-        assert not verifying.allow_recent_write
+    recovered = controller.step(0.9)
+    stable = controller.step(0.9)
+    long_ready = controller.step(0.9)
 
-    recovered = controller.step(
-        _posterior(present=0.8, absent=0.05),
-        _candidate(),
-        frame_index=4,
-    )
     assert recovered.action is Action.TRACK
     assert recovered.allow_recent_write
     assert not recovered.allow_long_write
-    assert not recovered.output_absent
-
-
-def test_failed_verification_resets_streak_and_long_memory_waits_after_recovery():
-    controller = BeliefController()
-    controller.step(
-        _posterior(present=0.1, absent=0.8, hazard8=0.4, duration=3),
-        None,
-        frame_index=1,
-    )
-    controller.step(_posterior(), _candidate(), frame_index=2)
-    failed = controller.step(
-        _posterior(entropy=0.5), _candidate(), frame_index=3)
-    assert failed.action is Action.REDETECT
-    for frame_index in (4, 5):
-        assert controller.step(
-            _posterior(), _candidate(), frame_index).action is Action.REDETECT
-    recovered = controller.step(_posterior(), _candidate(), frame_index=6)
-    assert recovered.action is Action.TRACK
-    assert not recovered.allow_long_write
-
-    for frame_index in range(7, 11):
-        stable = controller.step(_posterior(), _candidate(), frame_index)
-        assert stable.action is Action.TRACK
-        assert not stable.allow_long_write
-    long_ready = controller.step(_posterior(), _candidate(), frame_index=11)
+    assert not stable.allow_long_write
     assert long_ready.allow_long_write
 
 
-def test_builder_reads_every_frozen_controller_threshold():
+def test_absent_recovery_requires_two_rgb_localization_confirmations():
+    controller = VisibilityController(
+        suspect_frames=2, absent_frames=4, verify_frames=2)
+    for _ in range(4):
+        result = controller.step(0.1)
+    assert result.action is Action.ABSENT
+
+    verifying = controller.step(
+        0.9, identity_score=0.85, localization_score=0.8)
+    recovered = controller.step(
+        0.88, identity_score=0.82, localization_score=0.79)
+
+    assert verifying.action is Action.VERIFY
+    assert verifying.output_absent
+    assert not verifying.allow_recent_write
+    assert recovered.action is Action.TRACK
+    assert not recovered.output_absent
+    assert not recovered.allow_recent_write
+
+
+def test_failed_recovery_confirmation_returns_to_absent():
+    controller = VisibilityController()
+    for _ in range(4):
+        controller.step(0.1)
+    assert controller.step(
+        0.9, identity_score=0.9, localization_score=0.9
+    ).action is Action.VERIFY
+
+    failed = controller.step(
+        0.9, identity_score=0.4, localization_score=0.9)
+
+    assert failed.action is Action.ABSENT
+    assert failed.output_absent
+
+
+def test_builder_reads_visibility_controller_thresholds():
     values = SimpleNamespace(
-        THETA_TRACK=0.71,
-        THETA_ENTROPY=0.31,
-        THETA_IDENTITY=0.61,
-        THETA_MOTION=0.51,
-        THETA_ABSENT=0.62,
-        THETA_HAZARD8=0.32,
-        REDETECT_AGE=6,
-        REDETECT_PERIOD=11,
+        THETA_PRESENT=0.71,
+        THETA_RECOVER=0.81,
+        SUSPECT_FRAMES=3,
+        ABSENT_FRAMES=6,
         VERIFY_FRAMES=4,
         LONG_STABLE_FRAMES=7,
     )
     cfg = SimpleNamespace(MODEL=SimpleNamespace(
         SRBT=SimpleNamespace(CONTROLLER=values)))
 
-    controller = build_belief_controller(cfg)
+    controller = build_visibility_controller(cfg)
 
-    assert controller.theta_track == 0.71
-    assert controller.theta_entropy == 0.31
-    assert controller.theta_identity == 0.61
-    assert controller.theta_motion == 0.51
-    assert controller.theta_absent == 0.62
-    assert controller.theta_hazard8 == 0.32
-    assert controller.redetect_age == 6
-    assert controller.redetect_period == 11
+    assert controller.theta_present == 0.71
+    assert controller.theta_recover == 0.81
+    assert controller.suspect_frames == 3
+    assert controller.absent_frames == 6
     assert controller.verify_frames == 4
     assert controller.long_stable_frames == 7
 
 
-def test_tracker_uses_only_a_real_srbt_posterior_for_controller_input():
+def test_tracker_passes_only_local_presence_to_controller():
     class _Recorder:
         def __init__(self):
             self.args = None
@@ -179,19 +152,16 @@ def test_tracker_uses_only_a_real_srbt_posterior_for_controller_input():
 
     tracker = object.__new__(PETTrack)
     tracker.frame_id = 9
-    tracker.belief_controller = _Recorder()
+    tracker.visibility_controller = _Recorder()
 
     assert PETTrack._step_srbt_controller(tracker, {"score_peak": 0.9}) is None
-    assert tracker.belief_controller.args is None
+    assert tracker.visibility_controller.args is None
 
-    posterior = _posterior()
-    hypothesis = _candidate()
     result = PETTrack._step_srbt_controller(tracker, {
-        "srbt_posterior": posterior,
-        "srbt_best_hypothesis": hypothesis,
+        "presence_score": 0.82,
     })
     assert result == "controlled"
-    assert tracker.belief_controller.args == (posterior, hypothesis, 9)
+    assert tracker.visibility_controller.args == (0.82,)
 
 
 def test_verified_srbt_recovery_consumes_the_pending_global_box():
@@ -218,16 +188,66 @@ def test_tracker_has_no_event_background_fallback():
     assert not hasattr(PETTrack, "_should_update_event_background")
 
 
-def test_new_sequence_resets_causal_srbt_posterior():
+def test_new_sequence_resets_runtime_recovery_state():
     tracker = object.__new__(PETTrack)
-    tracker._srbt_posterior = {"state_prob": torch.ones(1, 4)}
-    tracker._srbt_last_action = Action.HOLD
+    tracker._srbt_last_action = Action.ABSENT
     tracker._redetect_hypotheses = {"active_count": 1}
     tracker._pending_redetect_box = [1.0, 2.0, 3.0, 4.0]
 
     PETTrack._reset_srbt_sequence_state(tracker)
 
-    assert tracker._srbt_posterior is None
     assert tracker._srbt_last_action is Action.TRACK
     assert tracker._redetect_hypotheses is None
     assert tracker._pending_redetect_box is None
+    assert not hasattr(tracker, "_expert_probabilities")
+
+
+def test_tracker_uses_all_experts_without_hidden_selector_history():
+    class Thor:
+        def begin_frame(self):
+            return torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)
+
+    class Network:
+        def __init__(self):
+            self.calls = []
+
+        def inference(self, **kwargs):
+            self.calls.append(kwargs)
+            expert_outputs = {
+                name: {
+                    "score_map": torch.full((1, 1, 2, 2), score),
+                    "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2]]]),
+                }
+                for name, score in zip(
+                    ("generalist", "motion_fm", "small_target_st",
+                     "visibility_foc_ov", "discrimination_bi"),
+                    (0.5, 0.6, 0.7, 0.8, 0.9),
+                )
+            }
+            return {
+                "score_map": torch.ones(1, 1, 2, 2),
+                "target_bbox": torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+                "presence_score": torch.tensor([0.8]),
+                "expert_outputs": expert_outputs,
+            }
+
+    tracker = object.__new__(PETTrack)
+    tracker.thor_wrapper = Thor()
+    tracker.network = Network()
+    tracker.static_zi = torch.zeros(1, 4, 8)
+    tracker.static_ze = torch.zeros(1, 4, 8)
+    tracker.output_window = torch.ones(1, 1, 2, 2)
+    tracker.params = SimpleNamespace(search_size=32)
+    tracker.map_box_back = lambda box, factor, reference: box
+    search = torch.zeros(1, 3, 32, 32)
+
+    candidate = tracker._run_local_candidate(
+        search, search, 1.0, 100, 100,
+        reference_state=[0.0, 0.0, 16.0, 16.0])
+
+    assert len(tracker.network.calls) == 1
+    assert "previous_expert_probabilities" not in tracker.network.calls[0]
+    assert candidate["retained_expert_ids"] == (0, 1, 2, 3, 4)
+    assert candidate["ensemble_weights"].shape == (5,)
+    assert len(candidate["expert_states"]) == 5
+    assert all(len(box) == 4 for box in candidate["expert_states"])

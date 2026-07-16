@@ -1,4 +1,5 @@
 import importlib
+import math
 import os
 from collections import OrderedDict
 from lib.test.evaluation.environment import env_settings
@@ -38,6 +39,21 @@ def trackerlist(name: str, parameter_name: str, dataset_name: str, run_ids = Non
     if run_ids is None or isinstance(run_ids, int):
         run_ids = [run_ids]
     return [Tracker(name, parameter_name, dataset_name, run_id, display_name, result_only) for run_id in run_ids]
+
+
+def is_valid_initial_bbox(bbox):
+    if bbox is None or len(bbox) != 4:
+        return False
+    try:
+        x, y, width, height = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return False
+    return (
+        all(math.isfinite(value) for value in (x, y, width, height))
+        and width > 0.0
+        and height > 0.0
+        and width * height >= 1.0
+    )
 
 
 class Tracker:
@@ -105,7 +121,7 @@ class Tracker:
 
     @staticmethod
     def _default_result_container():
-        return {'target_bbox': [], 'time': [], 'absent': []}
+        return {'target_bbox': [], 'time': []}
 
     def _track_sequence(self, tracker, seq, init_info):
         # Define outputs
@@ -122,6 +138,8 @@ class Tracker:
         # object in frame i
 
         output = self._default_result_container()
+        if getattr(tracker, 'supports_absent_output', False):
+            output['absent'] = []
 
         def _store_outputs(tracker_out: dict, defaults=None):
             defaults = {} if defaults is None else defaults
@@ -131,8 +149,7 @@ class Tracker:
                     output[key].append(val)
 
         init_bbox = init_info.get('init_bbox')
-        if init_bbox is None or len(init_bbox) != 4 \
-                or float(init_bbox[2]) * float(init_bbox[3]) < 1:
+        if not is_valid_initial_bbox(init_bbox):
             raise RuntimeError(
                 'Sequence initial bounding box must be valid; evaluation '
                 'cannot scan future ground truth for a replacement template')
@@ -149,6 +166,7 @@ class Tracker:
         init_default = {
             'target_bbox': init_bbox,
             'time': time.time() - start_time,
+            'absent': False,
         }
         _store_outputs(out, init_default)
 

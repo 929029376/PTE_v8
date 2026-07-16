@@ -185,8 +185,10 @@ class TemplateModule():
             self.ze_raw_list.append(self.static_e.clone())
         self.gen_z_feature()  
         self.calculate_gram_matrix()
-        self.base_sim_zi = self.gram_matrix_zi[0, 0]
-        self.base_sim_ze = self.gram_matrix_ze[0, 0]
+        self.base_sim_zi = self.gram_matrix_zi[0, 0].detach().clone()
+        self.base_sim_ze = self.gram_matrix_ze[0, 0].detach().clone()
+        self.selected_i = [self.zi_list[0]]
+        self.selected_e = [self.ze_list[0]]
         self.timestamp_list = [0] * self.z_capacity
     
     def gen_z_feature(self):

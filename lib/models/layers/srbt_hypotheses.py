@@ -324,6 +324,15 @@ class HypothesisTracker:
             observed = self._empty(reference, identity_dim)
 
         predicted = previous["boxes"] + previous["velocity"]
+        predicted_size = torch.where(
+            predicted[:, 2:] > 0.0,
+            predicted[:, 2:],
+            previous["boxes"][:, 2:],
+        ).clamp(min=1e-4, max=1.0)
+        predicted = torch.cat((
+            predicted[:, :2].clamp(0.0, 1.0),
+            predicted_size,
+        ), dim=-1)
         matches = []
         if predicted.shape[0] and observed["boxes"].shape[0]:
             iou = _box_iou(predicted[:, None, :], observed["boxes"][None, :, :])

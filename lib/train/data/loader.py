@@ -3,8 +3,6 @@ import torch.utils.data.dataloader
 import importlib
 import collections
 import collections.abc as collections_abc
-import math
-import random
 string_classes = (str, bytes)
 from lib.utils import TensorDict, TensorList
 
@@ -30,88 +28,11 @@ def _new_shared_stack_output(batch, dim):
     return batch[0].new(storage).resize_(*out_shape)
 
 
-class HorizonBatchSampler:
-    """Group arbitrary sample indices into batches sharing one horizon."""
-
-    def __init__(self, indices, batch_size, horizons, weights, drop_last):
-        if int(batch_size) <= 0:
-            raise ValueError("batch_size must be positive")
-        if not horizons or any(int(value) <= 0 for value in horizons):
-            raise ValueError("horizons must contain positive values")
-        if len(horizons) != len(weights):
-            raise ValueError("horizons and weights must have the same length")
-        if any(float(value) < 0 for value in weights) or sum(weights) <= 0:
-            raise ValueError("weights must contain a positive total")
-        self.indices = indices
-        self.batch_size = int(batch_size)
-        self.horizons = tuple(int(value) for value in horizons)
-        self.weights = tuple(float(value) for value in weights)
-        self.drop_last = bool(drop_last)
-        self.epoch = 0
-
-    def __iter__(self):
-        rng = random.Random(self.epoch)
-        batch = []
-        for index in self.indices:
-            batch.append(index)
-            if len(batch) == self.batch_size:
-                yield self._with_horizon(batch, rng)
-                batch = []
-        if batch and not self.drop_last:
-            yield self._with_horizon(batch, rng)
-
-    def __len__(self):
-        length = len(self.indices)
-        if self.drop_last:
-            return length // self.batch_size
-        return math.ceil(length / self.batch_size)
-
-    def set_epoch(self, epoch):
-        self.epoch = int(epoch)
-        if hasattr(self.indices, "set_epoch"):
-            self.indices.set_epoch(epoch)
-
-    def _with_horizon(self, indices, rng):
-        horizon = rng.choices(self.horizons, weights=self.weights, k=1)[0]
-        return [(index, horizon) for index in indices]
-
-
-_TEMPORAL_PAD_KEYS = {
-    "history_images": ("history_valid", True),
-    "history_event_images": ("history_valid", True),
-    "history_anno": ("history_valid", True),
-    "future_images": ("future_valid", False),
-    "future_event_images": ("future_valid", False),
-    "future_anno": ("future_valid", False),
-}
-
-
-def _pad_temporal_tensors(values, target_length, stack_dim, pad_left):
-    padded = []
-    for value in values:
-        if value.shape[0] > target_length:
-            raise ValueError("temporal tensor exceeds its declared length")
-        output = value.new_zeros((target_length, *value.shape[1:]))
-        offset = target_length - value.shape[0] if pad_left else 0
-        output[offset:offset + value.shape[0]] = value
-        padded.append(output)
-    return torch.stack(padded, dim=stack_dim)
-
-
 def _collate_tensor_dict(batch, collate, stack_dim):
-    result = {}
-    for key in batch[0]:
-        values = [item[key] for item in batch]
-        pad_spec = _TEMPORAL_PAD_KEYS.get(key)
-        if pad_spec is not None:
-            valid_key, pad_left = pad_spec
-            target_length = max(
-                int(item[valid_key].numel()) for item in batch)
-            result[key] = _pad_temporal_tensors(
-                values, target_length, stack_dim, pad_left)
-        else:
-            result[key] = collate(values)
-    return TensorDict(result)
+    return TensorDict({
+        key: collate([item[key] for item in batch])
+        for key in batch[0]
+    })
 
 
 

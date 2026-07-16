@@ -47,11 +47,6 @@ def _save_tracker_output(seq: Sequence, tracker: Tracker, output: dict):
         scores = np.array(data).astype(float)
         np.savetxt(file, scores, delimiter='\t', fmt='%.2f')
 
-    def save_flag(file, data):
-        _ensure_parent(file)
-        flags = np.array(data).astype(int)
-        np.savetxt(file, flags, delimiter='\t', fmt='%d')
-
     def save_debug_csv(file, rows):
         fieldnames = []
         for row in rows:
@@ -121,10 +116,6 @@ def _save_tracker_output(seq: Sequence, tracker: Tracker, output: dict):
                 print("saving scores...")
                 bbox_file = '{}_all_scores.txt'.format(base_results_path)
                 save_score(bbox_file, data)
-
-        if key == 'absent':
-            flag_file = '{}_absent.txt'.format(base_results_path)
-            save_flag(flag_file, data)
 
         if key == 'time':
             if isinstance(data[0], dict):

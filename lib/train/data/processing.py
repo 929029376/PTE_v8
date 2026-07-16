@@ -102,20 +102,6 @@ class STARKProcessing(BaseProcessing):
     def _default_masks(images):
         return [torch.zeros(image.shape[:2]) for image in images]
 
-    def _apply_joint_full_frame_transform(self, data, prefix):
-        image_key = prefix + '_images'
-        if image_key not in data or not data[image_key]:
-            return
-        anno_key = prefix + '_anno'
-        mask_key = prefix + '_masks'
-        event_key = prefix + '_event_images'
-        if mask_key not in data:
-            data[mask_key] = self._default_masks(data[image_key])
-        data[image_key], data[anno_key], data[mask_key] = self.transform['joint'](
-            image=data[image_key], bbox=data[anno_key], mask=data[mask_key], new_roll=False)
-        data[event_key] = self.transform['joint'](
-            image=data[event_key], new_roll=False)
-
     def _process_full_frame_sequence(self, data, prefix, factor, keep_auxiliary,
                                      new_roll=True):
         image_key = prefix + '_images'
@@ -183,10 +169,6 @@ class STARKProcessing(BaseProcessing):
                     mask=data['redetect_search_masks'], new_roll=False)
                 data['redetect_search_event_images'] = self.transform['joint'](
                     image=data['redetect_search_event_images'], new_roll=False)
-            if 'future_images' in data:
-                self._apply_joint_full_frame_transform(data, 'future')
-            if 'history_images' in data:
-                self._apply_joint_full_frame_transform(data, 'history')
 
         for s in ['template', 'search']:
             assert self.mode == 'sequence' or len(data[s + '_images']) == 1, \
@@ -231,24 +213,13 @@ class STARKProcessing(BaseProcessing):
                     # print("Values of down-sampled attention mask are all one. Replace it with new data.")
                     return data
 
-        new_full_frame_roll = True
         if 'redetect_search_images' in data:
             factor = float(getattr(
                 self.settings, "redetect_search_area_factor",
                 self.search_area_factor['search']))
             self._process_full_frame_sequence(
                 data, 'redetect_search', factor, keep_auxiliary=True,
-                new_roll=new_full_frame_roll)
-            new_full_frame_roll = False
-        if 'future_images' in data:
-            self._process_full_frame_sequence(
-                data, 'future', self.search_area_factor['search'],
-                keep_auxiliary=False, new_roll=new_full_frame_roll)
-            new_full_frame_roll = False
-        if 'history_images' in data:
-            self._process_full_frame_sequence(
-                data, 'history', self.search_area_factor['search'],
-                keep_auxiliary=False, new_roll=new_full_frame_roll)
+                new_roll=True)
 
         data['valid'] = True
 

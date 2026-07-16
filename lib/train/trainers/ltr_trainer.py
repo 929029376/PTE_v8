@@ -3,8 +3,15 @@ import datetime
 from collections import OrderedDict
 
 from lib.train.data.wandb_logger import WandbWriter
+from lib.train.sequence_validation import (
+    EXPERT_DIAGNOSTIC_KEYS,
+    EXPERT_NAMES,
+    RECOVERY_DIAGNOSTIC_KEYS,
+    run_felt_sequence_validation,
+    sequence_validation_due,
+)
 from lib.train.trainers import BaseTrainer
-from lib.train.admin import AverageMeter, StatValue
+from lib.train.admin import AverageMeter, StatValue, multigpu
 from lib.train.admin import TensorboardWriter
 import torch
 import time
@@ -38,7 +45,11 @@ class LTRTrainer(BaseTrainer):
         self._set_default_settings()
 
         # Initialize statistics variables
-        self.stats = OrderedDict({loader.name: None for loader in self.loaders})
+        stat_names = [loader.name for loader in self.loaders]
+        if (getattr(settings, "sequence_val_enable", False)
+                and "sequence_val" not in stat_names):
+            stat_names.append("sequence_val")
+        self.stats = OrderedDict({name: None for name in stat_names})
 
         # Initialize tensorboard and wandb
         self.wandb_writer = None
@@ -46,7 +57,8 @@ class LTRTrainer(BaseTrainer):
             tensorboard_writer_dir = os.path.join(self.settings.env.tensorboard_dir, self.settings.project_path)
             if not os.path.exists(tensorboard_writer_dir):
                 os.makedirs(tensorboard_writer_dir)
-            self.tensorboard_writer = TensorboardWriter(tensorboard_writer_dir, [l.name for l in loaders])
+            self.tensorboard_writer = TensorboardWriter(
+                tensorboard_writer_dir, stat_names)
 
             if settings.use_wandb:
                 world_size = get_world_size()
@@ -103,7 +115,6 @@ class LTRTrainer(BaseTrainer):
         """Do a cycle of training or validation."""
 
         self.actor.train(loader.training)
-        torch.set_grad_enabled(loader.training)
 
         self._init_timing()
 
@@ -116,13 +127,15 @@ class LTRTrainer(BaseTrainer):
             self.data_to_gpu_time = time.time()
 
             data['epoch'] = self.epoch
+            data['training_progress'] = min(1.0, self.epoch / self.max_epochs)
             data['settings'] = self.settings
             # forward pass
-            if not self.use_amp:
-                loss, stats = self.actor(data)
-            else:
-                with autocast(dtype=self.amp_dtype):
+            with torch.set_grad_enabled(loader.training):
+                if not self.use_amp:
                     loss, stats = self.actor(data)
+                else:
+                    with autocast(dtype=self.amp_dtype):
+                        loss, stats = self.actor(data)
 
             if not torch.isfinite(loss):
                 print(f'Non-finite loss at epoch {self.epoch}, iter {i}: {loss.item()}')
@@ -182,16 +195,264 @@ class LTRTrainer(BaseTrainer):
                 _set_loader_epoch(loader, self.epoch)
                 self.cycle_dataset(loader)
                 if not loader.training:
+                    metric_names = ["IoU"]
+                    best_metric = getattr(self.settings, "best_metric", "IoU")
+                    if best_metric not in metric_names:
+                        metric_names.append(best_metric)
                     self._sync_distributed_average_meters(
                         self.stats,
                         loader.name,
                         self.device,
-                        metric_names=[getattr(self.settings, "best_metric", "IoU")],
+                        metric_names=metric_names,
                     )
+
+    def finish_epoch(self):
+        sequence_val_due = (
+            getattr(self.settings, "sequence_val_enable", False)
+            and sequence_validation_due(
+                self.epoch,
+                getattr(self.settings, "sequence_val_schedule", None))
+        )
+        if sequence_val_due:
+            save_recovery = (
+                self._checkpoint_dir
+                and self._should_save_latest_checkpoint(
+                    self.epoch,
+                    getattr(self, "max_epochs", self.epoch),
+                    self.settings,
+                )
+            )
+            if save_recovery and self.settings.local_rank in [-1, 0]:
+                self.save_checkpoint("latest")
+            if save_recovery and torch.distributed.is_available() \
+                    and torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            self._run_sequence_validation()
 
         self._stats_new_epoch()
         if self.settings.local_rank in [-1, 0]:
             self._write_tensorboard()
+
+    def _run_sequence_validation(self):
+        network = (
+            self.actor.net.module
+            if multigpu.is_multi_gpu(self.actor.net)
+            else self.actor.net
+        )
+        distributed = (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        rank = torch.distributed.get_rank() if distributed else 0
+        world_size = torch.distributed.get_world_size() if distributed else 1
+        local_metrics = run_felt_sequence_validation(
+            network,
+            self.actor.cfg,
+            rank=rank,
+            world_size=world_size,
+            felt_val_root=getattr(self.settings.env, "felt_val_dir", None),
+        )
+        reduced = torch.tensor(
+            [
+                float(local_metrics["FELT_SR_PROXY_SUM"]),
+                float(local_metrics["FELT_ABSENT_BAL_ACC_SUM"]),
+                float(local_metrics["FELT_REAPPEARANCE_PROXY_SUM"]),
+                float(local_metrics["SEQUENCE_COUNT"]),
+                float(local_metrics["REAPPEARANCE_SEQUENCE_COUNT"]),
+            ],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        if world_size > 1:
+            torch.distributed.all_reduce(
+                reduced, op=torch.distributed.ReduceOp.SUM)
+        sequence_count = int(reduced[3].item())
+        if sequence_count <= 0:
+            raise RuntimeError("Sequence validation did not evaluate any FELT sequences")
+        score = float(reduced[0].item()) / sequence_count
+        absent_score = float(reduced[1].item()) / sequence_count
+        reappearance_count = int(reduced[4].item())
+        reappearance_score = (
+            float(reduced[2].item()) / reappearance_count
+            if reappearance_count > 0 else None
+        )
+        diagnostic_values = None
+        if any(key in local_metrics for key in RECOVERY_DIAGNOSTIC_KEYS):
+            diagnostic_tensor = torch.tensor(
+                [float(local_metrics.get(key, 0.0))
+                 for key in RECOVERY_DIAGNOSTIC_KEYS],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            if world_size > 1:
+                torch.distributed.all_reduce(
+                    diagnostic_tensor, op=torch.distributed.ReduceOp.SUM)
+            diagnostic_sums = dict(zip(
+                RECOVERY_DIAGNOSTIC_KEYS,
+                diagnostic_tensor.tolist(),
+            ))
+            ratio_specs = {
+                "EVENT_RECALL_AT_1": (
+                    "EVENT_RECALL_AT_1_HITS", "EVENT_REAPPEARANCE_COUNT"),
+                "EVENT_RECALL_AT_3": (
+                    "EVENT_RECALL_AT_3_HITS", "EVENT_REAPPEARANCE_COUNT"),
+                "EVENT_RECALL_AT_5": (
+                    "EVENT_RECALL_AT_5_HITS", "EVENT_REAPPEARANCE_COUNT"),
+                "RGB_FALSE_ACCEPT_RATE": (
+                    "RGB_FALSE_ACCEPTS", "RGB_ABSENT_CANDIDATES"),
+                "RECOVERY_LATENCY": (
+                    "RECOVERY_LATENCY_SUM", "RECOVERY_SUCCESS_COUNT"),
+                "RECOVERY_SUCCESS_RATE": (
+                    "RECOVERY_SUCCESS_COUNT", "RECOVERY_EVENT_COUNT"),
+                "REAPPEAR_IOU_AT_1": (
+                    "REAPPEAR_IOU_AT_1_SUM", "REAPPEAR_IOU_AT_1_COUNT"),
+                "REAPPEAR_IOU_AT_3": (
+                    "REAPPEAR_IOU_AT_3_SUM", "REAPPEAR_IOU_AT_3_COUNT"),
+                "REAPPEAR_IOU_AT_5": (
+                    "REAPPEAR_IOU_AT_5_SUM", "REAPPEAR_IOU_AT_5_COUNT"),
+                "VISIBLE_RETENTION_IOU": (
+                    "VISIBLE_RETENTION_IOU_SUM", "VISIBLE_RETENTION_COUNT"),
+                "TRACK_FPS": ("TRACK_FRAME_COUNT", "TRACK_TIME_SUM"),
+                "RECOVERY_FPS": (
+                    "RECOVERY_FRAME_COUNT", "RECOVERY_TIME_SUM"),
+            }
+            diagnostic_values = {
+                name: diagnostic_sums[numerator] / diagnostic_sums[denominator]
+                for name, (numerator, denominator) in ratio_specs.items()
+                if diagnostic_sums[denominator] > 0
+            }
+            visibility_aliases = {
+                "ExpertVal/visibility_foc_ov_rgb_false_accept_count": (
+                    diagnostic_sums["RGB_FALSE_ACCEPTS"]),
+            }
+            if "REAPPEAR_IOU_AT_1" in diagnostic_values:
+                visibility_aliases[
+                    "ExpertVal/visibility_foc_ov_reappearance_iou"
+                ] = diagnostic_values["REAPPEAR_IOU_AT_1"]
+            if "RECOVERY_SUCCESS_RATE" in diagnostic_values:
+                visibility_aliases[
+                    "ExpertVal/visibility_foc_ov_reappearance_success"
+                ] = diagnostic_values["RECOVERY_SUCCESS_RATE"]
+            diagnostic_values.update(visibility_aliases)
+        expert_values = None
+        if any(key in local_metrics for key in EXPERT_DIAGNOSTIC_KEYS):
+            expert_tensor = torch.tensor(
+                [float(local_metrics.get(key, 0.0))
+                 for key in EXPERT_DIAGNOSTIC_KEYS],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            if world_size > 1:
+                torch.distributed.all_reduce(
+                    expert_tensor, op=torch.distributed.ReduceOp.SUM)
+            expert_sums = dict(zip(
+                EXPERT_DIAGNOSTIC_KEYS, expert_tensor.tolist()))
+            expert_values = {}
+            for expert_id, expert_name in enumerate(EXPERT_NAMES):
+                prefix = f"EXPERT_{expert_id}"
+                count = expert_sums[f"{prefix}_COUNT"]
+                metric_prefix = f"ExpertVal/{expert_name}"
+                expert_values[f"{metric_prefix}_count"] = count
+                if count <= 0:
+                    continue
+                specialist_iou = expert_sums[f"{prefix}_IOU_SUM"] / count
+                generalist_iou = (
+                    expert_sums[f"{prefix}_GENERALIST_IOU_SUM"] / count)
+                expert_values.update({
+                    f"{metric_prefix}_iou": specialist_iou,
+                    f"{metric_prefix}_sr": (
+                        expert_sums[f"{prefix}_SUCCESS_HITS"] / count),
+                    f"{metric_prefix}_generalist_iou": generalist_iou,
+                    f"{metric_prefix}_generalist_sr": (
+                        expert_sums[
+                            f"{prefix}_GENERALIST_SUCCESS_HITS"] / count),
+                    f"{metric_prefix}_delta_iou": (
+                        specialist_iou - generalist_iou),
+                    f"{metric_prefix}_ensemble_iou": (
+                        expert_sums[f"{prefix}_ENSEMBLE_IOU_SUM"] / count),
+                    f"{metric_prefix}_ensemble_sr": (
+                        expert_sums[
+                            f"{prefix}_ENSEMBLE_SUCCESS_HITS"] / count),
+                })
+
+        if self.stats.get("sequence_val") is None:
+            self.stats["sequence_val"] = OrderedDict()
+        for metric_name in ("FELT_SR_PROXY", "FELT_ABSENT_BAL_ACC"):
+            if metric_name not in self.stats["sequence_val"]:
+                self.stats["sequence_val"][metric_name] = AverageMeter()
+        self.stats["sequence_val"]["FELT_SR_PROXY"].update(score)
+        self.stats["sequence_val"]["FELT_ABSENT_BAL_ACC"].update(absent_score)
+        if reappearance_score is not None:
+            if "FELT_REAPPEARANCE_PROXY" not in self.stats["sequence_val"]:
+                self.stats["sequence_val"][
+                    "FELT_REAPPEARANCE_PROXY"] = AverageMeter()
+            self.stats["sequence_val"][
+                "FELT_REAPPEARANCE_PROXY"].update(reappearance_score)
+        if diagnostic_values is not None:
+            for metric_name, metric_value in diagnostic_values.items():
+                if metric_name not in self.stats["sequence_val"]:
+                    self.stats["sequence_val"][metric_name] = AverageMeter()
+                self.stats["sequence_val"][metric_name].update(metric_value)
+        if expert_values is not None:
+            for metric_name, metric_value in expert_values.items():
+                if metric_name not in self.stats["sequence_val"]:
+                    self.stats["sequence_val"][metric_name] = AverageMeter()
+                self.stats["sequence_val"][metric_name].update(metric_value)
+        if rank == 0:
+            print(
+                "SequenceVal epoch {}: FELT_SR_PROXY={:.6f}, "
+                "FELT_ABSENT_BAL_ACC={:.6f}, "
+                "FELT_REAPPEARANCE_PROXY={}, sequences={}".format(
+                    self.epoch,
+                    score,
+                    absent_score,
+                    (f"{reappearance_score:.6f}"
+                     if reappearance_score is not None else "n/a"),
+                    sequence_count,
+                ))
+            if diagnostic_values:
+                print(
+                    "SequenceVal recovery: EventR@1/3/5={}/{}/{}, "
+                    "RGB_FAR={}, latency={}, success={}, "
+                    "IoU@1/3/5={}/{}/{}, visible_retention={}, "
+                    "FPS(track/recovery)={}/{}".format(
+                        *[
+                            (f"{diagnostic_values[name]:.6f}"
+                             if name in diagnostic_values else "n/a")
+                            for name in (
+                                "EVENT_RECALL_AT_1",
+                                "EVENT_RECALL_AT_3",
+                                "EVENT_RECALL_AT_5",
+                                "RGB_FALSE_ACCEPT_RATE",
+                                "RECOVERY_LATENCY",
+                                "RECOVERY_SUCCESS_RATE",
+                                "REAPPEAR_IOU_AT_1",
+                                "REAPPEAR_IOU_AT_3",
+                                "REAPPEAR_IOU_AT_5",
+                                "VISIBLE_RETENTION_IOU",
+                                "TRACK_FPS",
+                                "RECOVERY_FPS",
+                            )
+                        ]
+                    ))
+            if expert_values:
+                for expert_name in EXPERT_NAMES:
+                    prefix = f"ExpertVal/{expert_name}"
+                    if f"{prefix}_iou" not in expert_values:
+                        continue
+                    print(
+                        "SequenceVal expert {}: count={:.0f}, IoU={:.6f}, "
+                        "generalist={:.6f}, delta={:.6f}, ensemble={:.6f}, "
+                        "SR={:.6f}".format(
+                            expert_name,
+                            expert_values[f"{prefix}_count"],
+                            expert_values[f"{prefix}_iou"],
+                            expert_values[f"{prefix}_generalist_iou"],
+                            expert_values[f"{prefix}_delta_iou"],
+                            expert_values[f"{prefix}_ensemble_iou"],
+                            expert_values[f"{prefix}_sr"],
+                        ))
+        return score
 
     def _init_timing(self):
         self.num_frames = 0

@@ -1,11 +1,15 @@
 import os
+import math
 from pathlib import Path
+from collections.abc import Mapping
 # loss function related
 from lib.utils.box_ops import giou_loss
 from torch.nn.functional import l1_loss
 from torch.nn import BCEWithLogitsLoss
 # train pipeline related
 from lib.train.trainers import LTRTrainer
+from lib.train.trainers.base_trainer import load_srbt_checkpoint_file
+from lib.train.sequence_validation import EXPERT_NAMES
 # distributed training related
 from torch.nn.parallel import DistributedDataParallel as DDP
 # some more advanced functions
@@ -24,6 +28,36 @@ def _training_log_path(save_dir, script_name, config_name):
     safe_config_name = str(config_name).replace("\\", "__").replace("/", "__")
     return Path(save_dir) / "logs" / (
         f"{script_name}-{safe_config_name}.log")
+
+
+def _load_refine_gate_reference(cfg):
+    checkpoint_path = str(getattr(
+        cfg.MODEL, "INIT_CHECKPOINT", "") or "")
+    if not checkpoint_path:
+        raise RuntimeError(
+            "Stage 2 refine requires a Stage 1 INIT_CHECKPOINT")
+    state = load_srbt_checkpoint_file(checkpoint_path)
+    reference = state.get("specialist_gate_reference")
+    specialists = (
+        reference.get("specialists")
+        if isinstance(reference, Mapping) else None)
+    if (not isinstance(specialists, Mapping)
+            or any(name not in specialists for name in EXPERT_NAMES[1:])
+            or "generalist_iou" not in reference):
+        raise RuntimeError(
+            "Stage 1 specialist gate reference is missing or incomplete")
+    values = [reference["generalist_iou"]] + [
+        specialists[name] for name in EXPERT_NAMES[1:]
+    ]
+    if not all(math.isfinite(float(value)) for value in values):
+        raise RuntimeError(
+            "Stage 1 specialist gate reference must contain finite metrics")
+    return {
+        "generalist_iou": float(reference["generalist_iou"]),
+        "specialists": {
+            name: float(specialists[name]) for name in EXPERT_NAMES[1:]
+        },
+    }
 
 
 def run(settings):
@@ -78,12 +112,41 @@ def run(settings):
     settings.val_start_epoch = getattr(cfg.TRAIN, "VAL_START_EPOCH", 1)
     settings.val_schedule = getattr(cfg.TRAIN, "VAL_SCHEDULE", None)
     settings.val_last_epochs = getattr(cfg.TRAIN, "VAL_LAST_EPOCHS", 0)
+    settings.sequence_val_enable = getattr(
+        cfg.TRAIN, "SEQUENCE_VAL_ENABLE", False)
+    settings.sequence_val_schedule = getattr(
+        cfg.TRAIN, "SEQUENCE_VAL_SCHEDULE", None)
     settings.save_latest_each_epoch = getattr(cfg.TRAIN, "SAVE_LATEST_EACH_EPOCH", False)
     settings.save_final_checkpoint = getattr(cfg.TRAIN, "SAVE_FINAL_CHECKPOINT", True)
     settings.save_best = getattr(cfg.TRAIN, "SAVE_BEST", False)
     settings.best_metric = getattr(cfg.TRAIN, "BEST_METRIC", "IoU")
     settings.best_metric_mode = getattr(cfg.TRAIN, "BEST_METRIC_MODE", "max")
-    settings.best_loader = "val"
+    settings.best_loader = getattr(cfg.TRAIN, "BEST_LOADER", "val")
+    settings.expert_phase = getattr(
+        cfg.TRAIN, "EXPERT_PHASE", "specialize")
+    settings.specialist_gate_enable = getattr(
+        cfg.TRAIN, "SPECIALIST_GATE_ENABLE", False)
+    settings.specialist_min_count = getattr(
+        cfg.TRAIN, "SPECIALIST_MIN_COUNT", 100)
+    settings.specialist_min_delta = getattr(
+        cfg.TRAIN, "SPECIALIST_MIN_DELTA", 0.02)
+    settings.generalist_reference_iou = getattr(
+        cfg.TRAIN, "GENERALIST_REFERENCE_IOU", -1.0)
+    settings.generalist_max_drop = getattr(
+        cfg.TRAIN, "GENERALIST_MAX_DROP", 0.005)
+    settings.visibility_reference_reappear_iou = getattr(
+        cfg.TRAIN, "VISIBILITY_REFERENCE_REAPPEAR_IOU", -1.0)
+    settings.visibility_reference_reappear_success = getattr(
+        cfg.TRAIN, "VISIBILITY_REFERENCE_REAPPEAR_SUCCESS", -1.0)
+    settings.visibility_reference_rgb_false_accept_rate = getattr(
+        cfg.TRAIN, "VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE", -1.0)
+    if str(settings.expert_phase).lower() == "refine":
+        refine_schedule = getattr(
+            cfg.TRAIN, "REFINE_SEQUENCE_VAL_SCHEDULE", [[1, -1, 1]])
+        settings.val_schedule = refine_schedule
+        settings.sequence_val_schedule = refine_schedule
+        settings.specialist_gate_reference = (
+            _load_refine_gate_reference(cfg))
 
     # Loss functions and Actors
     if settings.script_name == "pet_track":
@@ -108,7 +171,30 @@ def run(settings):
     use_amp = getattr(cfg.TRAIN, "AMP", False)  # False
     settings.amp_dtype = getattr(cfg.TRAIN, "AMP_DTYPE", "float16")
 
-    trainer = LTRTrainer(actor, [loader_train, loader_val], optimizer, settings, lr_scheduler, use_amp=use_amp)
+    trainer = LTRTrainer(
+        actor,
+        _select_epoch_loaders(loader_train, loader_val, settings),
+        optimizer,
+        settings,
+        lr_scheduler,
+        use_amp=use_amp,
+    )
 
     load_latest = getattr(cfg.TRAIN, "LOAD_LATEST", True)
-    trainer.train(cfg.TRAIN.EPOCH, load_latest=load_latest, fail_safe=True)
+    expert_phase = str(getattr(
+        cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
+    if (expert_phase == "refine" and not load_latest
+            and settings.local_rank in [-1, 0]):
+        trainer.save_checkpoint("pre_refine")
+    max_epochs = (
+        int(getattr(cfg.TRAIN, "REFINE_MAX_EPOCH", 12))
+        if expert_phase == "refine" else int(cfg.TRAIN.EPOCH)
+    )
+    trainer.train(max_epochs, load_latest=load_latest, fail_safe=True)
+
+
+def _select_epoch_loaders(loader_train, loader_val, settings):
+    if (getattr(settings, "sequence_val_enable", False)
+            and str(getattr(settings, "best_loader", "val")) == "sequence_val"):
+        return [loader_train]
+    return [loader_train, loader_val]

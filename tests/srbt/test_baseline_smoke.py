@@ -58,10 +58,10 @@ def test_real_amttrack_checkpoint_preserves_baseline_eval_path():
     assert report["loaded_count"] == 288
     assert len(report["loaded_keys"]) == 288
     assert all(key.startswith(INHERITED_PREFIXES) for key in report["loaded_keys"])
-    assert not hasattr(model, "expert_enabled")
-    assert not hasattr(model, "pet_enabled")
+    assert model.expert_enabled is False
     assert not hasattr(model, "expert_router")
-    assert not hasattr(model, "expert_fusion")
+    assert model.expert_fusion is None
+    assert not hasattr(model, "pet_enabled")
     assert not hasattr(model, "hetero_tail")
     assert not hasattr(model, "event_belief")
     assert not hasattr(model, "absence_predictor")

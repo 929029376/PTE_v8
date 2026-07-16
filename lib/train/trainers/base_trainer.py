@@ -1,10 +1,16 @@
 import os
 import glob
+import math
 import pickle
 import torch
 import traceback
 from collections.abc import Mapping
 from lib.train.admin import multigpu
+from lib.train.sequence_validation import (
+    EXPERT_NAMES,
+    refine_checkpoint_is_accepted,
+    specialist_passes,
+)
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -65,9 +71,8 @@ def validate_srbt_checkpoint_schema(state):
     if state["amp_scaler"] is not None \
             and not isinstance(state["amp_scaler"], dict):
         raise RuntimeError("SRBT checkpoint amp_scaler must be a state dict or None")
-    if any(key.startswith(("expert_router.", "expert_fusion.", "absence_predictor.",
-                           "memory_policy.")) for key in net):
-        raise RuntimeError("Legacy PET route checkpoint is not a valid SRBT resume")
+    if any(key.startswith(("absence_predictor.", "memory_policy.")) for key in net):
+        raise RuntimeError("Unversioned legacy PET checkpoint is not a valid resume")
     return True
 
 
@@ -84,13 +89,17 @@ def load_srbt_checkpoint_file(checkpoint_path):
 
 
 def _config_summary(settings):
+    summary = {
+        "TRAIN.BEST_METRIC": str(getattr(settings, "best_metric", "IoU")),
+    }
     cfg = getattr(settings, "cfg", None)
     if cfg is None:
-        return {}
-    return {
+        return summary
+    summary.update({
         "MODEL.SRBT.ENABLE": bool(getattr(cfg.MODEL.SRBT, "ENABLE", False)),
         "DATA.SRBT.ENABLE": bool(getattr(cfg.DATA.SRBT, "ENABLE", False)),
-    }
+    })
+    return summary
 
 
 def _scaler_state(trainer):
@@ -130,6 +139,8 @@ class BaseTrainer:
 
         self.actor.to(self.device)
         self.settings = settings
+        self.specialist_gate_reference = getattr(
+            settings, "specialist_gate_reference", None)
 
     def update_settings(self, settings=None):
         """Updates the trainer settings. Must be called to update internal settings."""
@@ -179,6 +190,8 @@ class BaseTrainer:
                             self.lr_scheduler.step()
                         else:
                             self.lr_scheduler.step(epoch - 1)
+
+                    self.finish_epoch()
 
                     if self._checkpoint_dir and self.settings.local_rank in [-1, 0]:
                         self._maybe_save_best_checkpoint()
@@ -331,6 +344,143 @@ class BaseTrainer:
             return True
         return score < best_score if mode == "min" else score > best_score
 
+    def _specialist_gate_passes(self, loader_name):
+        min_count = int(getattr(
+            self.settings, "specialist_min_count", 100))
+        min_delta = float(getattr(
+            self.settings, "specialist_min_delta", 0.02))
+        max_drop = float(getattr(
+            self.settings, "generalist_max_drop", 0.005))
+        phase = str(getattr(
+            self.settings, "expert_phase", "specialize")).lower()
+        stage1_reference = getattr(
+            self, "specialist_gate_reference", None)
+        if phase == "refine":
+            if not isinstance(stage1_reference, Mapping):
+                return False
+            reference = float(stage1_reference.get(
+                "generalist_iou", -1.0))
+            visibility_reference = stage1_reference.get("visibility")
+        else:
+            reference = float(getattr(
+                self.settings, "generalist_reference_iou", -1.0))
+            visibility_reference = {
+                "reappearance_iou": float(getattr(
+                    self.settings,
+                    "visibility_reference_reappear_iou", -1.0)),
+                "reappearance_success": float(getattr(
+                    self.settings,
+                    "visibility_reference_reappear_success", -1.0)),
+                "rgb_false_accept_rate": float(getattr(
+                    self.settings,
+                    "visibility_reference_rgb_false_accept_rate", -1.0)),
+            }
+        generalist_count = self._latest_epoch_metric(
+            self.stats, loader_name, "ExpertVal/generalist_count")
+        generalist_iou = self._latest_epoch_metric(
+            self.stats, loader_name, "ExpertVal/generalist_iou")
+        if (reference < 0 or generalist_count is None or generalist_iou is None
+                or generalist_count < min_count
+                or generalist_iou < reference - max_drop):
+            return False
+
+        specialist_scores = {}
+        for expert_name in EXPERT_NAMES[1:]:
+            prefix = f"ExpertVal/{expert_name}"
+            count = self._latest_epoch_metric(
+                self.stats, loader_name, f"{prefix}_count")
+            specialist = self._latest_epoch_metric(
+                self.stats, loader_name, f"{prefix}_iou")
+            comparator = self._latest_epoch_metric(
+                self.stats, loader_name, f"{prefix}_generalist_iou")
+            if (count is None or specialist is None or comparator is None
+                    or not specialist_passes(
+                        count, specialist, comparator,
+                        min_count=min_count, min_delta=min_delta)):
+                return False
+            specialist_scores[expert_name] = specialist
+
+        if not isinstance(visibility_reference, Mapping):
+            return False
+        visibility_current = {
+            "reappearance_iou": self._latest_epoch_metric(
+                self.stats, loader_name,
+                "ExpertVal/visibility_foc_ov_reappearance_iou"),
+            "reappearance_success": self._latest_epoch_metric(
+                self.stats, loader_name,
+                "ExpertVal/visibility_foc_ov_reappearance_success"),
+            "rgb_false_accept_rate": self._latest_epoch_metric(
+                self.stats, loader_name, "RGB_FALSE_ACCEPT_RATE"),
+        }
+        visibility_pairs = {
+            name: (visibility_current[name], visibility_reference.get(name))
+            for name in visibility_current
+        }
+        if any(
+                current is None or baseline is None
+                or not math.isfinite(float(current))
+                or not math.isfinite(float(baseline))
+                or float(baseline) < 0.0
+                for current, baseline in visibility_pairs.values()):
+            return False
+        if (
+                visibility_current["reappearance_iou"]
+                < (float(visibility_reference["reappearance_iou"])
+                   + min_delta - 1e-12)
+                or visibility_current["reappearance_success"]
+                < float(visibility_reference["reappearance_success"])
+                or visibility_current["rgb_false_accept_rate"]
+                > float(visibility_reference["rgb_false_accept_rate"])):
+            return False
+
+        if phase != "refine":
+            return True
+        stage1_scores = stage1_reference.get("specialists")
+        if not isinstance(stage1_scores, Mapping):
+            return False
+        regressions = [
+            expert_name not in stage1_scores
+            or specialist_scores[expert_name] < float(stage1_scores[expert_name])
+            for expert_name in EXPERT_NAMES[1:]
+        ]
+        return refine_checkpoint_is_accepted(
+            reference,
+            generalist_iou,
+            regressions,
+            max_generalist_drop=max_drop,
+        )
+
+    def _current_specialist_reference(self, loader_name):
+        generalist_iou = self._latest_epoch_metric(
+            self.stats, loader_name, "ExpertVal/generalist_iou")
+        specialists = {
+            expert_name: self._latest_epoch_metric(
+                self.stats,
+                loader_name,
+                f"ExpertVal/{expert_name}_iou",
+            )
+            for expert_name in EXPERT_NAMES[1:]
+        }
+        visibility = {
+            "reappearance_iou": self._latest_epoch_metric(
+                self.stats, loader_name,
+                "ExpertVal/visibility_foc_ov_reappearance_iou"),
+            "reappearance_success": self._latest_epoch_metric(
+                self.stats, loader_name,
+                "ExpertVal/visibility_foc_ov_reappearance_success"),
+            "rgb_false_accept_rate": self._latest_epoch_metric(
+                self.stats, loader_name, "RGB_FALSE_ACCEPT_RATE"),
+        }
+        if (generalist_iou is None
+                or any(value is None for value in specialists.values())
+                or any(value is None for value in visibility.values())):
+            return None
+        return {
+            "generalist_iou": generalist_iou,
+            "specialists": specialists,
+            "visibility": visibility,
+        }
+
     def _maybe_save_best_checkpoint(self):
         if not getattr(self.settings, "save_best", False):
             return
@@ -341,13 +491,30 @@ class BaseTrainer:
         score = self._latest_epoch_metric(self.stats, loader_name, metric_name)
         if score is None or not self._is_better_metric(score, getattr(self, "best_val_score", None), mode):
             return
+        gate_enabled = bool(getattr(
+            self.settings, "specialist_gate_enable", False))
+        if gate_enabled and not self._specialist_gate_passes(loader_name):
+            return
 
         self.best_val_score = score
         self.best_val_epoch = self.epoch
-        self.save_checkpoint("best")
+        if gate_enabled:
+            phase = str(getattr(
+                self.settings, "expert_phase", "specialize")).lower()
+            if phase != "refine":
+                self.specialist_gate_reference = (
+                    self._current_specialist_reference(loader_name))
+            checkpoint_name = (
+                "best_stage2" if phase == "refine" else "best_stage1")
+        else:
+            checkpoint_name = "best"
+        self.save_checkpoint(checkpoint_name)
 
     def train_epoch(self):
         raise NotImplementedError
+
+    def finish_epoch(self):
+        pass
 
     def save_checkpoint(self, checkpoint_name=None):
         """Saves a checkpoint of the network and other variables."""
@@ -369,6 +536,8 @@ class BaseTrainer:
             'best_val_epoch': getattr(self, 'best_val_epoch', 0),
             'schema_version': SRBT_SCHEMA_VERSION,
             'config_summary': _config_summary(self.settings),
+            'specialist_gate_reference': getattr(
+                self, 'specialist_gate_reference', None),
         }
         validate_srbt_checkpoint_schema(state)
 
@@ -460,9 +629,23 @@ class BaseTrainer:
         if scaler is not None:
             scaler.load_state_dict(scaler_state)
         self.epoch = checkpoint_dict['epoch']
-        self.best_val_score = checkpoint_dict['best_val_score']
-        self.best_val_epoch = checkpoint_dict['best_val_epoch']
         self.config_summary = checkpoint_dict['config_summary']
+        self.specialist_gate_reference = checkpoint_dict.get(
+            'specialist_gate_reference',
+            getattr(self, 'specialist_gate_reference', None),
+        )
+        saved_best_metric = self.config_summary.get("TRAIN.BEST_METRIC", "IoU")
+        current_best_metric = str(getattr(self.settings, "best_metric", "IoU"))
+        if saved_best_metric == current_best_metric:
+            self.best_val_score = checkpoint_dict['best_val_score']
+            self.best_val_epoch = checkpoint_dict['best_val_epoch']
+        else:
+            print(
+                "Best checkpoint metric changed from {} to {}; "
+                "resetting only the saved best score.".format(
+                    saved_best_metric, current_best_metric))
+            self.best_val_score = None
+            self.best_val_epoch = 0
         for loader in self.loaders:
             if isinstance(loader.sampler, DistributedSampler):
                 loader.sampler.set_epoch(self.epoch)

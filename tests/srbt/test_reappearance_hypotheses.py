@@ -207,6 +207,73 @@ def test_selected_hypothesis_keeps_all_five_prediction_paths_trainable():
         assert tensor.grad.abs().sum() > 0
 
 
+def test_formal_redetection_uses_shared_rgb_event_fusion(monkeypatch):
+    calls = {}
+
+    class FusionProbe:
+        redetect_expert = object()
+
+        def redetect_from_observations(
+                self, zi, ze, xi, xe, dynamic_zi=None, dynamic_ze=None,
+                prior_H=None,
+                use_template_conditioning=True):
+            calls.update(
+                zi=zi,
+                ze=ze,
+                xi=xi,
+                xe=xe,
+                dynamic_zi=dynamic_zi,
+                dynamic_ze=dynamic_ze,
+                prior_H=prior_H,
+                use_template_conditioning=use_template_conditioning,
+            )
+            return {"hypotheses": {}}
+
+    tracker = object.__new__(PETTrack)
+    tracker.network = FusionProbe()
+    tracker.cfg = SimpleNamespace(MODEL=SimpleNamespace(
+        REDETECT=SimpleNamespace(USE_TEMPLATE_CONDITIONING=True)))
+    clean_rgb = torch.full((1, 3, 4, 4), 1.0)
+    clean_event = torch.full((1, 3, 4, 4), 2.0)
+    tracker.dynamic_zi = torch.full((1, 8, 6), 3.0)
+    tracker.dynamic_ze = torch.full((1, 8, 6), 4.0)
+    tracker.thor_wrapper = SimpleNamespace(
+        get_clean_template=lambda: (clean_rgb, clean_event))
+    tracker.redetect_factor = 8.0
+    tracker.params = SimpleNamespace(search_size=8)
+    tracker.preprocessor = SimpleNamespace(process=lambda patch, _mask: SimpleNamespace(
+        tensors=patch.permute(2, 0, 1).unsqueeze(0)))
+
+    def sample_global_crop(**_kwargs):
+        return (
+            torch.full((8, 8, 3), 11.0),
+            torch.full((8, 8, 3), 22.0),
+            0.5,
+            torch.zeros(8, 8),
+        )
+
+    monkeypatch.setattr(
+        "lib.test.tracker.pet_track.sample_target", sample_global_crop)
+
+    output = PETTrack._run_redetection(
+        tracker,
+        torch.zeros(8, 8, 3),
+        torch.zeros(8, 8, 3),
+        8,
+        8,
+    )
+
+    assert torch.equal(calls["zi"], clean_rgb)
+    assert torch.equal(calls["ze"], clean_event)
+    assert torch.equal(calls["dynamic_zi"], tracker.dynamic_zi)
+    assert torch.equal(calls["dynamic_ze"], tracker.dynamic_ze)
+    assert torch.all(calls["xi"] == 11.0)
+    assert torch.all(calls["xe"] == 22.0)
+    assert calls["prior_H"] is None
+    assert calls["use_template_conditioning"] is True
+    assert output["_resize_factor"] == pytest.approx(0.5)
+
+
 def test_tracker_matches_and_updates_weight_velocity_and_identity():
     tracker = HypothesisTracker(k_max=5)
     previous = _state(
@@ -317,6 +384,25 @@ def test_tracker_keeps_age_32_and_prunes_only_after_it_is_exceeded():
     assert updated["weights"][0].item() == pytest.approx(0.68)
 
 
+def test_tracker_keeps_extrapolated_hypothesis_size_strictly_positive():
+    tracker = HypothesisTracker(k_max=5)
+    previous = _state(
+        boxes=[[0.5, 0.5, 0.04, 0.03]],
+        weights=[0.8],
+        identity=[[1.0, 0.0]],
+        velocity=[[0.0, 0.0, -0.08, -0.06]],
+    )
+    empty = _state(boxes=[], weights=[], identity=[])
+    empty["identity"] = torch.empty(0, 2)
+    empty["boxes"] = torch.empty(0, 4)
+    empty["velocity"] = torch.empty(0, 4)
+
+    updated = tracker.update(previous, empty)
+
+    assert torch.isfinite(updated["boxes"]).all()
+    assert (updated["boxes"][:, 2:] > 0.0).all()
+
+
 def test_config_builder_applies_every_lifecycle_threshold():
     hypotheses = SimpleNamespace(
         K_MAX=4,
@@ -394,6 +480,7 @@ def test_inference_tracker_keeps_cross_frame_hypothesis_state_and_maps_best_box(
 
 def test_failed_redetect_cycle_discards_stale_hypotheses(monkeypatch):
     tracker = object.__new__(PETTrack)
+    tracker.hypothesis_tracker = HypothesisTracker(k_max=5)
     tracker.frame_id = 0
     tracker.state = [1.0, 1.0, 2.0, 2.0]
     tracker.params = SimpleNamespace(
@@ -418,14 +505,18 @@ def test_failed_redetect_cycle_discards_stale_hypotheses(monkeypatch):
     tracker._last_score_peak = 0.1
     tracker._last_redetect_conf = 0.8
     tracker._pending_redetect_box = [2.0, 2.0, 2.0, 2.0]
-    tracker._redetect_hypotheses = {
-        "active_count": 1,
-        "posterior": torch.ones(1),
-    }
-    tracker._srbt_last_action = Action.REDETECT
+    tracker._redetect_hypotheses = tracker.hypothesis_tracker.update(
+        None,
+        _state(
+            boxes=[[0.25, 0.25, 0.25, 0.25]],
+            weights=[1.0],
+            identity=[[1.0, 0.0]],
+        ),
+    )
+    tracker._srbt_last_action = Action.ABSENT
     tracker.debug = False
     tracker._step_srbt_controller = lambda *_args, **_kwargs: ControllerAction(
-        action=Action.HOLD,
+        action=Action.ABSENT,
         allow_recent_write=False,
         allow_long_write=False,
         output_absent=True,
@@ -440,15 +531,22 @@ def test_failed_redetect_cycle_discards_stale_hypotheses(monkeypatch):
         "srbt_best_hypothesis": None,
         "memory_frame_open": False,
     }
-    monkeypatch.setattr(
-        "lib.test.tracker.pet_track.sample_target",
-        lambda **_kwargs: (
+    tracker._run_redetection = lambda *_args, **_kwargs: None
+    tracker._run_event_recovery = lambda *_args, **_kwargs: None
+    tracker.full_rgb_fallback_interval = 1
+    sampled_boxes = []
+
+    def sample_target_for_test(**kwargs):
+        sampled_boxes.append(kwargs["target_bb"])
+        return (
             torch.zeros(8, 8, 3),
             torch.zeros(8, 8, 3),
             1.0,
             torch.zeros(8, 8),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(
+        "lib.test.tracker.pet_track.sample_target", sample_target_for_test)
 
     output = PETTrack.track(
         tracker,
@@ -458,6 +556,8 @@ def test_failed_redetect_cycle_discards_stale_hypotheses(monkeypatch):
 
     assert output["absent"] is True
     assert "c3_debug" not in output
+    assert sampled_boxes[0] == [2.0, 2.0, 2.0, 2.0]
+    assert tracker.state == [1.0, 1.0, 2.0, 2.0]
     assert tracker._pending_redetect_box is None
     assert tracker._redetect_hypotheses is None
     assert tracker._last_redetect_conf == 0.0

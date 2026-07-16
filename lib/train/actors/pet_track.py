@@ -1,24 +1,19 @@
-"""PET-Track actor with one baseline-localization plus SRBT objective stack."""
-from collections.abc import Mapping
-
+"""PET-Track actor with local experts, presence gating, and recovery."""
 import torch
+import torch.nn.functional as F
 
 from .pet_track_base import PETTrackBaseActor
-from lib.models.layers.pet_losses import PetTrackLoss
-from lib.models.layers.srbt_belief import REAPPEARING, VISIBLE
+from lib.utils.box_ops import (
+    box_cxcywh_to_xyxy,
+    box_iou,
+    box_xywh_to_xyxy,
+    generalized_box_iou,
+)
 from lib.utils.heapmap_utils import generate_heatmap
 
 
-REQUIRED_SRBT_PREDICTIONS = frozenset({
-    "existence_logits",
-    "hazard_logits",
-    "field_logits",
-    "candidate_logits",
-    "hypothesis_boxes",
-    "hypothesis_scores",
-    "identity_embeddings",
-    "template_identity",
-})
+REQUIRED_PRESENCE_PREDICTIONS = frozenset({"logits", "score"})
+VISIBILITY_EXPERT_ID = 3
 
 
 class PETTrackActor(PETTrackBaseActor):
@@ -27,35 +22,39 @@ class PETTrackActor(PETTrackBaseActor):
     def __init__(self, net, objective, loss_weight, settings, cfg=None):
         super().__init__(net, objective, loss_weight, settings, cfg)
         loss_cfg = getattr(cfg.TRAIN, "SRBT_LOSS", None)
-        self.pet_loss = PetTrackLoss(
-            existence_weight=float(getattr(loss_cfg, "EXISTENCE_WEIGHT", 1.0)),
-            survival_weight=float(getattr(loss_cfg, "SURVIVAL_WEIGHT", 1.0)),
-            field_weight=float(getattr(loss_cfg, "FIELD_WEIGHT", 1.0)),
-            hypothesis_weight=float(getattr(loss_cfg, "HYPOTHESIS_WEIGHT", 0.5)),
-            identity_weight=float(getattr(loss_cfg, "IDENTITY_WEIGHT", 0.2)),
-            calibration_weight=float(getattr(
-                loss_cfg, "CALIBRATION_WEIGHT", 0.05)),
-            teacher_weight=float(getattr(loss_cfg, "TEACHER_WEIGHT", 1.0)),
-            distill_max_weight=float(getattr(
-                loss_cfg, "DISTILL_MAX_WEIGHT", 0.5)),
-            distill_warmup=float(getattr(loss_cfg, "DISTILL_WARMUP", 0.05)),
-            identity_temperature=float(getattr(
-                loss_cfg, "IDENTITY_TEMPERATURE", 0.1)),
-            diversity_margin=float(getattr(
-                loss_cfg, "DIVERSITY_MARGIN", 0.25)),
-            diversity_weight=float(getattr(
-                loss_cfg, "DIVERSITY_WEIGHT", 0.1)),
-            hazard_bins=int(getattr(
-                cfg.MODEL.SRBT.TEACHER, "HAZARD_BINS", 129)),
-        )
         self.srbt_enabled = bool(getattr(cfg.MODEL.SRBT, "ENABLE", False))
-        self.stage = "srbt" if self.srbt_enabled else "base"
+        self.presence_loss_weight = float(getattr(
+            loss_cfg, "EXISTENCE_WEIGHT", 1.0))
+        self.presence_focal_gamma = float(getattr(
+            loss_cfg, "FOCAL_GAMMA", 2.0))
+        recovery_loss_cfg = getattr(cfg.TRAIN, "RECOVERY_LOSS", None)
+        self.identity_loss_weight = float(getattr(
+            recovery_loss_cfg, "IDENTITY_WEIGHT", 1.0))
+        self.identity_ranking_weight = float(getattr(
+            recovery_loss_cfg, "RANKING_WEIGHT", 0.5))
+        self.identity_ranking_margin = float(getattr(
+            recovery_loss_cfg, "RANKING_MARGIN", 0.2))
+        expert_cfg = getattr(cfg.MODEL, "EXPERT", None)
+        self.expert_enabled = bool(getattr(
+            expert_cfg, "ENABLE", False)) if expert_cfg is not None else False
+        self.expert_phase = str(getattr(
+            cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
+        if self.expert_phase not in {
+                "specialize", "refine", "recovery"}:
+            raise ValueError(
+                "TRAIN.EXPERT_PHASE must be specialize, refine, or recovery")
+        self.stage = self.expert_phase if self.expert_enabled else (
+            "srbt" if self.srbt_enabled else "base")
         self.active_losses = (
-            {"base", "srbt"} if self.srbt_enabled else {"base"})
+            {"presence", "redetect", "identity"}
+            if self.expert_phase == "recovery"
+            else ({"base", "srbt", "redetect"}
+                  if self.srbt_enabled else {"base"})
+        )
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _batch_first_future(value, batch_size, device):
+    def _batch_first_observations(value, batch_size, device):
         if value is None:
             return None
         value = torch.as_tensor(value, device=device)
@@ -63,90 +62,9 @@ class PETTrackActor(PETTrackBaseActor):
                 and value.shape[1] == batch_size:
             value = value.permute(1, 0, 2, 3, 4)
         if value.ndim != 5 or value.shape[0] != batch_size:
-            raise ValueError("future observations must have shape (B,H,C,W,W) or (H,B,C,W,W)")
+            raise ValueError(
+                "observations must have shape (B,H,C,W,W) or (H,B,C,W,W)")
         return value.contiguous()
-
-    @staticmethod
-    def _batch_first_future_mask(value, batch_size, device):
-        if value is None:
-            return None
-        value = torch.as_tensor(value, device=device, dtype=torch.bool)
-        if value.ndim == 2 and value.shape[0] != batch_size \
-                and value.shape[1] == batch_size:
-            value = value.transpose(0, 1)
-        if value.ndim != 2 or value.shape[0] != batch_size:
-            raise ValueError("future_valid must have shape (B,H) or (H,B)")
-        return value.contiguous()
-
-    @staticmethod
-    def _select_posterior(previous, updated, valid):
-        if bool(valid.all()):
-            return updated
-        if not bool(valid.any()):
-            return previous
-        if isinstance(updated, Mapping):
-            return {
-                key: PETTrackActor._select_posterior(
-                    previous[key], value, valid)
-                for key, value in updated.items()
-            }
-        if not torch.is_tensor(updated) or updated.ndim == 0:
-            return updated
-        if previous.shape != updated.shape:
-            if previous.ndim == updated.ndim and previous.shape[0] == updated.shape[0] \
-                    and previous.numel() == 0:
-                previous = torch.zeros_like(updated)
-            else:
-                raise ValueError("posterior field shape changed unexpectedly")
-        mask = valid.reshape(valid.shape[0], *([1] * (updated.ndim - 1)))
-        return torch.where(mask, updated, previous)
-
-    def _history_posterior(self, zi, ze, data, batch_size, device, dtype):
-        values = (
-            data.get("history_images"),
-            data.get("history_event_images"),
-            data.get("history_valid"),
-        )
-        if all(value is None for value in values):
-            return None
-        if any(value is None for value in values):
-            raise RuntimeError(
-                "history_images, history_event_images, and history_valid "
-                "are required together")
-        history_images = self._batch_first_future(values[0], batch_size, device)
-        history_events = self._batch_first_future(values[1], batch_size, device)
-        history_valid = self._batch_first_future_mask(
-            values[2], batch_size, device)
-        if history_images.shape[:2] != history_events.shape[:2]:
-            raise ValueError("history RGB, event, and validity horizons must match")
-        if history_images.shape[1] < history_valid.shape[1]:
-            pad = history_valid.shape[1] - history_images.shape[1]
-            rgb_pad = history_images.new_zeros(
-                batch_size, pad, *history_images.shape[2:])
-            event_pad = history_events.new_zeros(
-                batch_size, pad, *history_events.shape[2:])
-            history_images = torch.cat((rgb_pad, history_images), dim=1)
-            history_events = torch.cat((event_pad, history_events), dim=1)
-        if history_images.shape[:2] != history_valid.shape:
-            raise ValueError("history RGB, event, and validity horizons must match")
-
-        model = self.net.module if hasattr(self.net, "module") else self.net
-        posterior = model.initialize_srbt_posterior(batch_size, device, dtype)
-        with torch.no_grad():
-            for frame_id in range(history_images.shape[1]):
-                valid = history_valid[:, frame_id]
-                if not bool(valid.any()):
-                    continue
-                history_out = self.net(
-                    zi=zi,
-                    ze=ze,
-                    xi=history_images[:, frame_id:frame_id + 1],
-                    xe=history_events[:, frame_id:frame_id + 1],
-                    previous_posterior=posterior,
-                )
-                posterior = self._select_posterior(
-                    posterior, history_out["srbt_posterior"], valid)
-        return posterior
 
     def forward_pass(self, data):
         """Forward pass for baseline localization plus causal SRBT outputs."""
@@ -155,6 +73,21 @@ class PETTrackActor(PETTrackBaseActor):
         xi = data['search_images'].permute(1, 0, 2, 3, 4)
         xe = data['search_event_images'].permute(1, 0, 2, 3, 4)
         z_anno = data['template_anno'].permute(1, 0, 2)
+
+        owner_ids = None
+        if self.expert_enabled and self.expert_phase == "specialize":
+            owner_ids = data.get("expert_owner_id")
+            if owner_ids is None:
+                raise RuntimeError(
+                    "expert specialization requires expert_owner_id")
+            owner_ids = torch.as_tensor(owner_ids).reshape(-1)
+            if owner_ids.numel() != xi.shape[0]:
+                raise ValueError(
+                    "expert_owner_id must provide one owner per batch row")
+            model = self.net.module if hasattr(self.net, "module") else self.net
+            if any(owner < 0 or owner >= len(model.expert_names)
+                   for owner in owner_ids.tolist()):
+                raise ValueError("expert_owner_id contains an invalid owner")
 
         box_mask_z = []
         mask_z = []
@@ -167,8 +100,29 @@ class PETTrackActor(PETTrackBaseActor):
             mask_z = torch.cat(mask_z, dim=1)
             ce_keep_rate = self._adjust_keep_rate(data.get('epoch', 0))
 
-        previous_posterior = self._history_posterior(
-            zi, ze, data, xi.shape[0], xi.device, xi.dtype)
+        redetect_images = None
+        redetect_event_images = None
+        redetect_mask = None
+        is_reappear = data.get("is_reappear")
+        trains_visibility = (
+            owner_ids is None
+            or bool(torch.all(owner_ids == VISIBILITY_EXPERT_ID))
+        )
+        if is_reappear is not None and trains_visibility:
+            redetect_mask = torch.as_tensor(
+                is_reappear[-1], device=xi.device, dtype=torch.bool).reshape(-1)
+            if redetect_mask.numel() != xi.shape[0]:
+                raise ValueError("is_reappear must provide one flag per batch row")
+            if bool(redetect_mask.any()):
+                redetect_images = self._batch_first_observations(
+                    data.get("redetect_search_images"), xi.shape[0], xi.device)
+                redetect_event_images = self._batch_first_observations(
+                    data.get("redetect_search_event_images"), xi.shape[0], xi.device)
+                if redetect_images is None or redetect_event_images is None:
+                    raise RuntimeError(
+                        "reappearance training requires global RGB and event searches")
+            else:
+                redetect_mask = None
 
         forward_kwargs = {
             "zi": zi,
@@ -179,14 +133,12 @@ class PETTrackActor(PETTrackBaseActor):
             "ce_template_mask": box_mask_z,
             "ce_keep_rate": ce_keep_rate,
             "return_last_attn": False,
-            "previous_posterior": previous_posterior,
-            "future_images": self._batch_first_future(
-                data.get("future_images"), xi.shape[0], xi.device),
-            "future_event_images": self._batch_first_future(
-                data.get("future_event_images"), xi.shape[0], xi.device),
-            "future_valid": self._batch_first_future_mask(
-                data.get("future_valid"), xi.shape[0], xi.device),
+            "redetect_images": redetect_images,
+            "redetect_event_images": redetect_event_images,
+            "redetect_mask": redetect_mask,
         }
+        if owner_ids is not None:
+            forward_kwargs["expert_owner_ids"] = owner_ids
         out_dict = self.net(**forward_kwargs)
 
         return out_dict
@@ -211,74 +163,161 @@ class PETTrackActor(PETTrackBaseActor):
 
     # ------------------------------------------------------------------ #
     def compute_losses(self, pred_dict, gt_dict, return_status=True):
-        """Present-masked baseline localization plus the joint SRBT loss."""
+        """Present-masked localization plus the combined SRBT loss."""
         loss, status = super().compute_losses(pred_dict, gt_dict, return_status=True)
         base_loss = loss
-        if self.srbt_enabled:
-            predictions = pred_dict.get("srbt_predictions")
+        if self.expert_enabled and self.expert_phase == "recovery":
+            loss = base_loss * 0.0
+        srbt_loss = base_loss * 0.0
+        redetect_loss = base_loss * 0.0
+        owner_ids = None
+        trains_visibility = True
+        if self.expert_enabled and self.expert_phase == "specialize":
+            expert_owner_ids = gt_dict.get("expert_owner_id")
+            if expert_owner_ids is None:
+                raise RuntimeError(
+                    "expert specialization requires expert_owner_id")
+            owner_ids = torch.as_tensor(
+                expert_owner_ids, device=pred_dict["pred_boxes"].device,
+                dtype=torch.long).reshape(-1)
+            if owner_ids.numel() != pred_dict["pred_boxes"].shape[0]:
+                raise ValueError(
+                    "expert_owner_id must provide one owner per batch row")
+            trains_visibility = bool(torch.all(
+                owner_ids == VISIBILITY_EXPERT_ID))
+
+        if self.srbt_enabled and trains_visibility:
+            predictions = pred_dict.get("presence_predictions")
             if predictions is None:
                 raise RuntimeError(
-                    "SRBT training requires srbt_predictions from model forward")
+                    "presence training requires presence_predictions")
             actual = set(predictions)
-            if actual != REQUIRED_SRBT_PREDICTIONS:
-                missing = sorted(REQUIRED_SRBT_PREDICTIONS - actual)
-                extra = sorted(actual - REQUIRED_SRBT_PREDICTIONS)
-                if extra:
-                    raise RuntimeError(
-                        "SRBT predictions must expose exactly eight outputs; "
-                        f"extra outputs: {extra}")
+            if actual != REQUIRED_PRESENCE_PREDICTIONS:
+                missing = sorted(REQUIRED_PRESENCE_PREDICTIONS - actual)
                 raise RuntimeError(
-                    f"SRBT predictions missing required outputs: {missing}")
-            targets = self._build_srbt_targets(
-                gt_dict, pred_dict["pred_boxes"].device,
-                pred_dict["pred_boxes"].shape[0])
-            progress = gt_dict.get("training_progress", 0.0)
-            if torch.is_tensor(progress):
-                progress = progress.detach().reshape(-1)[0].item()
-            srbt_loss, srbt_status = self.pet_loss.srbt_loss(
-                predictions,
-                targets,
-                teacher=pred_dict.get("srbt_teacher"),
-                progress=progress,
-            )
+                    f"presence predictions have invalid outputs; missing: {missing}")
+            presence = self._present_search_mask(
+                gt_dict, predictions["logits"].device,
+                predictions["logits"].shape[0])
+            if presence is None:
+                raise RuntimeError("presence training requires official visibility")
+            logits = predictions["logits"].float()
+            targets = presence.to(torch.long)
+            per_sample_ce = F.cross_entropy(logits, targets, reduction="none")
+            target_probability = logits.softmax(dim=-1).gather(
+                1, targets[:, None]).squeeze(1)
+            srbt_loss = self.presence_loss_weight * (
+                (1.0 - target_probability).pow(self.presence_focal_gamma)
+                * per_sample_ce
+            ).mean()
             loss = loss + srbt_loss
-            status.update(srbt_status)
+            status["Loss/presence"] = srbt_loss.item()
+
+            redetect_predictions = pred_dict.get("redetect_predictions")
+            if redetect_predictions is not None:
+                redetect_loss, redetect_status = self._compute_redetect_loss(
+                    redetect_predictions, gt_dict)
+                loss = loss + redetect_loss
+                status.update(redetect_status)
+        elif self.srbt_enabled:
+            status["Loss/presence"] = 0.0
+
+        model = self.net.module if hasattr(self.net, "module") else self.net
+        if self.expert_enabled and self.expert_phase == "specialize":
+            gt_xyxy = box_xywh_to_xyxy(
+                gt_dict["search_anno"][-1].to(owner_ids.device))
+            pred_xyxy = box_cxcywh_to_xyxy(
+                pred_dict["pred_boxes"][:, 0]).detach()
+            present = self._present_search_mask(
+                gt_dict, owner_ids.device, owner_ids.numel())
+            if present is None:
+                present = torch.ones_like(owner_ids, dtype=torch.bool)
+            owned_iou = box_iou(pred_xyxy, gt_xyxy)[0]
+            for expert_id in range(len(model.expert_names)):
+                owned = present & (owner_ids == expert_id)
+                status[f"Expert/owner_count_{expert_id}"] = int(owned.sum())
+                status[f"Expert/owner_iou_{expert_id}"] = (
+                    owned_iou[owned].mean().item() if owned.any() else 0.0)
 
         if not return_status:
             return loss
         status["Loss/base"] = base_loss.item()
-        status["Loss/SRBT"] = (loss - base_loss).item()
+        status["Loss/SRBT"] = srbt_loss.item()
+        status.setdefault("Loss/redetect", redetect_loss.item())
+        status["Expert/phase_id"] = {
+            "specialize": 0, "refine": 1, "recovery": 2,
+        }[self.expert_phase]
+        status.setdefault("Redetect/count", 0)
         status["Loss/total"] = loss.item()
         return loss, status
 
-    def _build_srbt_targets(self, data, device, batch_size):
-        present = self._present_search_mask(data, device, batch_size)
-        if present is None:
-            raise RuntimeError("SRBT training requires frame-level presence")
-        targets = {"presence": present.float()}
-        for name in ("hazard_target", "hazard_mask", "censor_mask"):
-            value = data.get(name)
-            if value is None:
-                raise RuntimeError(f"SRBT training requires {name}")
-            targets[name] = value.to(device=device).reshape(-1)
-
-        gt_xywh = data["search_anno"][-1].to(device=device)
-        targets["target_box"] = torch.stack((
+    def _compute_redetect_loss(self, predictions, data):
+        indices = predictions["batch_indices"].to(
+            device=predictions["score_map"].device, dtype=torch.long)
+        annotations = data.get("redetect_search_anno")
+        if annotations is None:
+            raise RuntimeError(
+                "redetection predictions require redetect_search_anno")
+        annotations = torch.as_tensor(
+            annotations, device=indices.device)
+        gt_xywh = annotations[-1].index_select(0, indices)
+        target_box = torch.stack((
             gt_xywh[:, 0] + 0.5 * gt_xywh[:, 2],
             gt_xywh[:, 1] + 0.5 * gt_xywh[:, 3],
             gt_xywh[:, 2],
             gt_xywh[:, 3],
         ), dim=-1)
-        state = data.get("state_target")
-        if state is None:
-            raise RuntimeError("SRBT training requires state_target")
-        state = state.to(device=device).reshape(-1)
-        field_mask = (state == VISIBLE) | (state == REAPPEARING)
-        targets["field_mask"] = field_mask
-        targets["hypothesis_mask"] = field_mask
-        targets["identity_mask"] = field_mask
-        targets["field_target"] = generate_heatmap(
-            data["search_anno"], self.cfg.DATA.SEARCH.SIZE,
+        heatmap = generate_heatmap(
+            annotations,
+            self.cfg.DATA.SEARCH.SIZE,
             self.cfg.MODEL.BACKBONE.STRIDE,
-        )[-1].unsqueeze(1).to(device=device)
-        return targets
+        )[-1].unsqueeze(1).to(device=indices.device)
+        heatmap = heatmap.index_select(0, indices)
+        focal_loss = self.objective["focal"](
+            predictions["score_map"], heatmap)
+        box_loss = F.l1_loss(predictions["bbox"], target_box)
+        pred_xyxy = box_cxcywh_to_xyxy(predictions["bbox"])
+        target_xyxy = box_cxcywh_to_xyxy(target_box).clamp(0.0, 1.0)
+        giou, _ = generalized_box_iou(pred_xyxy, target_xyxy)
+        giou_loss = (1.0 - giou).mean()
+
+        identity_scores = predictions.get("identity_scores")
+        if identity_scores is None:
+            raise RuntimeError(
+                "recovery training requires RGB identity scores")
+        count = indices.numel()
+        if identity_scores.shape != (count, count):
+            raise ValueError(
+                "identity_scores must compare every template with every candidate")
+        identity_scores = identity_scores.float().clamp(1e-6, 1.0 - 1e-6)
+        identity_targets = torch.eye(
+            count, device=identity_scores.device, dtype=identity_scores.dtype)
+        identity_logits = torch.logit(identity_scores)
+        identity_loss = F.binary_cross_entropy_with_logits(
+            identity_logits, identity_targets)
+        if count > 1:
+            positive = identity_scores.diagonal()
+            negatives = identity_scores.masked_fill(
+                identity_targets.bool(), float("-inf"))
+            hardest_negative = negatives.max(dim=1).values
+            ranking_loss = F.relu(
+                self.identity_ranking_margin - positive + hardest_negative
+            ).mean()
+        else:
+            ranking_loss = identity_scores.sum() * 0.0
+        loss = (
+            self.loss_weight["focal"] * focal_loss
+            + self.loss_weight["l1"] * box_loss
+            + self.loss_weight["giou"] * giou_loss
+            + self.identity_loss_weight * identity_loss
+            + self.identity_ranking_weight * ranking_loss
+        )
+        return loss, {
+            "Loss/redetect": loss.item(),
+            "Loss/redetect_focal": focal_loss.item(),
+            "Loss/redetect_l1": box_loss.item(),
+            "Loss/redetect_giou": giou_loss.item(),
+            "Loss/recovery_identity": identity_loss.item(),
+            "Loss/recovery_ranking": ranking_loss.item(),
+            "Redetect/count": int(indices.numel()),
+        }

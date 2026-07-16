@@ -108,10 +108,14 @@ def test_refill_keeps_exact_capacity_instead_of_appending_duplicate_slots():
     wrapper.lt_module.clear()
     wrapper.lt_module.clear()
 
+    dynamic_rgb, dynamic_event = wrapper.lt_module.get_dynamic_z(
+        frame_num=1, resample_flag=False)
+
     assert len(wrapper.lt_module.zi_raw_list) == 10
     assert len(wrapper.lt_module.ze_raw_list) == 10
     assert len(wrapper.lt_module.zi_list) == 10
     assert len(wrapper.lt_module.ze_list) == 10
+    assert dynamic_rgb.shape == dynamic_event.shape
 
 
 def test_begin_frame_reads_memory_without_mutating_it_until_commit():
@@ -135,3 +139,20 @@ def test_begin_frame_reads_memory_without_mutating_it_until_commit():
 def test_default_memory_capacities_match_the_srbt_contract():
     assert cfg.TEST.SHORTTERM_LIBRARY_NUMS == 5
     assert cfg.TEST.LONGTERM_LIBRARY_NUMS == 10
+
+
+def test_long_term_memory_can_update_after_no_grad_setup():
+    with torch.no_grad():
+        wrapper = _wrapper(update_interval=1)
+
+    assert wrapper.lt_module.base_sim_zi._base is None
+    assert wrapper.lt_module.base_sim_ze._base is None
+
+    for frame in range(1, 4):
+        wrapper.begin_frame()
+        wrapper.commit(
+            _image(frame), _image(frame), pred_score=1.0,
+            allow_recent_write=True, allow_long_write=True,
+        )
+
+    assert wrapper.get_update_count()[1] > 0
