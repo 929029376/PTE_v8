@@ -342,7 +342,9 @@ def test_pursuit_validation_uses_the_same_contiguous_sampler_contract():
     assert sampler.pursuit_enabled is True
 
 
-def test_single_specialist_pursuit_enables_precise_frame_manifest(monkeypatch):
+@pytest.mark.parametrize("training", [True, False])
+def test_single_specialist_pursuit_enables_precise_frame_manifest(
+        monkeypatch, training):
     class Dataset:
         def __len__(self):
             return 1
@@ -377,7 +379,7 @@ def test_single_specialist_pursuit_enables_precise_frame_manifest(monkeypatch):
         num_search_frames=8,
         num_template_frames=2,
         cfg=cfg,
-        training=True,
+        training=training,
     )
 
     assert sampler.causal_specialist_pursuit is True

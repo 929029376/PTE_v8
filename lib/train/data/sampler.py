@@ -133,7 +133,8 @@ class TrackingSampler(torch.utils.data.Dataset):
             if self.expert_phase == "specialize" else ()
         )
         self.precise_expert_sampling = (
-            (self.training or self.expert_phase == "dispatch")
+            (self.training or self.expert_phase == "dispatch"
+             or self.causal_specialist_pursuit)
             and (self.expert_phase in {"specialize", "dispatch"}
                  or self.causal_specialist_pursuit)
             and bool(getattr(challenge_cfg, "ENABLE", False))
