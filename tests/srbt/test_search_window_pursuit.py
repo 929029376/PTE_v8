@@ -251,6 +251,29 @@ def test_pursuit_sampler_returns_strictly_contiguous_frames_with_absence():
     assert event_type == "pursuit_contiguous"
 
 
+def test_pursuit_specialist_window_contains_enough_eligible_motion_frames():
+    sampler = object.__new__(TrackingSampler)
+    sampler.num_template_frames = 2
+    sampler.num_search_frames = 8
+    sampler.max_gap = 20
+    visible = torch.ones(14, dtype=torch.uint8)
+    info = {
+        "bbox": torch.ones(14, 4),
+        "valid": torch.ones(14, dtype=torch.uint8),
+        "absent": visible.clone(),
+    }
+    eligible = torch.tensor(
+        [0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+        dtype=torch.bool,
+    )
+
+    _, search_ids, _ = sampler._sample_pursuit_causal_frame_ids(
+        visible, info, episode_type="visible", eligible_frames=eligible)
+
+    assert search_ids == list(range(search_ids[0], search_ids[0] + 8))
+    assert int(eligible[search_ids].sum()) >= 4
+
+
 def test_pursuit_transition_quota_retries_sequences_without_absence(
         monkeypatch):
     sampler = object.__new__(TrackingSampler)
@@ -317,6 +340,49 @@ def test_pursuit_validation_uses_the_same_contiguous_sampler_contract():
     )
 
     assert sampler.pursuit_enabled is True
+
+
+def test_single_specialist_pursuit_enables_precise_frame_manifest(monkeypatch):
+    class Dataset:
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(
+        "lib.train.data.sampler.load_manifest",
+        lambda _path: {"sequences": {}},
+    )
+    cfg = SimpleNamespace(
+        DATA=SimpleNamespace(
+            SRBT=SimpleNamespace(ENABLE=False, ANCHOR_WEIGHTS=None),
+            PURSUIT=SimpleNamespace(ENABLE=True),
+            CHALLENGE_SAMPLING=SimpleNamespace(
+                ENABLE=True,
+                PRECISE=True,
+                MANIFEST="frame_manifest.json",
+                VAL_MANIFEST="frame_manifest.json",
+            ),
+        ),
+        TRAIN=SimpleNamespace(
+            EXPERT_PHASE="pursuit",
+            SPECIALIST_EXPERT_IDS=[1],
+            SPECIALIST_EXPERT_SCHEDULE=[],
+        ),
+    )
+
+    sampler = TrackingSampler(
+        datasets=[Dataset()],
+        p_datasets=[1],
+        samples_per_epoch=8,
+        max_gap=20,
+        num_search_frames=8,
+        num_template_frames=2,
+        cfg=cfg,
+        training=True,
+    )
+
+    assert sampler.causal_specialist_pursuit is True
+    assert sampler.precise_expert_sampling is True
+    assert sampler.training_expert_for_index(0) == 1
 
 
 def test_pursuit_stage_requires_closed_loop_data_and_completed_experts():
@@ -644,6 +710,151 @@ def test_pursuit_actor_updates_controller_but_not_frozen_experts():
     assert status["Pursuit/steps"] == 2
     assert 0.0 <= status["Pursuit/next_in_crop_rate"] <= 1.0
     assert status["Pursuit/next_center_error"] >= 0.0
+
+
+def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller():
+    class FixedController(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=False)
+
+        def forward(self, **kwargs):
+            next_box = kwargs["current_box"] + self.bias * 0.0
+            return SimpleNamespace(
+                next_box=next_box,
+                inside_logit=next_box[:, 0] * 0.0,
+                quality_logit=next_box[:, 0] * 0.0,
+            )
+
+    class CausalExperts(torch.nn.Module):
+        expert_names = ["g", "m", "p", "v", "d"]
+
+        def __init__(self):
+            super().__init__()
+            self.motion_bias = torch.nn.Parameter(torch.tensor(0.0))
+            self.search_window_controller = FixedController()
+            self.calls = []
+
+        def inference(self, **kwargs):
+            self.calls.append(kwargs.get("active_expert_names"))
+            batch_size = kwargs["xi"].shape[0]
+
+            def output(center):
+                center = center.expand(batch_size)
+                box = torch.stack((
+                    center,
+                    center * 0.0 + 0.5,
+                    center * 0.0 + 0.2,
+                    center * 0.0 + 0.2,
+                ), dim=1).unsqueeze(1)
+                score = center[:, None, None, None].expand(
+                    batch_size, 1, 4, 4)
+                return {"pred_boxes": box, "score_map": score}
+
+            generalist = output(self.motion_bias.detach() * 0.0 + 0.5)
+            motion = output(0.5 + 0.1 * self.motion_bias.tanh())
+            return {
+                "expert_outputs": {"g": generalist, "m": motion},
+                "presence_score": torch.ones(batch_size),
+            }
+
+    model = CausalExperts()
+    actor = object.__new__(PETTrackActor)
+    actor.net = model
+    actor.expert_enabled = True
+    actor.expert_phase = "pursuit"
+    actor.settings = SimpleNamespace(search_area_factor={"search": 2.0})
+    actor.cfg = SimpleNamespace(
+        MODEL=SimpleNamespace(EXPERT=SimpleNamespace(
+            ACTIVATOR_TRAINED=False,
+            USE_ACTIVATION_INFERENCE=False,
+        )),
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(SIZE=8, FACTOR=2.0)),
+        TRAIN=SimpleNamespace(SPECIALIST_EXPERT_IDS=[1]),
+    )
+    frames = torch.zeros(3, 1, 3, 8, 8)
+    challenge_labels = torch.zeros(
+        3, 1, len(pet_track_actor_module.CHALLENGE_NAMES), dtype=torch.bool)
+    challenge_labels[
+        :, :, pet_track_actor_module.CHALLENGE_NAMES.index("motion")] = True
+    data = {
+        "template_images": torch.zeros(2, 1, 3, 4, 4),
+        "template_event_images": torch.zeros(2, 1, 3, 4, 4),
+        "pursuit_search_images": frames,
+        "pursuit_search_event_images": frames,
+        "pursuit_search_anno": torch.tensor([
+            [[0.10, 0.40, 0.10, 0.10]],
+            [[0.20, 0.40, 0.10, 0.10]],
+            [[0.30, 0.40, 0.10, 0.10]],
+        ]),
+        "pursuit_search_present": torch.ones(3, 1, dtype=torch.uint8),
+        "training_expert_id": torch.tensor([1]),
+        "pursuit_challenge_labels": challenge_labels,
+    }
+
+    output = actor._forward_pursuit(data)
+    specialist_outputs = output["pursuit_specialist_outputs"]
+    loss = torch.stack([
+        item["pred_boxes"].sum() for item in specialist_outputs
+    ]).mean()
+    loss.backward()
+
+    assert model.calls == [("m",), ("m",)]
+    assert model.motion_bias.grad is not None
+    assert bool(model.motion_bias.grad.abs() > 0)
+    assert model.search_window_controller.bias.grad is None
+
+
+def test_causal_specialist_total_loss_backpropagates_only_eligible_outputs(
+        monkeypatch):
+    motion_bias = torch.nn.Parameter(torch.tensor(0.25))
+
+    def fake_base_loss(_self, output, gt_dict, return_status=True):
+        present = gt_dict["search_absent"][-1].float()
+        values = output["pred_boxes"][:, 0, 0]
+        loss = (values * present).sum() / present.sum().clamp_min(1.0)
+        return loss, {"Loss/total": float(loss.detach()), "IoU": 0.5}
+
+    monkeypatch.setattr(PETTrackActor.__mro__[1], "compute_losses", fake_base_loss)
+    actor = object.__new__(PETTrackActor)
+    actor.settings = SimpleNamespace(search_area_factor={"search": 2.0})
+    actor.cfg = SimpleNamespace(
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(FACTOR=2.0)),
+        TRAIN=SimpleNamespace(
+            PURSUIT_CENTER_WEIGHT=1.0,
+            PURSUIT_SCALE_WEIGHT=0.5,
+            PURSUIT_CONTAINMENT_WEIGHT=2.0,
+            PURSUIT_INSIDE_WEIGHT=0.5,
+            PURSUIT_QUALITY_WEIGHT=0.25,
+        ),
+    )
+    controller_step = SimpleNamespace(
+        next_box=torch.tensor([[0.2, 0.2, 0.1, 0.1]]),
+        inside_logit=torch.zeros(1),
+        quality_logit=torch.zeros(1),
+    )
+    predictions = {
+        "pursuit_predictions": [controller_step],
+        "pursuit_targets": [torch.tensor([[0.3, 0.2, 0.1, 0.1]])],
+        "pursuit_current_inside": [torch.tensor([True])],
+        "pursuit_current_quality": [torch.tensor([0.5])],
+        "pursuit_present_next": [torch.tensor([True])],
+        "pursuit_specialist_id": 1,
+        "pursuit_specialist_outputs": [{
+            "pred_boxes": motion_bias.reshape(1, 1, 1).expand(1, 1, 4),
+        }],
+        "pursuit_specialist_targets": [
+            torch.tensor([[0.2, 0.2, 0.1, 0.1]])],
+        "pursuit_specialist_present": [torch.tensor([True])],
+    }
+
+    loss, status = actor._compute_pursuit_losses(predictions)
+    loss.backward()
+
+    assert motion_bias.grad is not None
+    assert bool(motion_bias.grad.abs() > 0)
+    assert status["Expert/train_count_1"] == 1
+    assert status["Loss/causal_specialist"] == pytest.approx(float(loss.detach()))
 
 
 def test_synthetic_training_improves_next_center_and_crop_inclusion():

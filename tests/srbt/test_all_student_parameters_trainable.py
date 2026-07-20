@@ -283,6 +283,7 @@ def test_pursuit_phase_trains_only_search_window_controller():
     model = TinyStudent()
     cfg = _cfg()
     cfg.TRAIN.EXPERT_PHASE = "pursuit"
+    cfg.TRAIN.SPECIALIST_EXPERT_IDS = [1, 2, 3, 4]
     cfg.TRAIN.PURSUIT_LR = 3e-4
 
     groups = _optimizer_groups(model, cfg)
@@ -300,6 +301,32 @@ def test_pursuit_phase_trains_only_search_window_controller():
     assert {id(parameter) for parameter in groups[0]["params"]} == {
         id(parameter) for parameter in trainable.values()
     }
+
+
+def test_pursuit_single_specialist_trains_only_declared_motion_path():
+    model = TinyStudent()
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "pursuit"
+    cfg.TRAIN.SPECIALIST_EXPERT_IDS = [1]
+
+    groups = _optimizer_groups(model, cfg)
+    trainable = {
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    expected_prefixes = (
+        "expert_fusion.experts.motion.",
+        "expert_fusion.residual_scale_logits.motion",
+        "expert_heads.motion.",
+        "proposal_adapters.motion.",
+    )
+
+    assert trainable
+    assert all(name.startswith(expected_prefixes) for name in trainable)
+    assert not any(
+        name.startswith("search_window_controller.") for name in trainable)
+    assert [group["name"] for group in groups] == [
+        "causal_specialist_motion"]
 
 
 def test_baseline_path_is_bitwise_immutable_after_precision_expert_step(tmp_path):

@@ -105,6 +105,10 @@ class TrackingSampler(torch.utils.data.Dataset):
             if self.expert_phase == "dispatch"
             else configured_expert_ids
         )
+        self.causal_specialist_pursuit = (
+            self.expert_phase == "pursuit"
+            and len(self.training_expert_ids) == 1
+        )
         specialist_schedule = []
         previous_end = 0
         for stage in getattr(
@@ -130,7 +134,8 @@ class TrackingSampler(torch.utils.data.Dataset):
         )
         self.precise_expert_sampling = (
             (self.training or self.expert_phase == "dispatch")
-            and self.expert_phase in {"specialize", "dispatch"}
+            and (self.expert_phase in {"specialize", "dispatch"}
+                 or self.causal_specialist_pursuit)
             and bool(getattr(challenge_cfg, "ENABLE", False))
             and bool(getattr(challenge_cfg, "PRECISE", False))
         )
@@ -336,7 +341,8 @@ class TrackingSampler(torch.utils.data.Dataset):
         return "visible"
 
     def _sample_pursuit_causal_frame_ids(
-            self, visible, seq_info_dict, episode_type=None):
+            self, visible, seq_info_dict, episode_type=None,
+            eligible_frames=None):
         """Sample a strict contiguous episode, including official absent frames."""
         frame_count = len(seq_info_dict["bbox"])
         window = int(self.num_search_frames)
@@ -350,11 +356,22 @@ class TrackingSampler(torch.utils.data.Dataset):
         disappearance_candidates = []
         reappearance_candidates = []
         presence = torch.as_tensor(visible, dtype=torch.bool).reshape(-1)
+        eligible = None
+        minimum_eligible = max(2, window // 2)
+        if eligible_frames is not None:
+            eligible = torch.as_tensor(
+                eligible_frames, dtype=torch.bool).reshape(-1)
+            if eligible.numel() != frame_count:
+                raise ValueError(
+                    "pursuit eligibility must provide one value per frame")
         for start in range(1, frame_count - window + 1):
             search_ids = list(range(start, start + window))
             window_present = presence[search_ids]
             if (not bool(presence[start])
                     or not bool(valid[search_ids][window_present].all())):
+                continue
+            if (eligible is not None
+                    and int(eligible[search_ids].sum()) < minimum_eligible):
                 continue
             base_id = self._previous_visible_id(visible, start)
             if base_id is None:
@@ -555,11 +572,25 @@ class TrackingSampler(torch.utils.data.Dataset):
                     gap_increase = 0
                     # Sample test and train frames in a causal manner, i.e. search_frame_ids > template_frame_ids
                     if self.pursuit_enabled:
+                        eligible_frames = None
+                        if training_expert_id is not None:
+                            labels = self._expert_attribute_labels(
+                                dataset, seq_id, seq_info_dict)
+                            eligible_frames = expert_supervision_mask(labels)[
+                                :, training_expert_id]
                         template_frame_ids, search_frame_ids, sampler_event_type = \
                             self._sample_pursuit_causal_frame_ids(
-                                visible, seq_info_dict, pursuit_episode_type)
+                                visible, seq_info_dict, pursuit_episode_type,
+                                eligible_frames=eligible_frames)
                         if search_frame_ids is None:
                             continue
+                        if training_expert_id is not None:
+                            sampled_training_expert_id = training_expert_id
+                            challenge_labels = torch.stack([
+                                self._frame_challenge_labels(
+                                    dataset, seq_id, seq_info_dict, frame_id)
+                                for frame_id in search_frame_ids
+                            ])
                     elif self.precise_expert_sampling:
                         (template_frame_ids, search_frame_ids,
                          sampler_event_type, sampled_training_expert_id,
@@ -643,7 +674,10 @@ class TrackingSampler(torch.utils.data.Dataset):
                 if sampled_training_expert_id is not None:
                     data['training_expert_id'] = torch.tensor(
                         sampled_training_expert_id, dtype=torch.long)
-                    data['challenge_labels'] = challenge_labels
+                    if self.pursuit_enabled:
+                        data['pursuit_challenge_labels'] = challenge_labels
+                    else:
+                        data['challenge_labels'] = challenge_labels
                 if self.srbt_enabled:
                     data.update({
                         'redetect_search_images': list(search_aps_frame_list),

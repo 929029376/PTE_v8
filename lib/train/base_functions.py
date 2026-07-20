@@ -205,6 +205,12 @@ def _optimizer_groups(net, cfg):
     expert_heads = getattr(model, "expert_heads", None)
     specialist_expert_ids = tuple(int(expert_id) for expert_id in getattr(
         cfg.TRAIN, "SPECIALIST_EXPERT_IDS", ()))
+    pursuit_specialist_id = (
+        specialist_expert_ids[0]
+        if expert_phase == "pursuit" and len(specialist_expert_ids) == 1
+        else None
+    )
+    pursuit_specialist_name = None
     small_target_only = (
         expert_phase == "specialize"
         and bool(specialist_expert_ids)
@@ -291,8 +297,37 @@ def _optimizer_groups(net, cfg):
                 "TRAIN.EXPERT_PHASE=pursuit requires MODEL.SEARCH_CONTROLLER.ENABLE=true")
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        for parameter in controller.parameters():
-            parameter.requires_grad_(True)
+        if pursuit_specialist_id is None:
+            for parameter in controller.parameters():
+                parameter.requires_grad_(True)
+        else:
+            expert_names = tuple(getattr(model, "expert_names", ()))
+            if not expert_names and expert_fusion is not None:
+                expert_names = tuple(expert_fusion.experts)
+            if (pursuit_specialist_id <= 0
+                    or pursuit_specialist_id >= len(expert_names)):
+                raise ValueError("causal pursuit specialist ID is invalid")
+            pursuit_specialist_name = expert_names[pursuit_specialist_id]
+            if (expert_fusion is None
+                    or pursuit_specialist_name not in expert_fusion.experts
+                    or expert_heads is None
+                    or pursuit_specialist_name not in expert_heads):
+                raise ValueError(
+                    "causal pursuit currently requires a shared specialist")
+            for parameter in expert_fusion.experts[
+                    pursuit_specialist_name].parameters():
+                parameter.requires_grad_(True)
+            expert_fusion.residual_scale_logits[
+                pursuit_specialist_name].requires_grad_(True)
+            for parameter in expert_heads[
+                    pursuit_specialist_name].parameters():
+                parameter.requires_grad_(True)
+            proposal_adapters = getattr(model, "proposal_adapters", None)
+            if (proposal_adapters is not None
+                    and pursuit_specialist_name in proposal_adapters):
+                for parameter in proposal_adapters[
+                        pursuit_specialist_name].parameters():
+                    parameter.requires_grad_(True)
     elif expert_phase == "dispatch":
         activator = getattr(model, "expert_activator", None)
         if activator is None:
@@ -330,10 +365,25 @@ def _optimizer_groups(net, cfg):
             float(getattr(cfg.TRAIN, "ACTIVATOR_LR", lr)),
             lambda name: name.startswith("expert_activator."))
     elif expert_phase == "pursuit":
-        add_group(
-            "search_window_controller",
-            float(getattr(cfg.TRAIN, "PURSUIT_LR", lr)),
-            lambda name: name.startswith("search_window_controller."))
+        if pursuit_specialist_name is None:
+            add_group(
+                "search_window_controller",
+                float(getattr(cfg.TRAIN, "PURSUIT_LR", lr)),
+                lambda name: name.startswith("search_window_controller."))
+        else:
+            prefixes = (
+                f"expert_fusion.experts.{pursuit_specialist_name}.",
+                f"expert_heads.{pursuit_specialist_name}.",
+                f"proposal_adapters.{pursuit_specialist_name}.",
+            )
+            residual_name = (
+                "expert_fusion.residual_scale_logits."
+                f"{pursuit_specialist_name}")
+            add_group(
+                f"causal_specialist_{pursuit_specialist_name}",
+                lr * float(getattr(
+                    cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0)),
+                lambda name: name.startswith(prefixes) or name == residual_name)
     elif expert_phase == "refine":
         add_group(
             "vit_tail_refine",

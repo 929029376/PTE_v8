@@ -242,6 +242,52 @@ class PETTrackActor(PETTrackBaseActor):
 
         return out_dict
 
+    def _pursuit_specialist_context(self, data, model, batch_size,
+                                    frame_count, device):
+        train_cfg = getattr(self.cfg, "TRAIN", None)
+        specialist_ids = tuple(int(expert_id) for expert_id in getattr(
+            train_cfg, "SPECIALIST_EXPERT_IDS", ()))
+        if len(specialist_ids) != 1:
+            return None, None
+        specialist_id = specialist_ids[0]
+        if (not getattr(self, "expert_enabled", False)
+                or specialist_id <= 0
+                or specialist_id >= len(model.expert_names)):
+            raise ValueError("causal pursuit specialist ID is invalid")
+        sampled_ids = data.get("training_expert_id")
+        challenge_labels = data.get("pursuit_challenge_labels")
+        if sampled_ids is None or challenge_labels is None:
+            raise RuntimeError(
+                "causal specialist pursuit requires frame challenge labels")
+        sampled_ids = torch.as_tensor(
+            sampled_ids, device=device, dtype=torch.long).reshape(-1)
+        if (sampled_ids.numel() != batch_size
+                or not bool((sampled_ids == specialist_id).all())):
+            raise ValueError(
+                "pursuit batch must contain only the declared specialist")
+        challenge_labels = torch.as_tensor(
+            challenge_labels, device=device, dtype=torch.bool)
+        expected = (batch_size, frame_count, len(CHALLENGE_NAMES))
+        if challenge_labels.shape == (
+                frame_count, len(CHALLENGE_NAMES), batch_size):
+            challenge_labels = challenge_labels.permute(2, 0, 1)
+        elif challenge_labels.shape == (
+                frame_count, batch_size, len(CHALLENGE_NAMES)):
+            challenge_labels = challenge_labels.permute(1, 0, 2)
+        if challenge_labels.shape != expected:
+            raise ValueError(
+                "pursuit_challenge_labels must describe every batch frame")
+        attributes = {
+            name: challenge_labels[..., index].reshape(-1)
+            for index, name in enumerate(CHALLENGE_NAMES)
+        }
+        eligible = expert_supervision_mask(attributes)[
+            :, specialist_id].reshape(batch_size, frame_count)
+        if not bool(eligible.any(dim=1).all()):
+            raise ValueError(
+                "each pursuit episode must contain eligible specialist frames")
+        return specialist_id, eligible
+
     @staticmethod
     def _aligned_iou_xywh(first, second):
         first_max = first[:, :2] + first[:, 2:]
@@ -257,7 +303,7 @@ class PETTrackActor(PETTrackBaseActor):
             first_area + second_area - intersection).clamp_min(1e-8)
 
     def _forward_pursuit(self, data):
-        """Unroll frozen experts over crops planned by the preceding frame."""
+        """Unroll controller or one specialist over prediction-driven crops."""
         model = self.net.module if hasattr(self.net, "module") else self.net
         controller = getattr(model, "search_window_controller", None)
         if controller is None:
@@ -289,6 +335,13 @@ class PETTrackActor(PETTrackBaseActor):
         if annotations.shape[:2] != frames.shape[:2] \
                 or present.shape != frames.shape[:2]:
             raise ValueError("pursuit sequence fields must share [batch, time]")
+        specialist_id, specialist_eligible = (
+            self._pursuit_specialist_context(
+                data, model, frames.shape[0], frames.shape[1], frames.device)
+        )
+        specialist_name = (
+            model.expert_names[specialist_id]
+            if specialist_id is not None else None)
         search_factor = float(getattr(
             self.cfg.DATA.SEARCH, "FACTOR",
             self.settings.search_area_factor["search"]))
@@ -301,17 +354,23 @@ class PETTrackActor(PETTrackBaseActor):
         current_quality_values = []
         present_next_values = []
         crop_anchors = []
+        specialist_outputs = []
+        specialist_targets = []
+        specialist_present = []
         expert_cfg = getattr(
             getattr(self.cfg, "MODEL", None), "EXPERT", None)
         use_activation = bool(getattr(
             expert_cfg, "USE_ACTIVATION_INFERENCE", False))
+        if specialist_id is not None and use_activation:
+            raise RuntimeError(
+                "causal specialist pursuit uses the declared expert directly")
         if use_activation and not bool(getattr(
                 expert_cfg, "ACTIVATOR_TRAINED", False)):
             raise RuntimeError(
                 "pursuit sparse activation requires a trained expert activator")
         was_training = model.training
         model.eval()
-        controller.train(was_training)
+        controller.train(was_training and specialist_id is None)
         try:
             for frame_index in range(frames.shape[1] - 1):
                 crop_anchors.append(planned_anchor)
@@ -321,12 +380,15 @@ class PETTrackActor(PETTrackBaseActor):
                 event_search, _ = dynamic_search_crop(
                     event_frames[:, frame_index], planned_anchor,
                     search_factor, search_size)
-                with torch.no_grad():
+                with torch.set_grad_enabled(specialist_id is not None):
                     inference_kwargs = dict(
                         static_zi=zi[:, 0], static_ze=ze[:, 0],
                         dynamic_zi=zi[:, 1:], dynamic_ze=ze[:, 1:],
                         xi=search, xe=event_search)
-                    if use_activation:
+                    if specialist_id is not None:
+                        inference_kwargs["active_expert_names"] = (
+                            specialist_name,)
+                    elif use_activation:
                         inference_kwargs["auto_activate"] = True
                     output = model.inference(**inference_kwargs)
                     expert_outputs = output.get("expert_outputs")
@@ -338,7 +400,13 @@ class PETTrackActor(PETTrackBaseActor):
                     if generalist is None:
                         raise RuntimeError(
                             "pursuit training requires the generalist output")
-                    if use_activation:
+                    if specialist_id is not None:
+                        active_mask = torch.zeros(
+                            search.shape[0], len(model.expert_names),
+                            device=search.device, dtype=torch.bool)
+                        active_mask[:, 0] = True
+                        active_mask[:, specialist_id] = True
+                    elif use_activation:
                         active_mask = output.get("expert_activation_mask")
                         expected_shape = (
                             search.shape[0], len(model.expert_names))
@@ -397,8 +465,11 @@ class PETTrackActor(PETTrackBaseActor):
                     expert_weights = reliability / reliability.sum(
                         dim=1, keepdim=True).clamp_min(1e-6)
                     observation = (
-                        expert_weights[..., None] * expert_boxes
-                    ).sum(dim=1)
+                        expert_boxes[:, specialist_id]
+                        if specialist_id is not None
+                        else (expert_weights[..., None] * expert_boxes).sum(
+                            dim=1)
+                    )
                     presence_score = output.get("presence_score")
                     if presence_score is None:
                         presence_score = frames.new_ones(frames.shape[0])
@@ -419,6 +490,25 @@ class PETTrackActor(PETTrackBaseActor):
                     search_factor) & present[:, frame_index]
                 current_quality = self._aligned_iou_xywh(
                     observation, annotations[:, frame_index])
+                if specialist_id is not None:
+                    region_xy = crop_region[:, :2]
+                    region_wh = crop_region[:, 2:]
+                    target_size = (
+                        annotations[:, frame_index, 2:] / region_wh)
+                    target_center = (
+                        annotations[:, frame_index, :2]
+                        + 0.5 * annotations[:, frame_index, 2:]
+                        - region_xy
+                    ) / region_wh
+                    specialist_targets.append(torch.cat((
+                        target_center - 0.5 * target_size,
+                        target_size,
+                    ), dim=1))
+                    specialist_present.append(
+                        present[:, frame_index]
+                        & specialist_eligible[:, frame_index])
+                    specialist_outputs.append(
+                        expert_outputs[specialist_name])
                 predictions.append(prediction)
                 targets.append(annotations[:, frame_index + 1])
                 current_inside_values.append(current_inside)
@@ -435,6 +525,10 @@ class PETTrackActor(PETTrackBaseActor):
             "pursuit_current_quality": current_quality_values,
             "pursuit_present_next": present_next_values,
             "pursuit_crop_anchors": crop_anchors,
+            "pursuit_specialist_id": specialist_id,
+            "pursuit_specialist_outputs": specialist_outputs,
+            "pursuit_specialist_targets": specialist_targets,
+            "pursuit_specialist_present": specialist_present,
         }
 
     # helpers for the CE logic (kept local)
@@ -736,7 +830,40 @@ class PETTrackActor(PETTrackBaseActor):
             )
             losses.append(step_loss)
             statuses.append(step_status)
-        loss = torch.stack(losses).mean()
+        controller_loss = torch.stack(losses).mean()
+        specialist_outputs = predictions.get(
+            "pursuit_specialist_outputs", ())
+        specialist_id = predictions.get("pursuit_specialist_id")
+        specialist_statuses = []
+        specialist_losses = []
+        specialist_weights = []
+        if specialist_outputs:
+            for index, output in enumerate(specialist_outputs):
+                step_present = predictions[
+                    "pursuit_specialist_present"][index]
+                step_weight = step_present.float().sum()
+                if not bool(step_present.any()):
+                    continue
+                local_gt = {
+                    "search_anno": predictions[
+                        "pursuit_specialist_targets"][index].unsqueeze(0),
+                    "search_absent": step_present.unsqueeze(0),
+                    "training_expert_id": torch.full(
+                        (step_present.numel(),), specialist_id,
+                        device=step_present.device, dtype=torch.long),
+                }
+                step_loss, step_status = super().compute_losses(
+                    output, local_gt, return_status=True)
+                specialist_losses.append(step_loss * step_weight)
+                specialist_weights.append(step_weight)
+                specialist_statuses.append((step_status, step_weight))
+            if not specialist_losses:
+                raise RuntimeError(
+                    "causal specialist pursuit produced no eligible loss")
+            specialist_weight = torch.stack(specialist_weights).sum()
+            loss = torch.stack(specialist_losses).sum() / specialist_weight
+        else:
+            loss = controller_loss
         if not return_status:
             return loss
         status = {
@@ -745,6 +872,18 @@ class PETTrackActor(PETTrackBaseActor):
             if key.startswith("Loss/")
         }
         status["Loss/total"] = float(loss.detach())
+        status["Loss/pursuit_controller_diagnostic"] = float(
+            controller_loss.detach())
+        if specialist_statuses:
+            total_weight = sum(
+                float(weight.detach()) for _, weight in specialist_statuses)
+            status[f"Expert/train_count_{specialist_id}"] = int(total_weight)
+            status[f"Expert/train_iou_{specialist_id}"] = sum(
+                item["IoU"] * float(weight.detach())
+                for item, weight in specialist_statuses
+            ) / total_weight
+            status["IoU"] = status[f"Expert/train_iou_{specialist_id}"]
+            status["Loss/causal_specialist"] = float(loss.detach())
         status["Pursuit/steps"] = len(steps)
         status["Pursuit/in_crop_rate"] = float(torch.cat([
             item.float() for item in predictions[

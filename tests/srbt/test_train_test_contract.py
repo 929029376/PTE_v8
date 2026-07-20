@@ -923,7 +923,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.EXPERT.ACTIVATION_THRESHOLD == pytest.approx(0.5)
     assert configured.MODEL.EXPERT.MAX_ACTIVE_SPECIALISTS == 2
     assert configured.MODEL.EXPERT.ACTIVATOR_TRAINED is True
-    assert configured.MODEL.EXPERT.USE_ACTIVATION_INFERENCE is True
+    assert configured.MODEL.EXPERT.USE_ACTIVATION_INFERENCE is False
     assert "MAX_ACTIVE" not in configured.MODEL.EXPERT
     assert "ROUTER_HIDDEN_DIM" not in configured.MODEL.EXPERT
     assert "TEMPORAL_MOMENTUM" not in configured.MODEL.EXPERT
@@ -932,14 +932,14 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "sparse_dispatch_balanced_v32_20260720/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_best.pth.tar")
+        "search_pursuit_v30_20260720/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_latest.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
 
 
-def test_canonical_dispatch_strategy_trains_only_input_driven_activation():
+def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
 
@@ -947,30 +947,30 @@ def test_canonical_dispatch_strategy_trains_only_input_driven_activation():
     update_config_from_file("experiments/pet_track/felt_pet_track.yaml", configured)
 
     assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 2400
-    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 1200
+    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 600
     assert configured.TRAIN.BATCH_SIZE == 12
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "sparse_dispatch_balanced_v32_20260720/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_best.pth.tar")
-    assert configured.TRAIN.STAGE == "dispatch"
-    assert configured.TRAIN.EXPERT_PHASE == "dispatch"
-    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1, 2, 3, 4]
+        "search_pursuit_v30_20260720/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_latest.pth.tar")
+    assert configured.TRAIN.STAGE == "pursuit"
+    assert configured.TRAIN.EXPERT_PHASE == "pursuit"
+    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1]
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
-    assert configured.DATA.PURSUIT.ENABLE is False
+    assert configured.DATA.PURSUIT.ENABLE is True
     assert configured.DATA.PURSUIT.WINDOW_LENGTH == 8
     assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
-    assert configured.DATA.PURSUIT.TRANSITION_PROBABILITY == pytest.approx(0.5)
-    assert configured.DATA.PURSUIT.REAPPEAR_PROBABILITY == pytest.approx(0.25)
+    assert configured.DATA.PURSUIT.TRANSITION_PROBABILITY == pytest.approx(0.0)
+    assert configured.DATA.PURSUIT.REAPPEAR_PROBABILITY == pytest.approx(0.0)
     assert configured.DATA.SEARCH.FACTOR == 4.0
     assert configured.DATA.SEARCH.CENTER_JITTER == pytest.approx(1.5)
     assert configured.DATA.SEARCH.MOTION_CENTER_JITTER_MULTIPLIER == pytest.approx(
         2.5)
     assert configured.DATA.SEARCH.PRECISION_SCALE_MULTIPLIER == pytest.approx(
         1.75)
-    assert configured.TRAIN.MIN_EPOCH == 6
+    assert configured.TRAIN.MIN_EPOCH == 10
     assert configured.TRAIN.EPOCH == 30
     assert configured.TRAIN.REFINE_MAX_EPOCH == 12
     assert configured.TRAIN.LR == 0.00001
@@ -1020,24 +1020,25 @@ def test_canonical_dispatch_strategy_trains_only_input_driven_activation():
     assert configured.MODEL.SRBT.CONTROLLER.THETA_PRESENT == 0.70
     assert configured.MODEL.SRBT.CONTROLLER.ABSENT_FRAMES == 4
     assert configured.TEST.POLICY_MODE == "stateful"
-    assert configured.TRAIN.SAVE_EPOCHS == [10, 20, 30]
+    assert configured.TRAIN.SAVE_EPOCHS == []
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is True
     assert configured.TRAIN.BEST_LOADER == "val"
-    assert configured.TRAIN.BEST_METRIC == "Activation/macro_f1"
+    assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_1"
     assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
     assert configured.TRAIN.SPECIALIST_MIN_DELTA == 0.02
     assert configured.TRAIN.GENERALIST_MAX_DROP == 0.005
 
 
-def test_supervisor_uses_balanced_sparse_dispatch_v32_run_directory():
+def test_supervisor_uses_causal_motion_v33_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "sparse_dispatch_balanced_v32_20260720" in supervisor
+    assert "causal_motion_v33_20260721" in supervisor
+    assert "sparse_dispatch_balanced_v32_20260720" not in supervisor
     assert "sparse_dispatch_v31_20260720" not in supervisor
     assert "multilabel_specialists_v29_20260720" not in supervisor
     assert "multilabel_specialists_v28_20260719" not in supervisor
@@ -1060,7 +1061,7 @@ def test_supervisor_uses_balanced_sparse_dispatch_v32_run_directory():
     assert "--nproc_per_node 2" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "sparse_dispatch_balanced_v32_20260720/logs && exec") == 2
+        "causal_motion_v33_20260721/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

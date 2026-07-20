@@ -1592,7 +1592,7 @@ def test_refine_best_uses_stage1_checkpoint_reference():
     assert saved == ["best_stage2"]
 
 
-def test_dispatch_experiment_defers_sequence_validation_until_activator_best():
+def test_causal_motion_experiment_defers_full_sequence_validation():
     assert default_cfg.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert default_cfg.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert default_cfg.TRAIN.BEST_LOADER == "val"
@@ -1603,15 +1603,17 @@ def test_dispatch_experiment_defers_sequence_validation_until_activator_best():
         .read_text(encoding="utf-8")
     )
 
-    assert experiment["TRAIN"]["EXPERT_PHASE"] == "dispatch"
+    assert experiment["TRAIN"]["EXPERT_PHASE"] == "pursuit"
+    assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [1]
+    assert experiment["DATA"]["PURSUIT"]["ENABLE"] is True
     assert experiment["TRAIN"]["SEQUENCE_VAL_ENABLE"] is False
-    assert experiment["TRAIN"]["MIN_EPOCH"] == 6
+    assert experiment["TRAIN"]["MIN_EPOCH"] == 10
     assert experiment["TRAIN"]["EPOCH"] == 30
     assert experiment["TRAIN"]["REFINE_MAX_EPOCH"] == 12
     assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == []
     assert experiment["TRAIN"][
         "SEQUENCE_VAL_TRAIN_IOU_THRESHOLD"] == pytest.approx(0.0)
-    assert experiment["TRAIN"]["SAVE_EPOCHS"] == [10, 20, 30]
+    assert experiment["TRAIN"]["SAVE_EPOCHS"] == []
     assert experiment["TRAIN"]["SPECIALIST_GATE_ENABLE"] is False
     assert experiment["TRAIN"]["SPECIALIST_MIN_COUNT"] == 100
     assert experiment["TRAIN"]["SPECIALIST_MIN_DELTA"] == pytest.approx(0.02)
@@ -1623,9 +1625,9 @@ def test_dispatch_experiment_defers_sequence_validation_until_activator_best():
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
     assert experiment["TRAIN"]["BEST_LOADER"] == "val"
-    assert experiment["TRAIN"]["BEST_METRIC"] == "Activation/macro_f1"
+    assert experiment["TRAIN"]["BEST_METRIC"] == "Expert/train_iou_1"
     assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
-    assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is True
+    assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is False
 
 
 def test_sequence_val_best_disables_incompatible_batch_val_loader():
