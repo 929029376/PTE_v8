@@ -1,6 +1,7 @@
 import inspect
 from types import SimpleNamespace
 
+import pytest
 import torch
 from easydict import EasyDict as edict
 
@@ -85,11 +86,15 @@ def _cfg(srbt_enabled=True, expert_enabled=False):
             "ENABLE": True,
             "DEFAULT": "generalist",
             "NAMES": [
-                "generalist", "motion_fm", "small_target_st",
+                "generalist", "motion_fm", "precision_refiner",
                 "visibility_foc_ov", "discrimination_bi",
             ],
         }
-    return edict({"MODEL": model, "TRAIN": {}})
+    return edict({
+        "MODEL": model,
+        "TRAIN": {},
+        "DATA": {"SEARCH": {"SIZE": 16}},
+    })
 
 
 def _model(srbt_enabled=True, expert_enabled=False):
@@ -154,12 +159,214 @@ def test_rgb_identity_tokens_use_only_rgb_patch_paths():
     assert model.rgb_identity_tokens(rgb, template=False).shape == (2, 4, 8)
 
 
-def test_all_expert_outputs_are_returned_inside_model_forward():
+def test_shared_model_forward_returns_four_shared_expert_outputs():
     model = _model(expert_enabled=True)
     output = model(*_images(batch=1))
 
+    assert tuple(output["expert_outputs"]) == tuple(model.shared_expert_names)
+    assert len(output["expert_outputs"]) == 4
+
+
+def test_inference_presence_gate_uses_visibility_expert_response():
+    class CaptureGate(torch.nn.Module):
+        def forward(self, pooled_feature, response_stats):
+            self.response_stats = response_stats.detach().clone()
+            return torch.zeros(
+                pooled_feature.shape[0], 2, device=pooled_feature.device)
+
+    model = _model(expert_enabled=True)
+    model.visibility_gate = CaptureGate()
+
+    def controlled_forward_head(
+            cat_feature, gt_score_map=None, training_expert_ids=None):
+        batch = cat_feature.shape[0]
+        general = {
+            "score_map": torch.zeros(batch, 1, 2, 2),
+            "pred_boxes": torch.full((batch, 1, 4), 0.5),
+        }
+        visibility = {
+            "score_map": torch.tensor(
+                [[[[0.1, 0.2], [0.3, 0.9]]]]).expand(batch, -1, -1, -1),
+            "pred_boxes": torch.full((batch, 1, 4), 0.5),
+        }
+        expert_outputs = {
+            name: dict(general) for name in model.shared_expert_names
+        }
+        expert_outputs["visibility_foc_ov"] = visibility
+        output = dict(general)
+        output["expert_outputs"] = expert_outputs
+        return output
+
+    model.forward_head = controlled_forward_head
+    output = model(*_images(batch=1))
+    response = output["expert_outputs"][
+        "visibility_foc_ov"]["score_map"].flatten(1)
+    expected = torch.stack((
+        response.max(dim=-1).values,
+        response.mean(dim=-1),
+        response.std(dim=-1, unbiased=False),
+    ), dim=-1)
+
+    assert torch.allclose(model.visibility_gate.response_stats, expected)
+
+
+def test_precision_expert_uses_detached_shared_proposal_and_trains_independently(
+        monkeypatch):
+    model = _model(expert_enabled=True)
+    shared_grad_modes = []
+    small_grad_modes = []
+    shared_forward = model._run_backbone
+    small_forward = model.small_target_expert.forward
+
+    def counted_shared(*args, **kwargs):
+        shared_grad_modes.append(torch.is_grad_enabled())
+        return shared_forward(*args, **kwargs)
+
+    def counted_small(*args, **kwargs):
+        small_grad_modes.append(torch.is_grad_enabled())
+        return small_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_run_backbone", counted_shared)
+    monkeypatch.setattr(model.small_target_expert, "forward", counted_small)
+
+    output = model(
+        *_images(batch=1), training_expert_ids=torch.tensor([2]))
+    loss = output["score_map"].mean() + output["pred_boxes"].mean()
+    loss.backward()
+
+    assert "expert_owner_id" not in output
+    assert shared_grad_modes == [False]
+    assert small_grad_modes == [True]
+    assert "upstream_pred_boxes" in output
+    assert output["score_map"].shape[-2:] == (4, 4)
+    assert all(
+        parameter.grad is not None
+        for parameter in model.small_target_expert.parameters())
+    assert all(
+        parameter.grad is not None
+        for parameter in model.proposal_adapters[
+            "precision_refiner"].parameters())
+    assert all(
+        parameter.grad is None
+        for module in (
+            model.backbone, model.memory, model.box_head,
+            model.expert_fusion, model.visibility_gate,
+        )
+        for parameter in module.parameters())
+
+
+def test_inference_runs_shared_and_small_paths_once_and_returns_five_candidates(
+        monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    static_zi = torch.randn(1, 3, 16, 16)
+    static_ze = torch.randn(1, 3, 16, 16)
+    dynamic_zi = torch.randn(1, 1, 3, 16, 16)
+    dynamic_ze = torch.randn(1, 1, 3, 16, 16)
+    xi = torch.randn(1, 1, 3, 16, 16)
+    xe = torch.randn(1, 1, 3, 16, 16)
+
+    with torch.no_grad():
+        encoded = model._encode_runtime_templates(
+            static_zi, static_ze, dynamic_zi, dynamic_ze)
+        shared_only = model._forward_srbt(
+            encoded[0], encoded[1], xi, xe,
+            encoded_templates=encoded)
+
+    calls = {"shared": 0, "small": 0}
+    shared_forward = model._run_encoded_backbone
+    small_forward = model.small_target_expert.forward
+
+    def counted_shared(*args, **kwargs):
+        calls["shared"] += 1
+        return shared_forward(*args, **kwargs)
+
+    def counted_small(*args, **kwargs):
+        calls["small"] += 1
+        assert torch.equal(args[0], static_zi)
+        assert torch.equal(args[1], static_ze)
+        return small_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_run_encoded_backbone", counted_shared)
+    monkeypatch.setattr(model.small_target_expert, "forward", counted_small)
+
+    with torch.no_grad():
+        output = model.inference(
+            static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe)
+
+    assert calls == {"shared": 1, "small": 1}
     assert tuple(output["expert_outputs"]) == tuple(model.expert_names)
-    assert len(output["expert_outputs"]) == 5
+    assert output["expert_outputs"]["precision_refiner"][
+        "score_map"].shape[-2:] == (4, 4)
+    for name in model.shared_expert_names:
+        for key, value in shared_only["expert_outputs"][name].items():
+            assert torch.equal(output["expert_outputs"][name][key], value)
+    for key, value in shared_only.items():
+        if key == "expert_outputs":
+            continue
+        if torch.is_tensor(value):
+            assert torch.equal(output[key], value)
+        elif isinstance(value, dict):
+            assert value.keys() == output[key].keys()
+            for nested_key, nested_value in value.items():
+                assert torch.equal(output[key][nested_key], nested_value)
+        else:
+            assert output[key] == value
+
+
+def test_expert_inference_rejects_encoded_static_templates_before_shared_forward(
+        monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    static_zi = model.backbone._z_feat(torch.randn(1, 1, 3, 16, 16))
+    static_ze = model.backbone._z_feat(torch.randn(1, 1, 3, 16, 16))
+    calls = {"shared": 0}
+    shared_forward = model._run_encoded_backbone
+
+    def counted_shared(*args, **kwargs):
+        calls["shared"] += 1
+        return shared_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model, "_run_encoded_backbone", counted_shared)
+    with pytest.raises(ValueError, match="requires raw static RGB/event"):
+        model.inference(
+            static_zi, static_ze,
+            torch.randn(1, 3, 16, 16), torch.randn(1, 3, 16, 16),
+            torch.randn(1, 3, 16, 16), torch.randn(1, 3, 16, 16),
+        )
+    assert calls == {"shared": 0}
+
+
+def test_inference_reuses_cached_independent_template_features(monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    static_zi = torch.randn(1, 3, 16, 16)
+    static_ze = torch.randn(1, 3, 16, 16)
+    cached = model.small_target_expert.encode_template(static_zi, static_ze)
+    calls = {"full": 0, "cached": 0}
+    full_forward = model.small_target_expert.forward
+    cached_forward = model.small_target_expert.track_with_template
+
+    def counted_full(*args, **kwargs):
+        calls["full"] += 1
+        return full_forward(*args, **kwargs)
+
+    def counted_cached(*args, **kwargs):
+        calls["cached"] += 1
+        assert args[0] is cached
+        return cached_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.small_target_expert, "forward", counted_full)
+    monkeypatch.setattr(
+        model.small_target_expert, "track_with_template", counted_cached)
+    with torch.no_grad():
+        output = model.inference(
+            static_zi, static_ze,
+            torch.randn(1, 3, 16, 16), torch.randn(1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            small_template_features=cached,
+        )
+
+    assert calls == {"full": 0, "cached": 1}
+    assert "precision_refiner" in output["expert_outputs"]
 
 
 def test_training_forward_runs_redetect_only_when_observations_are_requested():

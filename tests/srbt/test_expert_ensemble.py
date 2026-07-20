@@ -23,9 +23,9 @@ def test_four_expert_cluster_rejects_confident_spatial_outlier():
         last_box=torch.tensor([10.0, 10.0, 20.0, 20.0]),
     )
 
-    assert result.retained_ids == (0, 1, 2, 3)
+    assert result.retained_ids == (0,)
     assert result.weights[4].item() == 0.0
-    assert result.box[:2].tolist() == pytest.approx([10.25, 10.25], abs=0.3)
+    assert torch.equal(result.box, boxes[0])
 
 
 def test_quality_uses_declared_exponents_exactly():
@@ -42,10 +42,53 @@ def test_quality_uses_declared_exponents_exactly():
 
     expected = peaks.pow(0.35) * psr.pow(0.25)
     assert torch.allclose(result.quality, expected, atol=1e-6)
-    assert result.retained_ids == (0, 1, 2, 3, 4)
+    assert result.retained_ids == (4,)
+    assert torch.equal(result.box, boxes[4])
 
 
-def test_zero_quality_falls_back_to_highest_response_peak():
+def test_uncertain_specialists_fall_back_to_exact_generalist_box():
+    boxes = torch.tensor([
+        [10.0, 10.0, 20.0, 20.0],
+        [35.0, 10.0, 20.0, 20.0],
+        [10.0, 35.0, 20.0, 20.0],
+        [35.0, 35.0, 20.0, 20.0],
+        [60.0, 60.0, 20.0, 20.0],
+    ])
+
+    result = fuse_expert_predictions(
+        boxes=boxes,
+        response_peaks=torch.tensor([0.80, 0.81, 0.79, 0.80, 0.82]),
+        response_psr=torch.full((5,), 0.8),
+        last_box=boxes[0],
+    )
+
+    assert result.retained_ids == (0,)
+    assert torch.equal(result.box, boxes[0])
+    assert torch.equal(result.weights, torch.tensor([1., 0., 0., 0., 0.]))
+
+
+def test_clearly_superior_specialist_is_selected_without_box_averaging():
+    boxes = torch.tensor([
+        [10.0, 10.0, 20.0, 20.0],
+        [11.0, 10.0, 20.0, 20.0],
+        [10.0, 11.0, 20.0, 20.0],
+        [11.0, 11.0, 20.0, 20.0],
+        [80.0, 80.0, 10.0, 10.0],
+    ])
+
+    result = fuse_expert_predictions(
+        boxes=boxes,
+        response_peaks=torch.tensor([0.55, 0.95, 0.60, 0.58, 0.99]),
+        response_psr=torch.tensor([0.55, 0.98, 0.60, 0.58, 0.99]),
+        last_box=boxes[0],
+    )
+
+    assert result.retained_ids == (1,)
+    assert torch.equal(result.box, boxes[1])
+    assert torch.equal(result.weights, torch.tensor([0., 1., 0., 0., 0.]))
+
+
+def test_zero_quality_falls_back_to_generalist():
     boxes = torch.tensor([
         [0.0, 0.0, 5.0, 5.0],
         [5.0, 5.0, 5.0, 5.0],
@@ -61,9 +104,9 @@ def test_zero_quality_falls_back_to_highest_response_peak():
         last_box=None,
     )
 
-    assert result.retained_ids == (1,)
-    assert torch.equal(result.box, boxes[1])
-    assert torch.equal(result.weights, torch.tensor([0., 1., 0., 0., 0.]))
+    assert result.retained_ids == (0,)
+    assert torch.equal(result.box, boxes[0])
+    assert torch.equal(result.weights, torch.tensor([1., 0., 0., 0., 0.]))
 
 
 def test_response_psr_is_finite_and_bounded_for_flat_maps():

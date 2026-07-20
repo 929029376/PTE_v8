@@ -1,15 +1,17 @@
 import argparse
-from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import _init_paths  # noqa: F401
 
-from lib.train.data.expert_ownership import build_sequence_record, write_manifest
+from lib.train.data.challenge_manifest import build_sequence_record, write_manifest
 from lib.train.data.felt_challenges import (
+    CHALLENGE_NAMES,
+    DEFAULT_AMBIGUITY_THRESHOLD,
     DEFAULT_MOTION_NORM,
     DEFAULT_RECOVERY_WINDOW,
     DEFAULT_SMALL_AREA_RATIO,
+    expert_supervision_mask,
 )
 from lib.train.data.image_loader import opencv_loader
 from lib.train.dataset.felt import Felt
@@ -37,17 +39,21 @@ def _initialize_worker(data_root, split, thresholds):
 
 
 def _build_worker_record(seq_id):
-    sequence_name = _WORKER_DATASET.sequence_list[seq_id]
-    record = build_sequence_record(
-        _WORKER_DATASET, seq_id, _WORKER_THRESHOLDS)
-    return sequence_name, record
+    return _build_record(_WORKER_DATASET, seq_id, _WORKER_THRESHOLDS)
+
+
+def _build_record(dataset, seq_id, thresholds):
+    sequence_name = dataset.sequence_list[seq_id]
+    try:
+        return sequence_name, build_sequence_record(dataset, seq_id, thresholds), None
+    except FileNotFoundError as error:
+        return sequence_name, None, str(error)
 
 
 def _iter_sequence_records(dataset, data_root, split, thresholds, workers):
     if workers == 1:
-        for seq_id, sequence_name in enumerate(dataset.sequence_list):
-            yield sequence_name, build_sequence_record(
-                dataset, seq_id, thresholds)
+        for seq_id in range(len(dataset.sequence_list)):
+            yield _build_record(dataset, seq_id, thresholds)
         return
 
     with ProcessPoolExecutor(
@@ -63,7 +69,7 @@ def _iter_sequence_records(dataset, data_root, split, thresholds, workers):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build deterministic frame-level FELT expert ownership")
+        description="Build deterministic frame-level FELT challenge labels")
     parser.add_argument(
         "--data-root", required=True,
         help="FELT root containing list1k.txt and sequence directories")
@@ -75,12 +81,14 @@ def parse_args():
         help="Destination JSON manifest path")
     parser.add_argument(
         "--workers", type=_positive_int, default=1,
-        help="Sequence workers; ownership remains deterministic")
+        help="Sequence workers; challenge labels remain deterministic")
     parser.add_argument("--small-area-ratio", type=float,
                         default=DEFAULT_SMALL_AREA_RATIO)
     parser.add_argument("--motion-norm", type=float,
                         default=DEFAULT_MOTION_NORM)
-    parser.add_argument("--ambiguity-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--ambiguity-threshold", type=float,
+        default=DEFAULT_AMBIGUITY_THRESHOLD)
     parser.add_argument("--recovery-window", type=int,
                         default=DEFAULT_RECOVERY_WINDOW)
     return parser.parse_args()
@@ -100,7 +108,9 @@ def main():
         split=args.split,
     )
     sequences = {}
-    owner_counts = Counter()
+    challenge_counts = {name: 0 for name in CHALLENGE_NAMES}
+    expert_counts = {expert_id: 0 for expert_id in range(5)}
+    skipped = 0
     records = _iter_sequence_records(
         dataset,
         args.data_root,
@@ -108,19 +118,34 @@ def main():
         thresholds,
         args.workers,
     )
-    for seq_id, (sequence_name, record) in enumerate(records):
+    for seq_id, (sequence_name, record, error) in enumerate(records):
+        if error is not None:
+            skipped += 1
+            print(f"[skip] {sequence_name}: {error}", flush=True)
+            continue
         sequences[sequence_name] = record
-        owner_counts.update(record["owners"])
+        attributes = record["attributes"]
+        frame_count = len(attributes[CHALLENGE_NAMES[0]])
+        for name in CHALLENGE_NAMES:
+            challenge_counts[name] += sum(attributes[name])
+        supervision = expert_supervision_mask(attributes)
+        for expert_id in range(5):
+            expert_counts[expert_id] += int(supervision[:, expert_id].sum())
         print(
             f"[{seq_id + 1}/{len(dataset.sequence_list)}] "
-            f"{sequence_name}: {len(record['owners'])} frames",
+            f"{sequence_name}: {frame_count} frames",
             flush=True,
         )
 
     write_manifest(args.output, sequences, thresholds)
-    counts = " ".join(
-        f"expert_{owner}={owner_counts.get(owner, 0)}" for owner in range(5))
-    print(f"Wrote {args.output}: {counts}")
+    challenge_summary = " ".join(
+        f"{name}={challenge_counts[name]}" for name in CHALLENGE_NAMES)
+    expert_summary = " ".join(
+        f"expert_{expert_id}={expert_counts[expert_id]}"
+        for expert_id in range(5))
+    print(
+        f"Wrote {args.output}: {challenge_summary} {expert_summary} "
+        f"skipped={skipped}")
 
 
 if __name__ == "__main__":

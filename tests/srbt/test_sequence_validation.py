@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -19,16 +21,32 @@ from lib.test.evaluation.tracker import Tracker
 from lib.config.pet_track.config import cfg as default_cfg
 from lib.train.admin.stats import AverageMeter
 from lib.train.sequence_validation import (
+    SMALL_TARGET_DIAGNOSTIC_KEYS,
     expert_validation_sums,
     refine_checkpoint_is_accepted,
     recovery_diagnostic_sums,
     run_felt_sequence_validation,
     sequence_validation_due,
+    small_target_diagnostic_sums,
     specialist_passes,
 )
 from lib.train.train_script import _select_epoch_loaders
 from lib.train.trainers.base_trainer import BaseTrainer
 from lib.train.trainers.ltr_trainer import LTRTrainer
+
+
+def _challenge_attributes(count, **active_frames):
+    attributes = {
+        name: [False] * count
+        for name in (
+            "small_target", "motion", "low_light", "recovery",
+            "ambiguity", "deformation", "absent",
+        )
+    }
+    for name, frame_ids in active_frames.items():
+        for frame_id in frame_ids:
+            attributes[name][frame_id] = True
+    return attributes
 
 
 def _write_felt_sequence(train_root, name, presence):
@@ -180,7 +198,7 @@ def test_recovery_diagnostics_are_posthoc_and_aggregation_ready():
     assert sums["RECOVERY_TIME_SUM"] == pytest.approx(0.4)
 
 
-def test_expert_validation_sums_use_visible_owner_frames_only():
+def test_expert_validation_sums_use_visible_challenge_frames_only():
     ground_truth = np.array([
         [0.0, 0.0, 10.0, 10.0],
         [10.0, 10.0, 10.0, 10.0],
@@ -197,7 +215,8 @@ def test_expert_validation_sums_use_visible_owner_frames_only():
         ensemble_boxes=ensemble_boxes,
         ground_truth_boxes=ground_truth,
         target_visible=[1, 1, 0, 1],
-        owner_ids=[0, 2, 3, 2],
+        challenge_attributes=_challenge_attributes(
+            4, small_target=(1, 3), absent=(2,)),
     )
 
     assert sums["EXPERT_2_COUNT"] == 2
@@ -206,6 +225,183 @@ def test_expert_validation_sums_use_visible_owner_frames_only():
     assert sums["EXPERT_2_GENERALIST_IOU_SUM"] == pytest.approx(0.0)
     assert sums["EXPERT_2_ENSEMBLE_IOU_SUM"] == pytest.approx(2.0)
     assert sums["EXPERT_3_COUNT"] == 0
+
+
+def test_expert_validation_counts_compound_frame_for_all_relevant_experts():
+    ground_truth = np.array([[10.0, 10.0, 10.0, 10.0]])
+    expert_boxes = np.repeat(ground_truth[:, None, :], 5, axis=1)
+    attributes = {
+        "small_target": [True],
+        "motion": [True],
+        "low_light": [False],
+        "recovery": [False],
+        "ambiguity": [False],
+        "deformation": [False],
+        "absent": [False],
+    }
+
+    sums = expert_validation_sums(
+        expert_boxes=expert_boxes,
+        ensemble_boxes=ground_truth,
+        ground_truth_boxes=ground_truth,
+        target_visible=[1],
+        challenge_attributes=attributes,
+    )
+
+    assert sums["EXPERT_1_COUNT"] == 1
+    assert sums["EXPERT_2_COUNT"] == 1
+    assert sums["EXPERT_0_COUNT"] == 0
+
+
+def test_small_target_diagnostics_separate_crop_miss_from_in_crop_failure():
+    ground_truth = np.array([
+        [10.0, 10.0, 4.0, 4.0],
+        [20.0, 20.0, 4.0, 4.0],
+        [80.0, 80.0, 4.0, 4.0],
+        [30.0, 30.0, 8.0, 8.0],
+    ])
+    expert_boxes = np.repeat(ground_truth[:, None, :], 5, axis=1)
+    expert_boxes[1, 2] = [50.0, 50.0, 4.0, 4.0]
+    expert_boxes[2, 2] = [0.0, 0.0, 4.0, 4.0]
+    search_trace = [
+        {
+            "frame_id": 0,
+            "is_initial": True,
+            "search_state": ground_truth[0].tolist(),
+            "crop_bounds_xyxy": [8.0, 8.0, 16.0, 16.0],
+            "resize_factor": 4.0,
+            "expert_peaks": [1.0] * 5,
+            "expert_psr": [1.0] * 5,
+        },
+        {
+            "frame_id": 1,
+            "search_state": [18.0, 18.0, 8.0, 8.0],
+            "crop_bounds_xyxy": [16.0, 16.0, 32.0, 32.0],
+            "resize_factor": 4.0,
+            "previous_action": "suspect",
+            "presence_score": 0.42,
+            "controller_output_score": 0.0,
+            "controller_weak_streak": 4,
+            "recovery_attempted": True,
+            "recovery_confirmed": False,
+            "recovery_max_identity": 0.61,
+            "recovery_max_localization": 0.54,
+            "expert_peaks": [0.9, 0.8, 0.05, 0.7, 0.6],
+            "expert_psr": [1.0, 1.0, 0.2, 1.0, 1.0],
+        },
+        {
+            "frame_id": 2,
+            "search_state": [10.0, 10.0, 8.0, 8.0],
+            "crop_bounds_xyxy": [6.0, 6.0, 22.0, 22.0],
+            "resize_factor": 4.0,
+            "expert_peaks": [0.9, 0.8, 0.8, 0.7, 0.6],
+            "expert_psr": [1.0] * 5,
+        },
+        {
+            "frame_id": 3,
+            "search_state": [28.0, 28.0, 12.0, 12.0],
+            "crop_bounds_xyxy": [24.0, 24.0, 44.0, 44.0],
+            "resize_factor": 2.0,
+            "expert_peaks": [0.9] * 5,
+            "expert_psr": [1.0] * 5,
+        },
+    ]
+
+    sums, records = small_target_diagnostic_sums(
+        search_trace=search_trace,
+        expert_boxes=expert_boxes,
+        ground_truth_boxes=ground_truth,
+        target_visible=[1, 1, 1, 1],
+        challenge_attributes=_challenge_attributes(
+            4, small_target=(0, 1, 2)),
+        sequence_name="diagnostic_sequence",
+        confidence_threshold=0.25,
+    )
+
+    assert sums["SMALL_TARGET_COUNT"] == 2
+    assert sums["SMALL_TARGET_CENTER_IN_CROP_HITS"] == 1
+    assert sums["SMALL_TARGET_FULL_BOX_IN_CROP_HITS"] == 1
+    assert sums["SMALL_TARGET_VISIBLE_FRACTION_SUM"] == pytest.approx(1.0)
+    assert sums["SMALL_TARGET_TARGET_WIDTH_PX_SUM"] == pytest.approx(32.0)
+    assert sums["SMALL_TARGET_TARGET_HEIGHT_PX_SUM"] == pytest.approx(32.0)
+    assert sums["SMALL_TARGET_INSIDE_COUNT"] == 1
+    assert sums["SMALL_TARGET_OUTSIDE_COUNT"] == 1
+    assert sums["SMALL_TARGET_IN_WINDOW_LOW_CONFIDENCE_COUNT"] == 1
+    assert sums["SMALL_TARGET_CROP_MISS_COUNT"] == 1
+    assert [record["frame_index"] for record in records] == [1, 2]
+    assert [record["failure_bucket"] for record in records] == [
+        "in_window_low_confidence",
+        "crop_miss",
+    ]
+    assert records[0]["target_width_px"] == pytest.approx(16.0)
+    assert records[0]["state_iou"] == pytest.approx(0.25)
+    assert records[0]["specialist_iou"] == pytest.approx(0.0)
+    assert records[0]["full_box_in_crop"] is True
+    assert records[0]["previous_action"] == "suspect"
+    assert records[0]["presence_score"] == pytest.approx(0.42)
+    assert records[0]["controller_output_score"] == pytest.approx(0.0)
+    assert records[0]["controller_weak_streak"] == 4
+    assert records[0]["recovery_attempted"] is True
+    assert records[0]["recovery_confirmed"] is False
+    assert records[0]["recovery_max_identity"] == pytest.approx(0.61)
+    assert records[0]["recovery_max_localization"] == pytest.approx(0.54)
+    assert records[1]["center_in_crop"] is False
+    assert records[1]["visible_fraction"] == pytest.approx(0.0)
+
+
+def test_small_target_diagnostics_reject_frame_misalignment():
+    with pytest.raises(ValueError, match="frame-aligned"):
+        small_target_diagnostic_sums(
+            search_trace=[{}],
+            expert_boxes=np.zeros((2, 5, 4)),
+            ground_truth_boxes=np.zeros((2, 4)),
+            target_visible=[1, 1],
+            challenge_attributes=_challenge_attributes(
+                2, small_target=(0, 1)),
+        )
+
+
+def test_small_target_diagnostic_records_are_strict_json():
+    ground_truth = np.array([[10.0, 10.0, 4.0, 4.0]])
+    expert_boxes = np.repeat(ground_truth[:, None, :], 5, axis=1)
+    _, records = small_target_diagnostic_sums(
+        search_trace=[{
+            "frame_id": 0,
+            "search_state": [8.0, 8.0, 8.0, 8.0],
+            "crop_bounds_xyxy": [4.0, 4.0, 20.0, 20.0],
+            "resize_factor": 4.0,
+            "expert_peaks": [],
+            "expert_psr": [],
+        }],
+        expert_boxes=expert_boxes,
+        ground_truth_boxes=ground_truth,
+        target_visible=[1],
+        challenge_attributes=_challenge_attributes(1, small_target=(0,)),
+    )
+
+    assert records[0]["specialist_score"] is None
+    assert records[0]["specialist_psr"] is None
+    json.dumps(records[0], allow_nan=False)
+
+
+def test_small_target_diagnostics_reject_shifted_frame_ids():
+    ground_truth = np.array([[10.0, 10.0, 4.0, 4.0]])
+    expert_boxes = np.repeat(ground_truth[:, None, :], 5, axis=1)
+
+    with pytest.raises(ValueError, match="frame_id"):
+        small_target_diagnostic_sums(
+            search_trace=[{
+                "frame_id": 1,
+                "search_state": [8.0, 8.0, 8.0, 8.0],
+                "crop_bounds_xyxy": [4.0, 4.0, 20.0, 20.0],
+                "resize_factor": 4.0,
+            }],
+            expert_boxes=expert_boxes,
+            ground_truth_boxes=ground_truth,
+            target_visible=[1],
+            challenge_attributes=_challenge_attributes(
+                1, small_target=(0,)),
+        )
 
 
 def test_specialist_gate_requires_count_and_delta():
@@ -311,6 +507,85 @@ def test_test_tracker_uses_injected_network_without_building_or_loading(monkeypa
     assert not tracker.network.training
     assert tracker.preprocessor.mean.device == network.weight.device
     assert tracker.output_window.device == network.weight.device
+
+
+def test_search_diagnostics_are_frame_aligned_and_detached():
+    tracker = pet_tracker_module.PETTrack.__new__(pet_tracker_module.PETTrack)
+    tracker.params = SimpleNamespace(search_factor=4.0, search_size=32)
+    tracker.visibility_controller = SimpleNamespace(
+        theta_present=0.7,
+        theta_recover=0.75,
+        _weak_streak=4,
+        _verify_streak=0,
+        _stable_visible=0,
+    )
+    tracker._last_redetect_conf = 0.37
+    tracker._reset_srbt_sequence_state()
+
+    tracker._record_search_diagnostic(
+        search_state=[10.0, 20.0, 4.0, 6.0],
+        resize_factor=1.6,
+        action="initialize",
+        local_candidate=None,
+        is_initial=True,
+        frame_id=0,
+    )
+    tracker._record_search_diagnostic(
+        search_state=[11.0, 21.0, 4.0, 6.0],
+        resize_factor=1.6,
+        action="track",
+        local_candidate={
+            "score_peak": 0.7,
+            "presence_score": torch.tensor([0.42], requires_grad=True),
+            "expert_peaks": [0.1, 0.2, 0.3, 0.4, 0.5],
+            "expert_psr": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "retained_expert_ids": (2, 4),
+            "ensemble_weights": [0.0, 0.0, 0.6, 0.0, 0.4],
+        },
+        previous_action="suspect",
+        controller_output_score=0.0,
+        recovery_attempted=True,
+        recovery_confirmed=False,
+        recovery_max_identity=0.61,
+        recovery_max_localization=0.54,
+        frame_id=1,
+    )
+
+    trace = tracker.get_search_diagnostics()
+    assert len(trace) == 2
+    assert trace[0]["frame_id"] == 0
+    assert trace[0]["is_initial"] is True
+    assert trace[0]["search_state"] == [10.0, 20.0, 4.0, 6.0]
+    assert trace[0]["crop_bounds_xyxy"] == [2.0, 13.0, 22.0, 33.0]
+    assert trace[0]["resize_factor"] == pytest.approx(1.6)
+    assert trace[0]["action"] == "initialize"
+    assert trace[0]["presence_score"] is None
+    assert trace[0]["expert_peaks"] == []
+    assert trace[0]["expert_psr"] == []
+    assert trace[0]["retained_expert_ids"] == []
+    assert trace[0]["ensemble_weights"] == []
+    assert trace[1]["frame_id"] == 1
+    assert trace[1]["crop_bounds_xyxy"] == [3.0, 14.0, 23.0, 34.0]
+    assert trace[1]["expert_peaks"] == pytest.approx(
+        [0.1, 0.2, 0.3, 0.4, 0.5])
+    assert trace[1]["expert_psr"] == pytest.approx(
+        [1.0, 2.0, 3.0, 4.0, 5.0])
+    assert trace[1]["retained_expert_ids"] == [2, 4]
+    assert trace[1]["ensemble_weights"] == pytest.approx(
+        [0.0, 0.0, 0.6, 0.0, 0.4])
+    assert trace[1]["presence_score"] == pytest.approx(0.42)
+    assert trace[1]["previous_action"] == "suspect"
+    assert trace[1]["controller_output_score"] == pytest.approx(0.0)
+    assert trace[1]["theta_present"] == pytest.approx(0.7)
+    assert trace[1]["theta_recover"] == pytest.approx(0.75)
+    assert trace[1]["controller_weak_streak"] == 4
+    assert trace[1]["recovery_attempted"] is True
+    assert trace[1]["recovery_confirmed"] is False
+    assert trace[1]["recovery_max_identity"] == pytest.approx(0.61)
+    assert trace[1]["recovery_max_localization"] == pytest.approx(0.54)
+    assert trace[1]["redetect_confidence"] == pytest.approx(0.37)
+    trace[1]["search_state"][0] = -100.0
+    assert tracker.get_search_diagnostics()[1]["search_state"][0] == 11.0
 
 
 def test_sequence_validation_reuses_test_loop_without_future_ground_truth(capsys):
@@ -430,6 +705,36 @@ def test_sequence_validation_aggregates_fixed_manifest_expert_outputs():
         def get_expert_diagnostics():
             return expert_trace.copy()
 
+        @staticmethod
+        def get_search_diagnostics():
+            return [
+                    {
+                        "frame_id": 0,
+                        "is_initial": True,
+                    "search_state": [0.0, 0.0, 10.0, 10.0],
+                    "crop_bounds_xyxy": [-20.0, -20.0, 30.0, 30.0],
+                    "resize_factor": 6.4,
+                    "expert_peaks": [],
+                    "expert_psr": [],
+                },
+                    {
+                        "frame_id": 1,
+                        "search_state": [8.0, 8.0, 14.0, 14.0],
+                    "crop_bounds_xyxy": [0.0, 0.0, 40.0, 40.0],
+                    "resize_factor": 8.0,
+                    "expert_peaks": [0.1, 0.2, 0.8, 0.4, 0.5],
+                    "expert_psr": [1.0, 2.0, 3.0, 4.0, 5.0],
+                },
+                    {
+                        "frame_id": 2,
+                        "search_state": [18.0, 18.0, 14.0, 14.0],
+                    "crop_bounds_xyxy": [10.0, 10.0, 50.0, 50.0],
+                    "resize_factor": 8.0,
+                    "expert_peaks": [0.1, 0.2, 0.7, 0.4, 0.5],
+                    "expert_psr": [1.0, 2.0, 2.5, 4.0, 5.0],
+                },
+            ]
+
     class EvaluatorStub:
         @staticmethod
         def _track_sequence(_tracker, sequence, _init_info):
@@ -450,9 +755,12 @@ def test_sequence_validation_aggregates_fixed_manifest_expert_outputs():
         sequences=[SequenceStub()],
         evaluator=EvaluatorStub(),
         tracker_factory=lambda _network, _params: TrackerStub(),
-        ownership_manifest={
+        challenge_manifest={
             "sequences": {
-                "validation_sequence": {"owners": [0, 2, 2]},
+                "validation_sequence": {
+                    "attributes": _challenge_attributes(
+                        3, small_target=(1, 2)),
+                },
             },
         },
     )
@@ -462,6 +770,33 @@ def test_sequence_validation_aggregates_fixed_manifest_expert_outputs():
     assert metrics["EXPERT_2_IOU_SUM"] == pytest.approx(2.0)
     assert metrics["EXPERT_2_GENERALIST_IOU_SUM"] == pytest.approx(0.0)
     assert metrics["EXPERT_2_ENSEMBLE_IOU_SUM"] == pytest.approx(2.0)
+    assert metrics["SMALL_TARGET_COUNT"] == 2
+    assert metrics["SMALL_TARGET_CENTER_IN_CROP_HITS"] == 2
+    assert len(metrics["SMALL_TARGET_RECORDS"]) == 2
+    assert [record["frame_index"] for record in metrics[
+        "SMALL_TARGET_RECORDS"]] == [1, 2]
+
+    forced_motion_metrics = run_felt_sequence_validation(
+        torch.nn.Linear(1, 1),
+        cfg,
+        sequences=[SequenceStub()],
+        evaluator=EvaluatorStub(),
+        tracker_factory=lambda _network, _params: TrackerStub(),
+        challenge_manifest={
+            "sequences": {
+                "validation_sequence": {
+                    "attributes": _challenge_attributes(
+                        3, small_target=(1, 2)),
+                },
+            },
+        },
+        forced_expert_id=1,
+        policy_mode="local",
+        log_prefix="ExpertVal",
+    )
+
+    assert forced_motion_metrics["SMALL_TARGET_COUNT"] == 0
+    assert forced_motion_metrics["SMALL_TARGET_RECORDS"] == []
 
 
 def test_sequence_validation_skips_invalid_initial_bbox_without_looking_ahead(
@@ -528,6 +863,49 @@ def test_sequence_validation_skips_invalid_initial_bbox_without_looking_ahead(
     assert "SequenceVal rank 0: 1/1 valid_initial" in output
 
 
+def test_sequence_validation_skips_sequence_missing_from_challenge_manifest(
+        capsys):
+    class MissingManifestSequence:
+        name = "missing_manifest"
+        ground_truth_rect = np.array([[1.0, 1.0, 10.0, 10.0]])
+        target_visible = np.ones(1, dtype=np.uint8)
+
+        @staticmethod
+        def init_info():
+            return {"init_bbox": [1.0, 1.0, 10.0, 10.0]}
+
+    class EvaluatorStub:
+        @staticmethod
+        def _track_sequence(*_args, **_kwargs):
+            raise AssertionError(
+                "manifest-missing sequence must not reach Test tracking")
+
+    cfg = SimpleNamespace(TEST=SimpleNamespace(
+        TEMPLATE_FACTOR=2.0,
+        TEMPLATE_SIZE=128,
+        SEARCH_FACTOR=5.0,
+        SEARCH_SIZE=320,
+    ))
+
+    metrics = run_felt_sequence_validation(
+        torch.nn.Linear(1, 1),
+        cfg,
+        sequences=[MissingManifestSequence()],
+        evaluator=EvaluatorStub(),
+        tracker_factory=lambda _network, _params: object(),
+        challenge_manifest={"sequences": {}},
+        forced_expert_id=1,
+        policy_mode="local",
+        log_prefix="ExpertVal",
+    )
+
+    assert metrics["SEQUENCE_COUNT"] == 0
+    assert (
+        "ExpertVal skipped missing challenge manifest: missing_manifest"
+        in capsys.readouterr().out
+    )
+
+
 @pytest.mark.parametrize(
     ("epoch", "expected"),
     [
@@ -547,7 +925,91 @@ def test_sequence_validation_schedule(epoch, expected):
     assert sequence_validation_due(epoch, schedule) is expected
 
 
-def test_sequence_validation_failure_keeps_completed_epoch_checkpoint(tmp_path):
+@pytest.mark.parametrize(
+    ("epoch", "expected_calls"),
+    [
+        (30, [{"forced_expert_id": 1, "policy_mode": "local"}]),
+        (31, []),
+        (60, [{"forced_expert_id": 4, "policy_mode": "local"}]),
+        (160, [{"forced_expert_id": 2, "policy_mode": "local"}]),
+        (210, [
+            {"forced_expert_id": 3, "policy_mode": "stateful"},
+            {},
+        ]),
+    ],
+)
+def test_finish_epoch_separates_stage_expert_val_from_final_sequence_val(
+        epoch, expected_calls):
+    trainer = LTRTrainer.__new__(LTRTrainer)
+    trainer.epoch = epoch
+    trainer.settings = SimpleNamespace(
+        local_rank=1,
+        sequence_val_enable=True,
+        sequence_val_schedule=[[210, 210, 1]],
+        specialist_expert_schedule=[
+            [1, 30, [1]],
+            [31, 60, [4]],
+            [61, 160, [2]],
+            [161, 210, [3]],
+        ],
+    )
+    calls = []
+    trainer._sequence_validation_train_ready = lambda: True
+    trainer._run_sequence_validation = lambda **kwargs: calls.append(kwargs)
+    trainer._stats_new_epoch = lambda: None
+
+    trainer.finish_epoch()
+
+    assert calls == expected_calls
+
+
+def test_stage_expert_val_is_not_suppressed_by_final_validation_iou_gate():
+    trainer = LTRTrainer.__new__(LTRTrainer)
+    trainer.epoch = 30
+    trainer.settings = SimpleNamespace(
+        local_rank=1,
+        sequence_val_enable=True,
+        sequence_val_schedule=[[210, 210, 1]],
+        specialist_expert_schedule=[
+            [1, 30, [1]],
+            [31, 60, [4]],
+            [61, 160, [2]],
+            [161, 210, [3]],
+        ],
+    )
+    calls = []
+    trainer._sequence_validation_train_ready = lambda: False
+    trainer._run_sequence_validation = lambda **kwargs: calls.append(kwargs)
+    trainer._stats_new_epoch = lambda: None
+
+    trainer.finish_epoch()
+
+    assert calls == [{"forced_expert_id": 1, "policy_mode": "local"}]
+
+
+def test_sequence_validation_waits_for_train_iou_then_stays_enabled():
+    trainer = LTRTrainer.__new__(LTRTrainer)
+    trainer.settings = SimpleNamespace(
+        sequence_val_train_iou_threshold=0.30,
+        local_rank=0,
+    )
+    trainer.loaders = [SimpleNamespace(name="train", training=True)]
+    train_iou = AverageMeter()
+    trainer.stats = {"train": {"IoU": train_iou}}
+
+    train_iou.update(0.29)
+    assert trainer._sequence_validation_train_ready() is False
+
+    train_iou.reset()
+    train_iou.update(0.31)
+    assert trainer._sequence_validation_train_ready() is True
+
+    train_iou.reset()
+    train_iou.update(0.10)
+    assert trainer._sequence_validation_train_ready() is True
+
+
+def test_sequence_validation_failure_does_not_commit_epoch_checkpoint(tmp_path):
     events = []
 
     class SchedulerStub:
@@ -583,7 +1045,60 @@ def test_sequence_validation_failure_keeps_completed_epoch_checkpoint(tmp_path):
     with pytest.raises(RuntimeError, match="sequence validation failed"):
         trainer.train(max_epochs=1, fail_safe=False)
 
-    assert events == ["scheduler", "latest", "validation"]
+    assert events == ["scheduler", "validation"]
+
+
+def test_fail_safe_reraises_after_last_retry():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.epoch = 0
+    trainer.lr_scheduler = None
+    trainer._checkpoint_dir = None
+    trainer.settings = SimpleNamespace(
+        local_rank=0,
+        scheduler_type="step",
+    )
+    attempts = []
+
+    def fail_epoch():
+        attempts.append(trainer.epoch)
+        raise RuntimeError("persistent training failure")
+
+    trainer.train_epoch = fail_epoch
+    trainer.finish_epoch = lambda: None
+    trainer.load_checkpoint = lambda: True
+    trainer._is_distributed_training = lambda: False
+
+    with pytest.raises(RuntimeError, match="persistent training failure"):
+        trainer.train(max_epochs=1, fail_safe=True)
+
+    assert attempts == [1, 1, 1]
+
+
+def test_fail_safe_refuses_dirty_retry_without_recovery_checkpoint():
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.epoch = 0
+    trainer.lr_scheduler = None
+    trainer._checkpoint_dir = None
+    trainer.settings = SimpleNamespace(
+        local_rank=0,
+        scheduler_type="step",
+    )
+    attempts = []
+
+    def fail_epoch():
+        attempts.append(trainer.epoch)
+        raise RuntimeError("first epoch failed")
+
+    trainer.train_epoch = fail_epoch
+    trainer.finish_epoch = lambda: None
+    trainer.load_checkpoint = lambda: None
+    trainer._is_distributed_training = lambda: False
+
+    with pytest.raises(
+            RuntimeError, match="Fail-safe recovery requires a checkpoint"):
+        trainer.train(max_epochs=1, fail_safe=True)
+
+    assert attempts == [1]
 
 
 def test_trainer_records_aggregated_sequence_auc(
@@ -629,6 +1144,37 @@ def test_trainer_records_aggregated_sequence_auc(
             "EXPERT_2_ENSEMBLE_IOU_SUM": 7,
             "EXPERT_2_ENSEMBLE_SUCCESS_HITS": 6,
         })
+        metrics.update({
+            "SMALL_TARGET_COUNT": 2,
+            "SMALL_TARGET_CENTER_IN_CROP_HITS": 1,
+            "SMALL_TARGET_FULL_BOX_IN_CROP_HITS": 1,
+            "SMALL_TARGET_VISIBLE_FRACTION_SUM": 1.5,
+            "SMALL_TARGET_TARGET_WIDTH_PX_SUM": 20,
+            "SMALL_TARGET_TARGET_HEIGHT_PX_SUM": 22,
+            "SMALL_TARGET_STATE_IOU_SUM": 0.4,
+            "SMALL_TARGET_CENTER_OFFSET_NORM_SUM": 1.0,
+            "SMALL_TARGET_SPECIALIST_IOU_SUM": 0.6,
+            "SMALL_TARGET_INSIDE_COUNT": 1,
+            "SMALL_TARGET_INSIDE_IOU_SUM": 0.5,
+            "SMALL_TARGET_OUTSIDE_COUNT": 1,
+            "SMALL_TARGET_OUTSIDE_IOU_SUM": 0.1,
+            "SMALL_TARGET_SCORE_SUM": 0.4,
+            "SMALL_TARGET_SCORE_COUNT": 2,
+            "SMALL_TARGET_PSR_SUM": 4.0,
+            "SMALL_TARGET_PSR_COUNT": 2,
+            "SMALL_TARGET_CROP_MISS_COUNT": 1,
+            "SMALL_TARGET_IN_WINDOW_LOW_CONFIDENCE_COUNT": 1,
+            "SMALL_TARGET_LOCALIZATION_ERROR_COUNT": 0,
+            "SMALL_TARGET_SUCCESS_COUNT": 0,
+            "SMALL_TARGET_CENTER_ERROR_PX_SUM": 10,
+            "SMALL_TARGET_SIZE_ERROR_PX_SUM": 4,
+            "SMALL_TARGET_RECORDS": [{
+                "sequence": "diagnostic_sequence",
+                "frame_index": 7,
+                "expert_id": 2,
+                "specialist_score": None,
+            }],
+        })
         return metrics
 
     monkeypatch.setattr(
@@ -642,7 +1188,11 @@ def test_trainer_records_aggregated_sequence_auc(
     trainer = LTRTrainer.__new__(LTRTrainer)
     trainer.actor = SimpleNamespace(net=network, cfg=cfg)
     trainer.settings = SimpleNamespace(
-        env=SimpleNamespace(felt_val_dir=str(tmp_path)),
+        env=SimpleNamespace(
+            felt_val_dir=str(tmp_path),
+            tensorboard_dir=str(tmp_path / "tensorboard"),
+        ),
+        project_path="diagnostic_run",
         local_rank=0,
     )
     trainer.device = torch.device("cpu")
@@ -683,27 +1233,43 @@ def test_trainer_records_aggregated_sequence_auc(
     for name, expected in expected_diagnostics.items():
         assert trainer.stats["sequence_val"][name].avg == pytest.approx(expected)
     assert trainer.stats["sequence_val"][
-        "ExpertVal/small_target_st_count"].avg == pytest.approx(10)
+        "ExpertVal/precision_refiner_count"].avg == pytest.approx(10)
     assert trainer.stats["sequence_val"][
-        "ExpertVal/small_target_st_iou"].avg == pytest.approx(0.75)
+        "ExpertVal/precision_refiner_iou"].avg == pytest.approx(0.75)
     assert trainer.stats["sequence_val"][
-        "ExpertVal/small_target_st_sr"].avg == pytest.approx(0.6)
+        "ExpertVal/precision_refiner_sr"].avg == pytest.approx(0.6)
     assert trainer.stats["sequence_val"][
-        "ExpertVal/small_target_st_generalist_iou"].avg == pytest.approx(0.5)
+        "ExpertVal/precision_refiner_generalist_iou"].avg == pytest.approx(0.5)
     assert trainer.stats["sequence_val"][
-        "ExpertVal/small_target_st_delta_iou"].avg == pytest.approx(0.25)
+        "ExpertVal/precision_refiner_delta_iou"].avg == pytest.approx(0.25)
     assert trainer.stats["sequence_val"][
-        "ExpertVal/small_target_st_ensemble_iou"].avg == pytest.approx(0.7)
+        "ExpertVal/precision_refiner_ensemble_iou"].avg == pytest.approx(0.7)
     assert trainer.stats["sequence_val"][
         "ExpertVal/visibility_foc_ov_reappearance_iou"].avg == pytest.approx(0.5)
     assert trainer.stats["sequence_val"][
         "ExpertVal/visibility_foc_ov_reappearance_success"].avg == pytest.approx(2 / 3)
     assert trainer.stats["sequence_val"][
         "ExpertVal/visibility_foc_ov_rgb_false_accept_count"].avg == pytest.approx(1)
+    assert trainer.stats["sequence_val"][
+        "SmallTargetDiag/center_in_crop_rate"].avg == pytest.approx(0.5)
+    assert trainer.stats["sequence_val"][
+        "SmallTargetDiag/in_crop_iou"].avg == pytest.approx(0.5)
+    assert trainer.stats["sequence_val"][
+        "SmallTargetDiag/crop_miss_rate"].avg == pytest.approx(0.5)
+    diagnostic_path = (
+        tmp_path / "tensorboard" / "diagnostic_run"
+        / "small_target_diagnostics_epoch_0040.jsonl")
+    assert diagnostic_path.exists()
+    assert json.loads(diagnostic_path.read_text(encoding="utf-8")) == {
+        "sequence": "diagnostic_sequence",
+        "frame_index": 7,
+        "expert_id": 2,
+        "specialist_score": None,
+    }
     assert trainer.stats["val"] is None
     output = capsys.readouterr().out
     assert (
-        "SequenceVal expert small_target_st: count=10, IoU=0.750000, "
+        "SequenceVal expert precision_refiner: count=10, IoU=0.750000, "
         "generalist=0.500000, delta=0.250000, ensemble=0.700000, "
         "SR=0.600000"
     ) in output
@@ -756,6 +1322,75 @@ def test_trainer_all_reduces_disjoint_sequence_validation_shards(
         "world_size": 2,
         "felt_val_root": str(tmp_path),
     }]
+
+
+def test_trainer_all_reduces_small_target_raw_sums(monkeypatch, tmp_path):
+    local_small = {key: 0.0 for key in SMALL_TARGET_DIAGNOSTIC_KEYS}
+    local_small.update({
+        "SMALL_TARGET_COUNT": 2,
+        "SMALL_TARGET_CENTER_IN_CROP_HITS": 1,
+        "SMALL_TARGET_INSIDE_COUNT": 1,
+        "SMALL_TARGET_INSIDE_IOU_SUM": 0.5,
+    })
+    remote_small = {key: 0.0 for key in SMALL_TARGET_DIAGNOSTIC_KEYS}
+    remote_small.update({
+        "SMALL_TARGET_COUNT": 3,
+        "SMALL_TARGET_CENTER_IN_CROP_HITS": 2,
+        "SMALL_TARGET_INSIDE_COUNT": 2,
+        "SMALL_TARGET_INSIDE_IOU_SUM": 1.2,
+    })
+
+    def fake_sequence_validation(*_args, **_kwargs):
+        return {
+            "FELT_SR_PROXY_SUM": 0.5,
+            "FELT_ABSENT_BAL_ACC_SUM": 0.4,
+            "FELT_REAPPEARANCE_PROXY_SUM": 0.1,
+            "REAPPEARANCE_SEQUENCE_COUNT": 1,
+            "SEQUENCE_COUNT": 1,
+            "SMALL_TARGET_RECORDS": [],
+            **local_small,
+        }
+
+    def fake_all_reduce(values, op):
+        assert op == torch.distributed.ReduceOp.SUM
+        if values.numel() == 5:
+            values += torch.tensor(
+                [0.5, 0.4, 0.1, 1.0, 1.0], dtype=values.dtype)
+        else:
+            assert values.numel() == len(SMALL_TARGET_DIAGNOSTIC_KEYS)
+            values += torch.tensor(
+                [remote_small[key] for key in SMALL_TARGET_DIAGNOSTIC_KEYS],
+                dtype=values.dtype,
+            )
+
+    monkeypatch.setattr(
+        ltr_trainer_module, "run_felt_sequence_validation",
+        fake_sequence_validation)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    trainer = LTRTrainer.__new__(LTRTrainer)
+    trainer.actor = SimpleNamespace(
+        net=torch.nn.Linear(1, 1), cfg=SimpleNamespace())
+    trainer.settings = SimpleNamespace(
+        env=SimpleNamespace(felt_val_dir=str(tmp_path)),
+        local_rank=1,
+    )
+    trainer.device = torch.device("cpu")
+    trainer.stats = OrderedDict(val=None, sequence_val=None)
+    trainer.epoch = 40
+
+    trainer._run_sequence_validation()
+
+    assert trainer.stats["sequence_val"][
+        "SmallTargetDiag/count"].avg == pytest.approx(5.0)
+    assert trainer.stats["sequence_val"][
+        "SmallTargetDiag/center_in_crop_rate"].avg == pytest.approx(3 / 5)
+    assert trainer.stats["sequence_val"][
+        "SmallTargetDiag/in_crop_iou"].avg == pytest.approx(1.7 / 3)
 
 
 def test_trainer_initializes_sequence_val_stats_and_tensorboard(
@@ -855,7 +1490,7 @@ def test_specialist_best_checkpoint_requires_all_fresh_gates():
         "ExpertVal/generalist_count": meter(100),
         "ExpertVal/generalist_iou": meter(0.70),
     }
-    for name in ("motion_fm", "small_target_st", "visibility_foc_ov"):
+    for name in ("motion_fm", "precision_refiner", "visibility_foc_ov"):
         metrics[f"ExpertVal/{name}_count"] = meter(100)
         metrics[f"ExpertVal/{name}_iou"] = meter(0.62)
         metrics[f"ExpertVal/{name}_generalist_iou"] = meter(0.59)
@@ -887,7 +1522,7 @@ def test_specialist_best_checkpoint_requires_all_fresh_gates():
         "generalist_iou": pytest.approx(0.70),
         "specialists": {
             "motion_fm": pytest.approx(0.62),
-            "small_target_st": pytest.approx(0.62),
+            "precision_refiner": pytest.approx(0.62),
             "visibility_foc_ov": pytest.approx(0.62),
             "discrimination_bi": pytest.approx(0.62),
         },
@@ -920,7 +1555,7 @@ def test_refine_best_uses_stage1_checkpoint_reference():
         "generalist_iou": 0.70,
         "specialists": {
             name: 0.62 for name in (
-                "motion_fm", "small_target_st",
+                "motion_fm", "precision_refiner",
                 "visibility_foc_ov", "discrimination_bi")
         },
         "visibility": {
@@ -957,7 +1592,7 @@ def test_refine_best_uses_stage1_checkpoint_reference():
     assert saved == ["best_stage2"]
 
 
-def test_sequence_validation_is_opt_in_and_felt_experiment_selects_sequence_best():
+def test_pursuit_experiment_defers_sequence_validation_until_controller_best():
     assert default_cfg.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert default_cfg.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert default_cfg.TRAIN.BEST_LOADER == "val"
@@ -968,18 +1603,16 @@ def test_sequence_validation_is_opt_in_and_felt_experiment_selects_sequence_best
         .read_text(encoding="utf-8")
     )
 
-    assert experiment["TRAIN"]["SEQUENCE_VAL_ENABLE"] is True
-    assert experiment["TRAIN"]["MIN_EPOCH"] == 25
+    assert experiment["TRAIN"]["EXPERT_PHASE"] == "pursuit"
+    assert experiment["TRAIN"]["SEQUENCE_VAL_ENABLE"] is False
+    assert experiment["TRAIN"]["MIN_EPOCH"] == 20
     assert experiment["TRAIN"]["EPOCH"] == 60
     assert experiment["TRAIN"]["REFINE_MAX_EPOCH"] == 12
-    assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == [
-        [1, 1, 1],
-        [5, 5, 1],
-        [10, 50, 5],
-        [51, 60, 1],
-    ]
-    assert experiment["TRAIN"]["SAVE_EPOCHS"] == []
-    assert experiment["TRAIN"]["SPECIALIST_GATE_ENABLE"] is True
+    assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == []
+    assert experiment["TRAIN"][
+        "SEQUENCE_VAL_TRAIN_IOU_THRESHOLD"] == pytest.approx(0.0)
+    assert experiment["TRAIN"]["SAVE_EPOCHS"] == [10, 20, 30, 40, 50, 60]
+    assert experiment["TRAIN"]["SPECIALIST_GATE_ENABLE"] is False
     assert experiment["TRAIN"]["SPECIALIST_MIN_COUNT"] == 100
     assert experiment["TRAIN"]["SPECIALIST_MIN_DELTA"] == pytest.approx(0.02)
     assert experiment["TRAIN"]["GENERALIST_REFERENCE_IOU"] == pytest.approx(
@@ -989,8 +1622,8 @@ def test_sequence_validation_is_opt_in_and_felt_experiment_selects_sequence_best
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_REAPPEAR_SUCCESS"] == 0.0
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
-    assert experiment["TRAIN"]["BEST_LOADER"] == "sequence_val"
-    assert experiment["TRAIN"]["BEST_METRIC"] == "FELT_SR_PROXY"
+    assert experiment["TRAIN"]["BEST_LOADER"] == "val"
+    assert experiment["TRAIN"]["BEST_METRIC"] == "Pursuit/next_in_crop_rate"
 
 
 def test_sequence_val_best_disables_incompatible_batch_val_loader():

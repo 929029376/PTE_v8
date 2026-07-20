@@ -164,6 +164,26 @@ def test_tracker_passes_only_local_presence_to_controller():
     assert tracker.visibility_controller.args == (0.82,)
 
 
+def test_tracker_bypasses_untrained_srbt_gate_when_disabled():
+    class _UnexpectedController:
+        def step(self, *args):
+            raise AssertionError("disabled SRBT must not run the visibility controller")
+
+    tracker = object.__new__(PETTrack)
+    tracker.srbt_controller_enabled = False
+    tracker.visibility_controller = _UnexpectedController()
+
+    result = PETTrack._step_srbt_controller(tracker, {
+        "presence_score": 0.45,
+    })
+
+    assert result.action is Action.TRACK
+    assert result.output_score == 0.45
+    assert not result.output_absent
+    assert not result.allow_recent_write
+    assert not result.allow_long_write
+
+
 def test_verified_srbt_recovery_consumes_the_pending_global_box():
     tracker = object.__new__(PETTrack)
     tracker._pending_redetect_box = [90.0, 40.0, 20.0, 10.0]
@@ -215,11 +235,15 @@ def test_tracker_uses_all_experts_without_hidden_selector_history():
             self.calls.append(kwargs)
             expert_outputs = {
                 name: {
-                    "score_map": torch.full((1, 1, 2, 2), score),
+                    "score_map": torch.full(
+                        (1, 1, 4, 4) if name == "precision_refiner"
+                        else (1, 1, 2, 2),
+                        score,
+                    ),
                     "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2]]]),
                 }
                 for name, score in zip(
-                    ("generalist", "motion_fm", "small_target_st",
+                    ("generalist", "motion_fm", "precision_refiner",
                      "visibility_foc_ov", "discrimination_bi"),
                     (0.5, 0.6, 0.7, 0.8, 0.9),
                 )
@@ -247,7 +271,136 @@ def test_tracker_uses_all_experts_without_hidden_selector_history():
 
     assert len(tracker.network.calls) == 1
     assert "previous_expert_probabilities" not in tracker.network.calls[0]
-    assert candidate["retained_expert_ids"] == (0, 1, 2, 3, 4)
+    assert tracker.network.calls[0]["small_template_features"] is None
+    assert candidate["retained_expert_ids"] == (4,)
     assert candidate["ensemble_weights"].shape == (5,)
+    assert int(torch.count_nonzero(candidate["ensemble_weights"])) == 1
     assert len(candidate["expert_states"]) == 5
     assert all(len(box) == 4 for box in candidate["expert_states"])
+
+
+def test_tracker_stage_validation_commits_the_forced_expert_box():
+    class Thor:
+        @staticmethod
+        def begin_frame():
+            return torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)
+
+    class Network:
+        @staticmethod
+        def inference(**_kwargs):
+            names = (
+                "generalist", "motion_fm", "precision_refiner",
+                "visibility_foc_ov", "discrimination_bi",
+            )
+            return {
+                "presence_score": torch.tensor([0.8]),
+                "expert_outputs": {
+                    name: {
+                        "score_map": torch.full((1, 1, 2, 2), 0.5 + index / 10),
+                        "pred_boxes": torch.tensor([[[
+                            0.2 + index / 10, 0.5, 0.2, 0.2,
+                        ]]]),
+                    }
+                    for index, name in enumerate(names)
+                },
+            }
+
+    tracker = object.__new__(PETTrack)
+    tracker.thor_wrapper = Thor()
+    tracker.network = Network()
+    tracker.static_zi = torch.zeros(1, 4, 8)
+    tracker.static_ze = torch.zeros(1, 4, 8)
+    tracker.output_window = torch.ones(1, 1, 2, 2)
+    tracker.params = SimpleNamespace(search_size=32)
+    tracker.map_box_back = lambda box, factor, reference: box
+    tracker.forced_expert_id = 1
+
+    candidate = tracker._run_local_candidate(
+        torch.zeros(1, 3, 32, 32),
+        torch.zeros(1, 3, 32, 32),
+        1.0,
+        100,
+        100,
+        reference_state=[0.0, 0.0, 16.0, 16.0],
+    )
+
+    assert candidate["retained_expert_ids"] == (1,)
+    assert int(candidate["ensemble_weights"].argmax()) == 1
+    assert candidate["state"] == candidate["expert_states"][1]
+
+
+def test_tracker_replaces_small_template_cache_for_each_sequence(monkeypatch):
+    class SmallExpert:
+        def __init__(self):
+            self.calls = 0
+
+        def encode_template(self, _rgb, _event):
+            self.calls += 1
+            return (f"s4-{self.calls}", f"s8-{self.calls}")
+
+    class Network:
+        def __init__(self):
+            self.small_target_expert = SmallExpert()
+            self.inference_calls = []
+
+        def inference(self, **kwargs):
+            self.inference_calls.append(kwargs)
+            return {
+                "score_map": torch.ones(1, 1, 2, 2),
+                "target_bbox": torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+                "presence_score": torch.tensor([0.8]),
+            }
+
+    class Thor:
+        def setup(self, *_args):
+            pass
+
+        def begin_frame(self):
+            return torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)
+
+    monkeypatch.setattr(
+        "lib.test.tracker.pet_track.sample_target",
+        lambda **_kwargs: (
+            torch.zeros(1, 3, 16, 16),
+            torch.zeros(1, 3, 16, 16),
+            1.0,
+            torch.zeros(1, 16, 16),
+        ),
+    )
+    monkeypatch.setattr(
+        "lib.test.tracker.pet_track.generate_mask_z",
+        lambda **_kwargs: None,
+    )
+    tracker = object.__new__(PETTrack)
+    tracker.params = SimpleNamespace(
+        template_factor=2.0, template_size=16,
+        search_factor=4.0, search_size=32,
+    )
+    tracker.preprocessor = SimpleNamespace(
+        process=lambda patch, _mask: SimpleNamespace(tensors=patch))
+    tracker.transform_bbox_to_crop = lambda *_args: torch.tensor(
+        [[[0.5, 0.5, 0.2, 0.2]]])
+    tracker.cfg = SimpleNamespace(MODEL=SimpleNamespace(
+        BACKBONE=SimpleNamespace(CE_LOC=False)))
+    tracker.network = Network()
+    tracker.thor_wrapper = Thor()
+    tracker.visibility_controller = SimpleNamespace(reset=lambda: None)
+    tracker._reset_srbt_sequence_state = lambda: None
+    tracker._record_search_diagnostic = lambda *_args, **_kwargs: None
+    tracker.output_window = torch.ones(1, 1, 2, 2)
+    tracker.map_box_back = lambda box, _factor, _reference: box
+    info = {"init_bbox": [1.0, 1.0, 4.0, 4.0]}
+
+    tracker.initialize(None, None, info, idx=0)
+    first_cache = tracker.small_template_features
+    tracker.initialize(None, None, info, idx=0)
+    second_cache = tracker.small_template_features
+    search = torch.zeros(1, 3, 32, 32)
+    tracker._run_local_candidate(
+        search, search, 1.0, 100, 100,
+        reference_state=[0.0, 0.0, 16.0, 16.0])
+
+    assert first_cache == ("s4-1", "s8-1")
+    assert second_cache == ("s4-2", "s8-2")
+    assert tracker.network.inference_calls[-1][
+        "small_template_features"] is second_cache

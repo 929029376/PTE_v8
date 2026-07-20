@@ -1,8 +1,10 @@
 """PET-Track inference with event-guided RGB recovery and protected memory."""
+import math
 import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from lib.models.pet_track import build_pet_track
 from lib.test.tracker.basetracker import BaseTracker
@@ -19,6 +21,7 @@ from lib.models.layers.srbt_hypotheses import (
 )
 from lib.models.layers.srbt_controller import (
     Action as BeliefAction,
+    ControllerAction,
     build_visibility_controller,
 )
 from lib.models.layers.event_recovery import EventProposalExtractor
@@ -26,6 +29,7 @@ from lib.models.layers.expert_ensemble import (
     fuse_expert_predictions,
     normalized_response_psr,
 )
+from lib.models.layers.search_window_controller import event_motion_centroid
 from lib.train.trainers.base_trainer import load_srbt_checkpoint_file
 
 
@@ -45,6 +49,17 @@ class PETTrack(BaseTracker):
             _load_srbt_eval_checkpoint(network, self.params.checkpoint)
             network = network.cuda()
         self.cfg = params.cfg
+        policy_mode = getattr(params, "policy_mode", None)
+        policy_mode = str(
+            policy_mode or getattr(
+                self.cfg.TEST, "POLICY_MODE", "stateful")).lower()
+        self.srbt_controller_enabled = policy_mode == "stateful"
+        self.forced_expert_id = getattr(params, "forced_expert_id", None)
+        if (self.forced_expert_id is not None
+                and int(self.forced_expert_id) not in range(5)):
+            raise ValueError("forced_expert_id must be in [0, 4]")
+        if self.forced_expert_id is not None:
+            self.forced_expert_id = int(self.forced_expert_id)
         self.hypothesis_tracker = build_hypothesis_tracker(self.cfg)
         self.visibility_controller = build_visibility_controller(self.cfg)
         self._srbt_last_action = BeliefAction.TRACK
@@ -54,6 +69,21 @@ class PETTrack(BaseTracker):
         self.network.eval()
         self.preprocessor = Preprocessor(device=self.device)
         self.state = None
+        search_controller_cfg = getattr(
+            self.cfg.MODEL, "SEARCH_CONTROLLER", None)
+        self.search_controller_enabled = bool(getattr(
+            search_controller_cfg, "ENABLE", False)) and bool(getattr(
+                search_controller_cfg, "USE_INFERENCE", False))
+        if self.search_controller_enabled and not bool(getattr(
+                search_controller_cfg, "TRAINED", False)):
+            raise RuntimeError(
+                "search-window inference requires a trained controller")
+        if self.search_controller_enabled and getattr(
+                self.network, "search_window_controller", None) is None:
+            raise RuntimeError(
+                "search-window inference is enabled but the model has no controller")
+        self._planned_search_state = None
+        self._search_controller_previous_box = None
 
         self.feat_sz = self.cfg.TEST.SEARCH_SIZE // self.cfg.MODEL.BACKBONE.STRIDE
         self.output_window = hann2d(
@@ -112,6 +142,84 @@ class PETTrack(BaseTracker):
             "identity_scores": [],
         }]
         self._expert_diagnostics = []
+        self._search_diagnostics = []
+        self._planned_search_state = None
+        self._search_controller_previous_box = None
+
+    def _search_state_for_frame(self):
+        if (self._srbt_last_action in (
+                BeliefAction.ABSENT, BeliefAction.VERIFY)
+                and self._pending_redetect_box is not None):
+            return self._pending_redetect_box
+        if (getattr(self, "search_controller_enabled", False)
+                and getattr(self, "_planned_search_state", None) is not None
+                and self._srbt_last_action in (
+                    BeliefAction.TRACK, BeliefAction.SUSPECT)):
+            return self._planned_search_state
+        return self.state
+
+    @staticmethod
+    def _normalize_image_boxes(boxes, height, width, device):
+        boxes = torch.as_tensor(
+            boxes, device=device, dtype=torch.float32)
+        scale = boxes.new_tensor((width, height, width, height))
+        return boxes / scale
+
+    def _plan_next_search_state(
+            self, event_image, height, width, local_candidate, action):
+        if not getattr(self, "search_controller_enabled", False) or action not in (
+                "track", "suspect") or local_candidate is None:
+            self._planned_search_state = None
+            return None
+        expert_states = local_candidate.get("expert_states")
+        peaks = local_candidate.get("expert_peaks")
+        psr = local_candidate.get("expert_psr")
+        if not expert_states or len(expert_states) != len(self.network.expert_names):
+            raise RuntimeError(
+                "search controller requires every expert state")
+        if len(peaks) != len(expert_states) or len(psr) != len(expert_states):
+            raise RuntimeError(
+                "search controller requires every expert response statistic")
+        current = self._normalize_image_boxes(
+            [self.state], height, width, self.device)
+        previous = (
+            current if self._search_controller_previous_box is None
+            else self._search_controller_previous_box)
+        experts = self._normalize_image_boxes(
+            [expert_states], height, width, self.device)
+        event_tensor = torch.as_tensor(
+            event_image, device=self.device, dtype=torch.float32)
+        if event_tensor.ndim != 3:
+            raise ValueError("event image must have shape [height, width, channels]")
+        event_center, event_confidence = event_motion_centroid(
+            event_tensor.permute(2, 0, 1).unsqueeze(0))
+        presence = local_candidate.get("presence_score")
+        if presence is None:
+            presence = current.new_ones(1)
+        with torch.no_grad():
+            output = self.network.search_window_controller(
+                current_box=current,
+                previous_box=previous,
+                expert_boxes=experts,
+                response_peaks=current.new_tensor([peaks]),
+                response_psr=current.new_tensor([psr]),
+                presence=torch.as_tensor(
+                    presence, device=self.device, dtype=current.dtype),
+                event_center=event_center,
+                event_confidence=event_confidence,
+            )
+        scale = output.next_box.new_tensor((width, height, width, height))
+        planned = output.next_box[0] * scale
+        self._planned_search_state = clip_box(
+            planned.detach().cpu().tolist(), height, width, margin=1)
+        self._search_controller_previous_box = current.detach()
+        local_candidate["planned_search_state"] = list(
+            self._planned_search_state)
+        local_candidate["search_inside_probability"] = float(
+            output.inside_logit.sigmoid()[0].item())
+        local_candidate["search_quality_probability"] = float(
+            output.quality_logit.sigmoid()[0].item())
+        return self._planned_search_state
 
     def get_recovery_diagnostics(self):
         return [dict(item) for item in self._recovery_diagnostics]
@@ -119,6 +227,104 @@ class PETTrack(BaseTracker):
     def get_expert_diagnostics(self):
         return [[list(box) for box in frame]
                 for frame in self._expert_diagnostics]
+
+    def get_search_diagnostics(self):
+        return [{
+            key: list(value) if isinstance(value, list) else value
+            for key, value in item.items()
+        } for item in self._search_diagnostics]
+
+    def _record_search_diagnostic(
+            self, search_state, resize_factor, action, local_candidate,
+            *, previous_action="", controller_output_score=None,
+            recovery_attempted=False, recovery_confirmed=False,
+            recovery_max_identity=None, recovery_max_localization=None,
+            recovery_accepted_count=0, is_initial=False, frame_id=None):
+        state = [float(value) for value in search_state]
+        crop_size = math.ceil(
+            math.sqrt(state[2] * state[3]) * self.params.search_factor)
+        x1 = round(state[0] + 0.5 * state[2] - 0.5 * crop_size)
+        y1 = round(state[1] + 0.5 * state[3] - 0.5 * crop_size)
+        candidate = local_candidate or {}
+        weights = candidate.get("ensemble_weights", [])
+        if torch.is_tensor(weights):
+            weights = weights.detach().cpu().tolist()
+        presence_score = self._diagnostic_scalar(
+            candidate.get("presence_score"))
+        controller = getattr(self, "visibility_controller", None)
+        self._search_diagnostics.append({
+            "frame_id": int(self.frame_id if frame_id is None else frame_id),
+            "is_initial": bool(is_initial),
+            "search_state": state,
+            "crop_bounds_xyxy": [
+                float(x1), float(y1),
+                float(x1 + crop_size), float(y1 + crop_size),
+            ],
+            "resize_factor": float(resize_factor),
+            "previous_action": str(previous_action),
+            "action": str(action),
+            "presence_score": presence_score,
+            "controller_output_score": self._diagnostic_scalar(
+                controller_output_score),
+            "theta_present": self._diagnostic_scalar(
+                getattr(controller, "theta_present", None)),
+            "theta_recover": self._diagnostic_scalar(
+                getattr(controller, "theta_recover", None)),
+            "controller_weak_streak": int(getattr(
+                controller, "_weak_streak", 0)),
+            "controller_verify_streak": int(getattr(
+                controller, "_verify_streak", 0)),
+            "controller_stable_visible": int(getattr(
+                controller, "_stable_visible", 0)),
+            "recovery_attempted": bool(recovery_attempted),
+            "recovery_confirmed": bool(recovery_confirmed),
+            "recovery_max_identity": self._diagnostic_scalar(
+                recovery_max_identity),
+            "recovery_max_localization": self._diagnostic_scalar(
+                recovery_max_localization),
+            "recovery_accepted_count": int(recovery_accepted_count),
+            "redetect_confidence": self._diagnostic_scalar(
+                getattr(self, "_last_redetect_conf", None)),
+            "ensemble_score": float(candidate.get("score_peak", 0.0)),
+            "expert_peaks": [
+                float(value) for value in candidate.get("expert_peaks", [])],
+            "expert_psr": [
+                float(value) for value in candidate.get("expert_psr", [])],
+            "retained_expert_ids": [
+                int(value) for value in candidate.get(
+                    "retained_expert_ids", [])],
+            "ensemble_weights": [float(value) for value in weights],
+            "planned_search_state": [
+                float(value) for value in candidate.get(
+                    "planned_search_state", [])],
+            "search_inside_probability": self._diagnostic_scalar(
+                candidate.get("search_inside_probability")),
+            "search_quality_probability": self._diagnostic_scalar(
+                candidate.get("search_quality_probability")),
+        })
+
+    @staticmethod
+    def _diagnostic_scalar(value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            value = value.detach().item()
+        value = float(value)
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _recovery_diagnostic_value(recovery, key, *, count=False):
+        if recovery is None or key not in recovery:
+            return 0 if count else None
+        value = recovery[key]
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return 0 if count else None
+            return int(value.detach().sum().item()) if count else float(
+                value.detach().max().item())
+        return None
 
     def initialize(self, image, event_image, info: dict, idx=0):
         z_patch_arr, event_z_patch_arr, resize_factor, z_amask_arr = sample_target(
@@ -142,6 +348,12 @@ class PETTrack(BaseTracker):
             self.dynamic_ze = None
             self.static_zi = template
             self.static_ze = event_template
+            small_target_expert = getattr(
+                self.network, "small_target_expert", None)
+            self.small_template_features = (
+                small_target_expert.encode_template(template, event_template)
+                if small_target_expert is not None else None
+            )
             self._last_trusted_zi = template.detach().clone()
             self._last_trusted_ze = event_template.detach().clone()
             self.thor_wrapper.setup(self.static_zi, self.static_ze)
@@ -156,25 +368,55 @@ class PETTrack(BaseTracker):
             list(info['init_bbox']) for _ in range(5)
         ]]
         self.frame_id = idx
+        self._record_search_diagnostic(
+            info['init_bbox'],
+            self.params.search_size / math.ceil(
+                math.sqrt(info['init_bbox'][2] * info['init_bbox'][3])
+                * self.params.search_factor),
+            "initialize",
+            None,
+            is_initial=True,
+            frame_id=idx,
+        )
 
     def _run_local_candidate(self, search, event_search,
                              resize_factor, height, width,
-                             reference_state=None):
+                             reference_state=None,
+                             dynamic_templates=None):
         """Run the local path without committing its box."""
-        dynamic_zi, dynamic_ze = self.thor_wrapper.begin_frame()
+        if dynamic_templates is None:
+            dynamic_zi, dynamic_ze = self.thor_wrapper.begin_frame()
+        else:
+            dynamic_zi, dynamic_ze = dynamic_templates
         self.dynamic_zi, self.dynamic_ze = dynamic_zi, dynamic_ze
 
         out_dict = self.network.inference(
             static_zi=self.static_zi, static_ze=self.static_ze,
             dynamic_zi=dynamic_zi, dynamic_ze=dynamic_ze,
-            xi=search, xe=event_search)
+            xi=search, xe=event_search,
+            small_template_features=getattr(
+                self, "small_template_features", None))
         expert_outputs = out_dict.get("expert_outputs")
         if expert_outputs:
             mapped_boxes = []
             response_maps = []
+            response_peaks = []
+            response_psr = []
             for expert_output in expert_outputs.values():
-                response_maps.append(
-                    self.output_window * expert_output["score_map"])
+                score_map = expert_output["score_map"]
+                window = self.output_window
+                if window.shape[-2:] != score_map.shape[-2:]:
+                    window = F.interpolate(
+                        window, size=score_map.shape[-2:],
+                        mode="bilinear", align_corners=False)
+                native_response = window * score_map
+                response_peaks.append(native_response.flatten(1).max(dim=1).values[0])
+                response_psr.append(normalized_response_psr(native_response)[0])
+                if native_response.shape[-2:] != self.output_window.shape[-2:]:
+                    native_response = F.interpolate(
+                        native_response, size=self.output_window.shape[-2:],
+                        mode="bilinear", align_corners=False)
+                response_maps.append(native_response)
                 pred_box = (
                     expert_output["pred_boxes"][0, 0]
                     * self.params.search_size / resize_factor
@@ -187,23 +429,39 @@ class PETTrack(BaseTracker):
             boxes = torch.as_tensor(
                 mapped_boxes, device=response_stack.device,
                 dtype=response_stack.dtype)
-            response_peaks = response_stack.flatten(1).max(dim=1).values
-            ensemble = fuse_expert_predictions(
-                boxes=boxes,
-                response_peaks=response_peaks,
-                response_psr=normalized_response_psr(response_stack),
-                last_box=(self.state if reference_state is None
-                          else reference_state),
-            )
-            candidate_state = clip_box(
-                ensemble.box.detach().cpu().tolist(),
-                height, width, margin=10)
-            response = (
-                ensemble.weights[:, None, None, None] * response_stack
-            ).sum(dim=0, keepdim=True)
-            retained_expert_ids = ensemble.retained_ids
-            ensemble_weights = ensemble.weights.detach()
+            forced_expert_id = getattr(self, "forced_expert_id", None)
+            if forced_expert_id is None:
+                ensemble = fuse_expert_predictions(
+                    boxes=boxes,
+                    response_peaks=torch.stack(response_peaks),
+                    response_psr=torch.stack(response_psr),
+                    last_box=(self.state if reference_state is None
+                              else reference_state),
+                )
+                candidate_state = clip_box(
+                    ensemble.box.detach().cpu().tolist(),
+                    height, width, margin=10)
+                response = (
+                    ensemble.weights[:, None, None, None] * response_stack
+                ).sum(dim=0, keepdim=True)
+                retained_expert_ids = ensemble.retained_ids
+                ensemble_weights = ensemble.weights.detach()
+            else:
+                candidate_state = list(mapped_boxes[forced_expert_id])
+                response = response_stack[
+                    forced_expert_id:forced_expert_id + 1]
+                ensemble_weights = torch.zeros(
+                    len(mapped_boxes),
+                    device=response_stack.device,
+                    dtype=response_stack.dtype,
+                )
+                ensemble_weights[forced_expert_id] = 1.0
+                retained_expert_ids = (forced_expert_id,)
             expert_states = [list(box) for box in mapped_boxes]
+            expert_peaks = [float(value.detach().item())
+                            for value in response_peaks]
+            expert_psr_values = [float(value.detach().item())
+                                 for value in response_psr]
         else:
             response = self.output_window * out_dict['score_map']
             pred_box = (
@@ -217,6 +475,8 @@ class PETTrack(BaseTracker):
             ensemble_weights = torch.ones(
                 1, device=response.device, dtype=response.dtype)
             expert_states = [list(candidate_state) for _ in range(5)]
+            expert_peaks = []
+            expert_psr_values = []
 
         return {
             "state": candidate_state,
@@ -227,6 +487,8 @@ class PETTrack(BaseTracker):
             "retained_expert_ids": retained_expert_ids,
             "ensemble_weights": ensemble_weights,
             "expert_states": expert_states,
+            "expert_peaks": expert_peaks,
+            "expert_psr": expert_psr_values,
         }
 
     def get_update_count(self):
@@ -246,12 +508,43 @@ class PETTrack(BaseTracker):
             if presence_score is None else presence_score)
         if presence_score is None:
             return None
+        if not getattr(self, "srbt_controller_enabled", True):
+            return ControllerAction(
+                action=BeliefAction.TRACK,
+                allow_recent_write=False,
+                allow_long_write=False,
+                output_absent=False,
+                output_score=float(presence_score),
+            )
         if identity_score is None and localization_score is None:
             return self.visibility_controller.step(presence_score)
         return self.visibility_controller.step(
             presence_score,
             identity_score,
             localization_score,
+        )
+
+    def _refine_pending_recovery(self, image, event_image, height, width):
+        if self._pending_redetect_box is None:
+            return None
+        reference_state = list(self._pending_redetect_box)
+        patch, event_patch, resize_factor, mask = sample_target(
+            im=image,
+            eim=event_image,
+            target_bb=reference_state,
+            search_area_factor=self.params.search_factor,
+            output_sz=self.params.search_size,
+        )
+        search = self.preprocessor.process(patch, mask).tensors
+        event_search = self.preprocessor.process(event_patch, mask).tensors
+        return self._run_local_candidate(
+            search,
+            event_search,
+            resize_factor,
+            height,
+            width,
+            reference_state=reference_state,
+            dynamic_templates=(self.dynamic_zi, self.dynamic_ze),
         )
 
     def _resolve_tracking_state(self, local_state, height, width,
@@ -312,13 +605,7 @@ class PETTrack(BaseTracker):
         self.frame_id += 1
         self._last_redetect_error = ""
         H, W, _ = image.shape
-        search_state = (
-            self._pending_redetect_box
-            if (self._srbt_last_action in (
-                    BeliefAction.ABSENT, BeliefAction.VERIFY)
-                and self._pending_redetect_box is not None)
-            else self.state
-        )
+        search_state = self._search_state_for_frame()
         x_patch_arr, event_x_patch_arr, resize_factor, x_amask_arr = sample_target(
             im=image, eim=event_image, target_bb=search_state,
             search_area_factor=self.params.search_factor, output_sz=self.params.search_size)
@@ -332,7 +619,10 @@ class PETTrack(BaseTracker):
 
             previous_action = self._srbt_last_action
             recovery = None
+            confirmation = None
+            recovery_attempted = False
             if previous_action in (BeliefAction.ABSENT, BeliefAction.VERIFY):
+                recovery_attempted = True
                 recovery = self._run_recovery_cycle(image, event_image, H, W)
                 confirmation = self._best_recovery_confirmation(recovery)
                 if confirmation is None:
@@ -348,6 +638,7 @@ class PETTrack(BaseTracker):
             else:
                 srbt_control = self._step_srbt_controller(local_candidate)
                 if srbt_control is not None and srbt_control.action is BeliefAction.ABSENT:
+                    recovery_attempted = True
                     recovery = self._run_recovery_cycle(image, event_image, H, W)
                     confirmation = self._best_recovery_confirmation(recovery)
                     if confirmation is not None:
@@ -372,6 +663,13 @@ class PETTrack(BaseTracker):
                     previous_action is not BeliefAction.TRACK
                     and current_action is BeliefAction.TRACK),
             }
+            if decision["exit_to_tracking"]:
+                refined_candidate = self._refine_pending_recovery(
+                    image, event_image, H, W)
+                if refined_candidate is not None:
+                    local_candidate = refined_candidate
+                    self._pending_redetect_box = list(
+                        refined_candidate["state"])
             self._srbt_last_action = current_action
             action = decision["action"]
 
@@ -411,6 +709,9 @@ class PETTrack(BaseTracker):
             elif action == "verify":
                 is_absent = True
 
+            self._plan_next_search_state(
+                event_image, H, W, local_candidate, action)
+
             diagnostic = {
                 "action": action,
                 "event_centers": [],
@@ -437,6 +738,24 @@ class PETTrack(BaseTracker):
             if not hasattr(self, "_expert_diagnostics"):
                 self._expert_diagnostics = []
             self._expert_diagnostics.append(expert_states)
+            if not hasattr(self, "_search_diagnostics"):
+                self._search_diagnostics = []
+            self._record_search_diagnostic(
+                search_state,
+                resize_factor,
+                action,
+                local_candidate,
+                previous_action=previous_action.value,
+                controller_output_score=srbt_control.output_score,
+                recovery_attempted=recovery_attempted,
+                recovery_confirmed=confirmation is not None,
+                recovery_max_identity=self._recovery_diagnostic_value(
+                    recovery, "identity_scores"),
+                recovery_max_localization=self._recovery_diagnostic_value(
+                    recovery, "localization_scores"),
+                recovery_accepted_count=self._recovery_diagnostic_value(
+                    recovery, "accepted", count=True),
+            )
 
         # The current observation is committed only after its action is known.
         tracking_result_arr, tracking_result_event_arr, _, tracking_result_amask_arr = sample_target(

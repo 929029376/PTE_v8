@@ -85,8 +85,9 @@ def _temporal_consistency(boxes, last_box, eps=1e-6):
 
 def fuse_expert_predictions(
         boxes, response_peaks, response_psr, last_box,
-        cluster_iou=0.50, reject_consensus=0.15):
-    """Fuse expert image-coordinate ``xywh`` boxes without learned routing."""
+        cluster_iou=0.50, reject_consensus=0.15,
+        specialist_margin=1.05, minimum_quality=0.10):
+    """Select one expert box, falling back to the exact generalist box."""
     boxes = torch.as_tensor(boxes).float()
     if boxes.ndim != 2 or boxes.shape[1] != 4:
         raise ValueError("boxes must have shape (E,4)")
@@ -110,35 +111,32 @@ def fuse_expert_predictions(
         * temporal.pow(0.15)
     )
 
-    retained = torch.ones(
+    eligible = torch.ones(
         expert_count, dtype=torch.bool, device=boxes.device)
     if _has_pairwise_cluster(pairwise_iou, float(cluster_iou)):
-        retained &= consensus >= float(reject_consensus)
-    retained_ids = tuple(retained.nonzero(as_tuple=False).flatten().tolist())
-    retained_quality = quality * retained.to(quality.dtype)
-    quality_sum = retained_quality.sum()
-    if not retained_ids or not bool(torch.isfinite(quality_sum)) \
-            or float(quality_sum.item()) <= 0.0:
-        best_id = int(peaks.argmax().item())
-        weights = torch.zeros_like(quality)
-        weights[best_id] = 1.0
-        return ExpertEnsembleResult(
-            box=boxes[best_id],
-            score=float(peaks[best_id].item()),
-            weights=weights,
-            quality=quality,
-            consensus=consensus,
-            temporal=temporal,
-            retained_ids=(best_id,),
-        )
-
-    weights = retained_quality / quality_sum
+        eligible &= consensus >= float(reject_consensus)
+    eligible[0] = True
+    ranked_quality = quality.masked_fill(~eligible, float("-inf"))
+    best_id = int(ranked_quality.argmax().item())
+    selected_id = 0
+    best_quality = ranked_quality[best_id]
+    generalist_quality = quality[0]
+    if (
+        best_id != 0
+        and bool(torch.isfinite(best_quality))
+        and float(best_quality.item()) >= float(minimum_quality)
+        and float(best_quality.item())
+        >= float(generalist_quality.item()) * float(specialist_margin)
+    ):
+        selected_id = best_id
+    weights = torch.zeros_like(quality)
+    weights[selected_id] = 1.0
     return ExpertEnsembleResult(
-        box=(weights[:, None] * boxes).sum(dim=0),
-        score=float((weights * peaks).sum().item()),
+        box=boxes[selected_id],
+        score=float(peaks[selected_id].item()),
         weights=weights,
         quality=quality,
         consensus=consensus,
         temporal=temporal,
-        retained_ids=retained_ids,
+        retained_ids=(selected_id,),
     )

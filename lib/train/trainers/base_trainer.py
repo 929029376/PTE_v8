@@ -176,9 +176,14 @@ class BaseTrainer:
         distributed = self._is_distributed_training()
         num_tries = 1 if distributed or not fail_safe else 3
         for i in range(num_tries):
+            recovery_checkpoint_missing = False
             try:
                 if load_latest:
-                    self.load_checkpoint()
+                    checkpoint_loaded = self.load_checkpoint()
+                    if i > 0 and checkpoint_loaded is not True:
+                        recovery_checkpoint_missing = True
+                        raise RuntimeError(
+                            "Fail-safe recovery requires a checkpoint")
                 self.max_epochs = max_epochs
                 for epoch in range(self.epoch+1, max_epochs+1):
                     self.epoch = epoch
@@ -210,7 +215,9 @@ class BaseTrainer:
                     # A single-rank retry deadlocks the remaining DDP ranks.
                     # Let the distributed launcher fail the whole worker group;
                     # the external supervisor will restart from latest.
-                    if self._is_distributed_training():
+                    if (self._is_distributed_training()
+                            or i == num_tries - 1
+                            or recovery_checkpoint_missing):
                         raise
                     self.epoch -= 1
                     load_latest = True
@@ -221,6 +228,51 @@ class BaseTrainer:
                     raise
 
         print('Finished training!')
+
+    def _rebase_step_scheduler_after_resume(
+            self, configured_group_lrs, configured_scheduler_state):
+        if not bool(getattr(
+                self.settings, "rebase_scheduler_on_resume", False)):
+            return
+        if (self.lr_scheduler is None
+                or str(getattr(self.settings, "scheduler_type", "")) != "step"):
+            raise RuntimeError(
+                "Resume scheduler rebasing requires a step scheduler")
+        if len(configured_group_lrs) != len(self.optimizer.param_groups):
+            raise RuntimeError(
+                "Resume scheduler rebasing requires unchanged optimizer groups")
+
+        step_size = int(configured_scheduler_state["step_size"])
+        gamma = float(configured_scheduler_state["gamma"])
+        if step_size <= 0 or not math.isfinite(gamma) or gamma <= 0.0:
+            raise RuntimeError("Invalid configured resume scheduler state")
+        if any(not math.isfinite(lr) or lr <= 0.0
+               for lr in configured_group_lrs):
+            raise RuntimeError("Invalid configured resume learning rate")
+
+        decay_count = int(self.epoch) // step_size
+        resumed_lrs = [
+            float(lr) * (gamma ** decay_count)
+            for lr in configured_group_lrs
+        ]
+        for group, base_lr, resumed_lr in zip(
+                self.optimizer.param_groups,
+                configured_group_lrs,
+                resumed_lrs):
+            group["initial_lr"] = float(base_lr)
+            group["lr"] = resumed_lr
+
+        self.lr_scheduler.step_size = step_size
+        self.lr_scheduler.gamma = gamma
+        self.lr_scheduler.base_lrs = [
+            float(lr) for lr in configured_group_lrs]
+        self.lr_scheduler.last_epoch = int(self.epoch)
+        self.lr_scheduler._last_lr = resumed_lrs
+        if hasattr(self.lr_scheduler, "_step_count"):
+            self.lr_scheduler._step_count = int(self.epoch) + 1
+        print(
+            "Rebased resume step scheduler at epoch {}: step_size={}, "
+            "lr={}".format(self.epoch, step_size, resumed_lrs))
 
     @staticmethod
     def _is_distributed_training():
@@ -606,6 +658,12 @@ class BaseTrainer:
         else:
             raise TypeError
 
+        configured_group_lrs = [
+            float(group["lr"]) for group in self.optimizer.param_groups]
+        configured_scheduler_state = (
+            None if self.lr_scheduler is None
+            else self.lr_scheduler.state_dict())
+
         # Load network
         checkpoint_dict = load_srbt_checkpoint_file(checkpoint_path)
 
@@ -629,6 +687,9 @@ class BaseTrainer:
         if scaler is not None:
             scaler.load_state_dict(scaler_state)
         self.epoch = checkpoint_dict['epoch']
+        if configured_scheduler_state is not None:
+            self._rebase_step_scheduler_after_resume(
+                configured_group_lrs, configured_scheduler_state)
         self.config_summary = checkpoint_dict['config_summary']
         self.specialist_gate_reference = checkpoint_dict.get(
             'specialist_gate_reference',

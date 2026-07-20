@@ -2,7 +2,13 @@ import random
 import torch.utils.data
 import torch
 from lib.utils import TensorDict
-from lib.train.data.expert_ownership import load_manifest
+from lib.train.data.challenge_manifest import load_manifest
+from lib.train.data.felt_challenges import (
+    CHALLENGE_NAMES,
+    EXPERT_CHALLENGE_NAMES,
+    expert_supervision_mask,
+)
+
 
 def no_processing(data):
     return data
@@ -66,8 +72,54 @@ class TrackingSampler(torch.utils.data.Dataset):
             "absent_to_present": float(getattr(anchor_weights, "REAPPEARING", 0.25)),
         }
         challenge_cfg = getattr(data_cfg, "CHALLENGE_SAMPLING", None)
+        self.current_epoch = 1
+        train_cfg = getattr(cfg, "TRAIN", None)
         self.expert_phase = str(getattr(
-            getattr(cfg, "TRAIN", None), "EXPERT_PHASE", "specialize")).lower()
+            train_cfg, "EXPERT_PHASE", "specialize")).lower()
+        pursuit_cfg = getattr(data_cfg, "PURSUIT", None)
+        self.pursuit_enabled = (
+            self.expert_phase == "pursuit"
+            and bool(getattr(pursuit_cfg, "ENABLE", False))
+        )
+        self.pursuit_transition_probability = float(getattr(
+            pursuit_cfg, "TRANSITION_PROBABILITY", 0.5))
+        self.pursuit_reappear_probability = float(getattr(
+            pursuit_cfg, "REAPPEAR_PROBABILITY", 0.25))
+        if not 0.0 <= self.pursuit_transition_probability <= 1.0:
+            raise ValueError(
+                "DATA.PURSUIT.TRANSITION_PROBABILITY must be in [0, 1]")
+        if not 0.0 <= self.pursuit_reappear_probability \
+                <= self.pursuit_transition_probability:
+            raise ValueError(
+                "DATA.PURSUIT.REAPPEAR_PROBABILITY must be in [0, transition]")
+        self.training_expert_ids = tuple(int(expert_id) for expert_id in getattr(
+            train_cfg, "SPECIALIST_EXPERT_IDS", [1, 2, 3, 4]))
+        if (not self.training_expert_ids
+                or len(set(self.training_expert_ids)) != len(self.training_expert_ids)
+                or any(expert_id < 1 or expert_id > 4
+                       for expert_id in self.training_expert_ids)):
+            raise ValueError(
+                "TRAIN.SPECIALIST_EXPERT_IDS must contain unique IDs in [1, 4]")
+        specialist_schedule = []
+        previous_end = 0
+        for stage in getattr(
+                train_cfg, "SPECIALIST_EXPERT_SCHEDULE", ()):
+            if len(stage) != 3:
+                raise ValueError(
+                    "each specialist schedule entry must be "
+                    "[start_epoch, end_epoch, expert_ids]")
+            start, end = int(stage[0]), int(stage[1])
+            expert_ids = tuple(int(expert_id) for expert_id in stage[2])
+            if (start != previous_end + 1 or end < start or not expert_ids
+                    or len(set(expert_ids)) != len(expert_ids)
+                    or any(expert_id not in self.training_expert_ids
+                           for expert_id in expert_ids)):
+                raise ValueError(
+                    "specialist schedule must be contiguous, non-overlapping, "
+                    "and use configured expert IDs")
+            specialist_schedule.append((start, end, expert_ids))
+            previous_end = end
+        self.specialist_stage_schedule = tuple(specialist_schedule)
         self.precise_expert_sampling = (
             self.training
             and self.expert_phase == "specialize"
@@ -86,12 +138,33 @@ class TrackingSampler(torch.utils.data.Dataset):
     def __len__(self):
         return self.samples_per_epoch
 
-    def owner_for_index(self, index):
-        if self.samples_per_epoch % 5 != 0:
-            raise ValueError("samples_per_epoch must be divisible by five experts")
+    def set_epoch(self, epoch):
+        epoch = int(epoch)
+        if epoch < 1:
+            raise ValueError("epoch must be positive")
+        self.current_epoch = epoch
+
+    def _active_training_expert_ids(self):
+        for start, end, expert_ids in getattr(
+                self, "specialist_stage_schedule", ()):
+            if start <= self.current_epoch <= end:
+                return expert_ids
+        if getattr(self, "specialist_stage_schedule", ()):
+            raise ValueError(
+                f"epoch {self.current_epoch} is outside specialist schedule")
+        return self.training_expert_ids
+
+    def training_expert_for_index(self, index):
+        active_expert_ids = self._active_training_expert_ids()
+        expert_count = len(active_expert_ids)
+        if self.samples_per_epoch % expert_count != 0:
+            raise ValueError(
+                "samples_per_epoch must be divisible by active specialists")
         if index < 0 or index >= self.samples_per_epoch:
             raise IndexError(index)
-        return min(index // (self.samples_per_epoch // 5), 4)
+        block = min(
+            index // (self.samples_per_epoch // expert_count), expert_count - 1)
+        return active_expert_ids[block]
 
     def _sample_visible_ids(self, visible, num_ids=1, min_id=None, max_id=None,
                             allow_invisible=False, force_invisible=False):
@@ -243,7 +316,79 @@ class TrackingSampler(torch.utils.data.Dataset):
         template_frame_ids, search_frame_ids = examples[event_type]
         return template_frame_ids, search_frame_ids, event_type
 
-    def _expert_owner_labels(self, dataset, seq_id, seq_info_dict):
+    def _pursuit_episode_type_for_index(self, index):
+        slot = (int(index) % 100) / 100.0
+        if slot < self.pursuit_reappear_probability:
+            return "reappearance"
+        if slot < self.pursuit_transition_probability:
+            return "disappearance"
+        return "visible"
+
+    def _sample_pursuit_causal_frame_ids(
+            self, visible, seq_info_dict, episode_type=None):
+        """Sample a strict contiguous episode, including official absent frames."""
+        frame_count = len(seq_info_dict["bbox"])
+        window = int(self.num_search_frames)
+        valid = torch.as_tensor(
+            seq_info_dict.get("valid", torch.ones(frame_count)),
+            dtype=torch.bool,
+        ).reshape(-1)
+        if valid.numel() != frame_count or window < 2 or frame_count <= window:
+            return None, None, None
+        visible_candidates = []
+        disappearance_candidates = []
+        reappearance_candidates = []
+        presence = torch.as_tensor(visible, dtype=torch.bool).reshape(-1)
+        for start in range(1, frame_count - window + 1):
+            search_ids = list(range(start, start + window))
+            window_present = presence[search_ids]
+            if (not bool(presence[start])
+                    or not bool(valid[search_ids][window_present].all())):
+                continue
+            base_id = self._previous_visible_id(visible, start)
+            if base_id is None:
+                continue
+            previous = self._sample_visible_ids(
+                visible,
+                num_ids=self.num_template_frames - 1,
+                min_id=max(0, base_id - self.max_gap),
+                max_id=base_id,
+            )
+            if previous is None:
+                continue
+            candidate = ([base_id] + previous, search_ids)
+            has_reappearance = bool((
+                (~window_present[:-1]) & window_present[1:]).any())
+            if has_reappearance:
+                reappearance_candidates.append(candidate)
+            elif bool(window_present.all()):
+                visible_candidates.append(candidate)
+            else:
+                disappearance_candidates.append(candidate)
+        if episode_type is None:
+            draw = random.random()
+            reappear_probability = getattr(
+                self, "pursuit_reappear_probability", 0.25)
+            transition_probability = getattr(
+                self, "pursuit_transition_probability", 0.5)
+            episode_type = (
+                "reappearance" if draw < reappear_probability
+                else "disappearance" if draw < transition_probability
+                else "visible")
+        if episode_type == "reappearance":
+            candidates = reappearance_candidates
+        elif episode_type == "disappearance":
+            candidates = disappearance_candidates
+        elif episode_type == "visible":
+            candidates = visible_candidates
+        else:
+            raise ValueError(f"unknown pursuit episode type: {episode_type}")
+        if not candidates:
+            return None, None, None
+        template_ids, search_ids = random.choice(candidates)
+        return template_ids, search_ids, "pursuit_contiguous"
+
+    def _expert_attribute_labels(self, dataset, seq_id, seq_info_dict):
         if not hasattr(dataset, "sequence_list"):
             raise RuntimeError(
                 "precise expert sampling requires named video sequences")
@@ -251,34 +396,91 @@ class TrackingSampler(torch.utils.data.Dataset):
         record = self._expert_manifest.get(sequence_name)
         if record is None:
             raise RuntimeError(
-                f"expert ownership manifest has no sequence {sequence_name}")
-        labels = torch.as_tensor(record["owners"], dtype=torch.int8)
-        if labels.numel() != len(seq_info_dict["bbox"]):
+                f"challenge manifest has no sequence {sequence_name}")
+        attributes = record.get("attributes")
+        if not isinstance(attributes, dict) or set(attributes) != set(
+                CHALLENGE_NAMES):
             raise RuntimeError(
-                f"expert ownership length mismatch for {sequence_name}: "
-                f"manifest={labels.numel()} annotations={len(seq_info_dict['bbox'])}")
+                f"challenge manifest has invalid attributes for {sequence_name}")
+        frame_count = len(seq_info_dict["bbox"])
+        labels = {
+            name: torch.as_tensor(attributes[name], dtype=torch.bool)
+            for name in CHALLENGE_NAMES
+        }
+        if any(values.numel() != frame_count for values in labels.values()):
+            raise RuntimeError(
+                f"challenge manifest length mismatch for {sequence_name}")
         return labels
 
+    def _frame_challenge_labels(
+            self, dataset, seq_id, seq_info_dict, frame_id):
+        labels = self._expert_attribute_labels(
+            dataset, seq_id, seq_info_dict)
+        return torch.stack([labels[name][frame_id] for name in CHALLENGE_NAMES])
+
+    def _expert_candidate_groups(
+            self, dataset, seq_id, seq_info_dict, training_expert_id):
+        labels = self._expert_attribute_labels(
+            dataset, seq_id, seq_info_dict)
+        expert_mask = expert_supervision_mask(labels)
+        target = expert_mask[:, training_expert_id]
+        if training_expert_id != 3:
+            return {
+                "expert": torch.nonzero(target, as_tuple=False).flatten().tolist()
+            }
+
+        present = torch.as_tensor(
+            seq_info_dict["absent"], dtype=torch.bool).reshape(-1)
+        if present.numel() != target.numel():
+            raise RuntimeError("visibility labels must match challenge manifest")
+        previous_absent = torch.cat([
+            torch.zeros(1, dtype=torch.bool), ~present[:-1]
+        ])
+        reappear = labels["recovery"] & present & previous_absent
+        recovery = labels["recovery"] & ~reappear
+        groups = {
+            "absent": labels["absent"],
+            "reappear": reappear,
+            "recovery": recovery,
+        }
+        return {
+            name: torch.nonzero(
+                values, as_tuple=False
+            ).flatten().tolist()
+            for name, values in groups.items()
+            if bool(values.any())
+        }
+
     def _sample_expert_causal_frame_ids(
-            self, dataset, seq_id, visible, seq_info_dict, owner_id):
-        labels = self._expert_owner_labels(dataset, seq_id, seq_info_dict)
-        candidate_ids = torch.nonzero(
-            labels == owner_id, as_tuple=False).flatten().tolist()
-        random.shuffle(candidate_ids)
-        for search_id in candidate_ids:
-            frame_ids = self._causal_frame_ids_for_anchor(
-                visible, search_id, candidate_ids)
-            if frame_ids is not None:
-                template_frame_ids, search_frame_ids = frame_ids
-                return (
-                    template_frame_ids,
-                    search_frame_ids,
-                    f"expert_{owner_id}",
-                    owner_id,
-                )
-        if not candidate_ids:
-            return None, None, None, None
-        return None, None, None, None
+            self, dataset, seq_id, visible, seq_info_dict,
+            training_expert_id):
+        candidate_groups = self._expert_candidate_groups(
+            dataset, seq_id, seq_info_dict, training_expert_id)
+        examples = {}
+        for group_name, candidate_ids in candidate_groups.items():
+            random.shuffle(candidate_ids)
+            for search_id in candidate_ids:
+                frame_ids = self._causal_frame_ids_for_anchor(
+                    visible, search_id, candidate_ids)
+                if frame_ids is not None:
+                    examples[group_name] = frame_ids
+                    break
+        if not examples:
+            return None, None, None, None, None
+        group_name = random.choice(list(examples))
+        template_frame_ids, search_frame_ids = examples[group_name]
+        event_type = f"expert_{training_expert_id}"
+        if training_expert_id == 3:
+            event_type = f"{event_type}_{group_name}"
+        challenge_labels = self._frame_challenge_labels(
+            dataset, seq_id, seq_info_dict, search_frame_ids[-1])
+        return (
+            template_frame_ids,
+            search_frame_ids,
+            event_type,
+            training_expert_id,
+            challenge_labels,
+        )
 
     def _previous_visible_id(self, visible, frame_id):
         visible = self._to_bool_list(visible)
@@ -304,14 +506,25 @@ class TrackingSampler(torch.utils.data.Dataset):
         if self.train_cls:
             batch_data = self.getitem_cls()
         else:
-            owner_id = (
-                self.owner_for_index(index)
+            training_expert_id = (
+                self.training_expert_for_index(index)
                 if self.precise_expert_sampling else None
             )
-            batch_data = self.getitem(owner_id=owner_id)
+            pursuit_enabled = bool(getattr(
+                self, "pursuit_enabled", False))
+            pursuit_episode_type = (
+                self._pursuit_episode_type_for_index(index)
+                if pursuit_enabled else None)
+            if pursuit_enabled:
+                batch_data = self.getitem(
+                    training_expert_id=training_expert_id,
+                    pursuit_episode_type=pursuit_episode_type)
+            else:
+                batch_data = self.getitem(
+                    training_expert_id=training_expert_id)
         return batch_data
 
-    def getitem(self, owner_id=None):
+    def getitem(self, training_expert_id=None, pursuit_episode_type=None):
         """
         returns:
             TensorDict - dict containing all the data blocks
@@ -322,19 +535,27 @@ class TrackingSampler(torch.utils.data.Dataset):
             is_video_dataset = dataset.is_video_sequence()
             seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(
                 dataset, is_video_dataset)
-            expert_owner_id = None
+            sampled_training_expert_id = None
+            challenge_labels = None
             if is_video_dataset:
                 if self.frame_sample_mode == 'causal':
                     template_frame_ids, search_frame_ids = None, None
                     sampler_event_type = None
                     gap_increase = 0
                     # Sample test and train frames in a causal manner, i.e. search_frame_ids > template_frame_ids
-                    if self.precise_expert_sampling:
+                    if self.pursuit_enabled:
+                        template_frame_ids, search_frame_ids, sampler_event_type = \
+                            self._sample_pursuit_causal_frame_ids(
+                                visible, seq_info_dict, pursuit_episode_type)
+                        if search_frame_ids is None:
+                            continue
+                    elif self.precise_expert_sampling:
                         (template_frame_ids, search_frame_ids,
-                         sampler_event_type, expert_owner_id) = \
+                         sampler_event_type, sampled_training_expert_id,
+                         challenge_labels) = \
                             self._sample_expert_causal_frame_ids(
                                 dataset, seq_id, visible, seq_info_dict,
-                                owner_id)
+                                training_expert_id)
                         if search_frame_ids is None:
                             continue
                     elif self.srbt_enabled:
@@ -383,6 +604,14 @@ class TrackingSampler(torch.utils.data.Dataset):
                 redetect_search_anno = [
                     box.clone() for box in search_anno['bbox']
                 ]
+                pursuit_search_anno = [
+                    box.clone() for box in search_anno['bbox']
+                ]
+                pursuit_search_present = torch.as_tensor(
+                    search_anno.get(
+                        'absent', torch.ones(len(search_frame_ids))),
+                    dtype=torch.uint8,
+                )
                 self._replace_absent_search_boxes_for_crop(search_anno, search_frame_ids, seq_info_dict)
 
                 H, W, _ = template_aps_frame_list[0].shape
@@ -400,15 +629,27 @@ class TrackingSampler(torch.utils.data.Dataset):
                                     'template_event_images': template_dvs_frame_list,
                                    'search_event_images': search_dvs_frame_list,
                                 })
-                if expert_owner_id is not None:
-                    data['expert_owner_id'] = torch.tensor(
-                        expert_owner_id, dtype=torch.long)
+                if sampled_training_expert_id is not None:
+                    data['training_expert_id'] = torch.tensor(
+                        sampled_training_expert_id, dtype=torch.long)
+                    data['challenge_labels'] = challenge_labels
                 if self.srbt_enabled:
                     data.update({
                         'redetect_search_images': list(search_aps_frame_list),
                         'redetect_search_event_images': list(search_dvs_frame_list),
                         'redetect_search_anno': redetect_search_anno,
                         'redetect_search_masks': list(search_masks),
+                    })
+                if self.pursuit_enabled:
+                    data.update({
+                        'pursuit_search_images': list(search_aps_frame_list),
+                        'pursuit_search_event_images': list(search_dvs_frame_list),
+                        'pursuit_search_anno': pursuit_search_anno,
+                        'pursuit_search_masks': list(search_masks),
+                        'pursuit_search_present': pursuit_search_present,
+                        'pursuit_frame_ids': torch.tensor(
+                            search_frame_ids, dtype=torch.long),
+                        'pursuit_episode_type': pursuit_episode_type,
                     })
                 self._add_presence_transition_fields(
                     data, seq_info_dict, template_frame_ids, search_frame_ids,
@@ -517,6 +758,13 @@ class TrackingSampler(torch.utils.data.Dataset):
         while not enough_visible_frames:
             # Sample a sequence
             seq_id = random.randint(0, dataset.get_num_sequences() - 1)
+            if self.precise_expert_sampling:
+                if not hasattr(dataset, "sequence_list"):
+                    raise RuntimeError(
+                        "precise expert sampling requires named video sequences")
+                sequence_name = dataset.sequence_list[seq_id]
+                if sequence_name not in self._expert_manifest:
+                    continue
 
             # Sample frames
             seq_info_dict = dataset.get_sequence_info(seq_id)

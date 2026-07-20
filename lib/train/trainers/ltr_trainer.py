@@ -1,5 +1,6 @@
-import os
 import datetime
+import json
+import os
 from collections import OrderedDict
 
 from lib.train.data.wandb_logger import WandbWriter
@@ -7,6 +8,7 @@ from lib.train.sequence_validation import (
     EXPERT_DIAGNOSTIC_KEYS,
     EXPERT_NAMES,
     RECOVERY_DIAGNOSTIC_KEYS,
+    SMALL_TARGET_DIAGNOSTIC_KEYS,
     run_felt_sequence_validation,
     sequence_validation_due,
 )
@@ -22,11 +24,61 @@ from lib.utils.misc import get_world_size
 
 
 def _set_loader_epoch(loader, epoch):
+    if hasattr(loader.dataset, "set_epoch"):
+        loader.dataset.set_epoch(epoch)
     batch_sampler = getattr(loader, "batch_sampler", None)
     if hasattr(batch_sampler, "set_epoch"):
         batch_sampler.set_epoch(epoch)
     elif isinstance(loader.sampler, DistributedSampler):
         loader.sampler.set_epoch(epoch)
+
+
+def _write_small_target_diagnostics(
+        settings, epoch, rank, world_size, records, distributed):
+    tensorboard_dir = getattr(getattr(settings, "env", None),
+                              "tensorboard_dir", None)
+    project_path = getattr(settings, "project_path", None)
+    if not tensorboard_dir or not project_path:
+        return None
+    output_dir = os.path.join(tensorboard_dir, project_path)
+    os.makedirs(output_dir, exist_ok=True)
+    stem = f"small_target_diagnostics_epoch_{int(epoch):04d}"
+    shard_path = os.path.join(output_dir, f"{stem}.rank_{rank:04d}.jsonl")
+    with open(shard_path, "w", encoding="utf-8") as handle:
+        for record in records:
+            if int(record.get("expert_id", -1)) != 2:
+                raise ValueError(
+                    "Small-target JSONL accepts precision expert records only")
+            handle.write(json.dumps(
+                record, ensure_ascii=True, allow_nan=False,
+                separators=(",", ":")) + "\n")
+    if distributed:
+        torch.distributed.barrier()
+    final_path = os.path.join(output_dir, f"{stem}.jsonl")
+    if rank == 0:
+        merged = []
+        shard_paths = [
+            os.path.join(output_dir, f"{stem}.rank_{item:04d}.jsonl")
+            for item in range(world_size)
+        ]
+        for path in shard_paths:
+            with open(path, "r", encoding="utf-8") as handle:
+                merged.extend(
+                    json.loads(line) for line in handle if line.strip())
+        merged.sort(key=lambda item: (
+            str(item.get("sequence", "")), int(item.get("frame_index", -1))))
+        temporary_path = final_path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            for record in merged:
+                handle.write(json.dumps(
+                    record, ensure_ascii=True, allow_nan=False,
+                    separators=(",", ":")) + "\n")
+        os.replace(temporary_path, final_path)
+        for path in shard_paths:
+            os.remove(path)
+    if distributed:
+        torch.distributed.barrier()
+    return final_path if rank == 0 else None
 
 
 class LTRTrainer(BaseTrainer):
@@ -49,6 +101,9 @@ class LTRTrainer(BaseTrainer):
         if (getattr(settings, "sequence_val_enable", False)
                 and "sequence_val" not in stat_names):
             stat_names.append("sequence_val")
+        if (getattr(settings, "specialist_expert_schedule", None)
+                and "expert_val" not in stat_names):
+            stat_names.append("expert_val")
         self.stats = OrderedDict({name: None for name in stat_names})
 
         # Initialize tensorboard and wandb
@@ -207,33 +262,75 @@ class LTRTrainer(BaseTrainer):
                     )
 
     def finish_epoch(self):
-        sequence_val_due = (
+        stage_expert_id = None
+        for stage in getattr(
+                self.settings, "specialist_expert_schedule", ()):
+            if self.epoch != int(stage[1]):
+                continue
+            expert_ids = tuple(int(value) for value in stage[2])
+            if len(expert_ids) != 1:
+                raise ValueError(
+                    "stage ExpertVal requires exactly one active expert")
+            stage_expert_id = expert_ids[0]
+            break
+        sequence_val_scheduled = (
             getattr(self.settings, "sequence_val_enable", False)
             and sequence_validation_due(
                 self.epoch,
                 getattr(self.settings, "sequence_val_schedule", None))
         )
-        if sequence_val_due:
-            save_recovery = (
-                self._checkpoint_dir
-                and self._should_save_latest_checkpoint(
-                    self.epoch,
-                    getattr(self, "max_epochs", self.epoch),
-                    self.settings,
-                )
+        if stage_expert_id is not None:
+            self._run_sequence_validation(
+                forced_expert_id=stage_expert_id,
+                policy_mode=(
+                    "stateful" if stage_expert_id == 3 else "local"),
             )
-            if save_recovery and self.settings.local_rank in [-1, 0]:
-                self.save_checkpoint("latest")
-            if save_recovery and torch.distributed.is_available() \
-                    and torch.distributed.is_initialized():
-                torch.distributed.barrier()
+        if (sequence_val_scheduled
+                and self._sequence_validation_train_ready()):
             self._run_sequence_validation()
 
         self._stats_new_epoch()
         if self.settings.local_rank in [-1, 0]:
             self._write_tensorboard()
 
-    def _run_sequence_validation(self):
+    def _sequence_validation_train_ready(self):
+        if getattr(self, "_sequence_val_train_ready", False):
+            return True
+
+        threshold = float(getattr(
+            self.settings, "sequence_val_train_iou_threshold", 0.0))
+        if threshold <= 0.0:
+            self._sequence_val_train_ready = True
+            return True
+
+        meter = next((
+            self.stats.get(loader.name, {}).get("IoU")
+            for loader in self.loaders
+            if loader.training
+            and self.stats.get(loader.name, {}).get("IoU") is not None
+        ), None)
+        if meter is None or meter.count <= 0:
+            return False
+
+        total, count = float(meter.sum), float(meter.count)
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            reduced = torch.tensor(
+                [total, count], dtype=torch.float64, device=self.device)
+            torch.distributed.all_reduce(
+                reduced, op=torch.distributed.ReduceOp.SUM)
+            total, count = reduced.tolist()
+        train_iou = total / count
+        self._sequence_val_train_ready = train_iou >= threshold
+        if self.settings.local_rank in [-1, 0]:
+            state = "enabled" if self._sequence_val_train_ready else "waiting"
+            print(
+                f"SequenceVal train gate: {state}, "
+                f"IoU={train_iou:.6f}, threshold={threshold:.6f}")
+        return self._sequence_val_train_ready
+
+    def _run_sequence_validation(
+            self, forced_expert_id=None, policy_mode=None):
         network = (
             self.actor.net.module
             if multigpu.is_multi_gpu(self.actor.net)
@@ -245,12 +342,44 @@ class LTRTrainer(BaseTrainer):
         )
         rank = torch.distributed.get_rank() if distributed else 0
         world_size = torch.distributed.get_world_size() if distributed else 1
+        validation_name = (
+            "expert_val" if forced_expert_id is not None else "sequence_val")
+        log_prefix = (
+            "ExpertVal" if forced_expert_id is not None else "SequenceVal")
+        validation_kwargs = {
+            "rank": rank,
+            "world_size": world_size,
+            "felt_val_root": getattr(
+                self.settings.env, "felt_val_dir", None),
+        }
+        if forced_expert_id is not None:
+            validation_kwargs.update({
+                "forced_expert_id": int(forced_expert_id),
+                "policy_mode": policy_mode,
+                "log_prefix": log_prefix,
+            })
         local_metrics = run_felt_sequence_validation(
             network,
             self.actor.cfg,
-            rank=rank,
-            world_size=world_size,
-            felt_val_root=getattr(self.settings.env, "felt_val_dir", None),
+            **validation_kwargs,
+        )
+        small_target_records = local_metrics.pop(
+            "SMALL_TARGET_RECORDS", [])
+        has_small_target_diagnostics = (
+            bool(small_target_records)
+            or any(key in local_metrics
+                   for key in SMALL_TARGET_DIAGNOSTIC_KEYS)
+        )
+        diagnostic_jsonl = (
+            _write_small_target_diagnostics(
+                self.settings,
+                self.epoch,
+                rank,
+                world_size,
+                small_target_records,
+                distributed,
+            )
+            if has_small_target_diagnostics else None
         )
         reduced = torch.tensor(
             [
@@ -277,7 +406,9 @@ class LTRTrainer(BaseTrainer):
             if reappearance_count > 0 else None
         )
         diagnostic_values = None
-        if any(key in local_metrics for key in RECOVERY_DIAGNOSTIC_KEYS):
+        if (forced_expert_id in (None, 3)
+                and any(key in local_metrics
+                        for key in RECOVERY_DIAGNOSTIC_KEYS)):
             diagnostic_tensor = torch.tensor(
                 [float(local_metrics.get(key, 0.0))
                  for key in RECOVERY_DIAGNOSTIC_KEYS],
@@ -348,7 +479,11 @@ class LTRTrainer(BaseTrainer):
             expert_sums = dict(zip(
                 EXPERT_DIAGNOSTIC_KEYS, expert_tensor.tolist()))
             expert_values = {}
-            for expert_id, expert_name in enumerate(EXPERT_NAMES):
+            expert_ids = (
+                range(len(EXPERT_NAMES))
+                if forced_expert_id is None else (int(forced_expert_id),))
+            for expert_id in expert_ids:
+                expert_name = EXPERT_NAMES[expert_id]
                 prefix = f"EXPERT_{expert_id}"
                 count = expert_sums[f"{prefix}_COUNT"]
                 metric_prefix = f"ExpertVal/{expert_name}"
@@ -375,47 +510,136 @@ class LTRTrainer(BaseTrainer):
                             f"{prefix}_ENSEMBLE_SUCCESS_HITS"] / count),
                 })
 
-        if self.stats.get("sequence_val") is None:
-            self.stats["sequence_val"] = OrderedDict()
-        for metric_name in ("FELT_SR_PROXY", "FELT_ABSENT_BAL_ACC"):
-            if metric_name not in self.stats["sequence_val"]:
-                self.stats["sequence_val"][metric_name] = AverageMeter()
-        self.stats["sequence_val"]["FELT_SR_PROXY"].update(score)
-        self.stats["sequence_val"]["FELT_ABSENT_BAL_ACC"].update(absent_score)
-        if reappearance_score is not None:
-            if "FELT_REAPPEARANCE_PROXY" not in self.stats["sequence_val"]:
-                self.stats["sequence_val"][
+        small_target_values = None
+        if (forced_expert_id in (None, 2)
+                and any(key in local_metrics
+                        for key in SMALL_TARGET_DIAGNOSTIC_KEYS)):
+            small_target_tensor = torch.tensor(
+                [float(local_metrics.get(key, 0.0))
+                 for key in SMALL_TARGET_DIAGNOSTIC_KEYS],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            if world_size > 1:
+                torch.distributed.all_reduce(
+                    small_target_tensor, op=torch.distributed.ReduceOp.SUM)
+            sums = dict(zip(
+                SMALL_TARGET_DIAGNOSTIC_KEYS,
+                small_target_tensor.tolist(),
+            ))
+            count = sums["SMALL_TARGET_COUNT"]
+            small_target_values = {
+                "SmallTargetDiag/count": count,
+            }
+            ratio_specs = {
+                "center_in_crop_rate": (
+                    "SMALL_TARGET_CENTER_IN_CROP_HITS", "SMALL_TARGET_COUNT"),
+                "full_box_in_crop_rate": (
+                    "SMALL_TARGET_FULL_BOX_IN_CROP_HITS", "SMALL_TARGET_COUNT"),
+                "visible_fraction": (
+                    "SMALL_TARGET_VISIBLE_FRACTION_SUM", "SMALL_TARGET_COUNT"),
+                "target_width_px": (
+                    "SMALL_TARGET_TARGET_WIDTH_PX_SUM", "SMALL_TARGET_COUNT"),
+                "target_height_px": (
+                    "SMALL_TARGET_TARGET_HEIGHT_PX_SUM", "SMALL_TARGET_COUNT"),
+                "state_iou": (
+                    "SMALL_TARGET_STATE_IOU_SUM", "SMALL_TARGET_COUNT"),
+                "center_offset_norm": (
+                    "SMALL_TARGET_CENTER_OFFSET_NORM_SUM", "SMALL_TARGET_COUNT"),
+                "specialist_iou": (
+                    "SMALL_TARGET_SPECIALIST_IOU_SUM", "SMALL_TARGET_COUNT"),
+                "in_crop_iou": (
+                    "SMALL_TARGET_INSIDE_IOU_SUM", "SMALL_TARGET_INSIDE_COUNT"),
+                "out_of_crop_iou": (
+                    "SMALL_TARGET_OUTSIDE_IOU_SUM", "SMALL_TARGET_OUTSIDE_COUNT"),
+                "score_peak": (
+                    "SMALL_TARGET_SCORE_SUM", "SMALL_TARGET_SCORE_COUNT"),
+                "psr": ("SMALL_TARGET_PSR_SUM", "SMALL_TARGET_PSR_COUNT"),
+                "crop_miss_rate": (
+                    "SMALL_TARGET_CROP_MISS_COUNT", "SMALL_TARGET_COUNT"),
+                "in_window_low_confidence_rate": (
+                    "SMALL_TARGET_IN_WINDOW_LOW_CONFIDENCE_COUNT",
+                    "SMALL_TARGET_COUNT"),
+                "localization_error_rate": (
+                    "SMALL_TARGET_LOCALIZATION_ERROR_COUNT", "SMALL_TARGET_COUNT"),
+                "success_rate": (
+                    "SMALL_TARGET_SUCCESS_COUNT", "SMALL_TARGET_COUNT"),
+                "center_error_px": (
+                    "SMALL_TARGET_CENTER_ERROR_PX_SUM", "SMALL_TARGET_COUNT"),
+                "size_error_px": (
+                    "SMALL_TARGET_SIZE_ERROR_PX_SUM", "SMALL_TARGET_COUNT"),
+            }
+            small_target_values.update({
+                f"SmallTargetDiag/{name}": sums[numerator] / sums[denominator]
+                for name, (numerator, denominator) in ratio_specs.items()
+                if sums[denominator] > 0
+            })
+
+        if self.stats.get(validation_name) is None:
+            self.stats[validation_name] = OrderedDict()
+        score_metric = (
+            "FORCED_SEQUENCE_SR_PROXY"
+            if forced_expert_id is not None else "FELT_SR_PROXY")
+        metric_names = [score_metric]
+        if forced_expert_id in (None, 3):
+            metric_names.append("FELT_ABSENT_BAL_ACC")
+        for metric_name in metric_names:
+            if metric_name not in self.stats[validation_name]:
+                self.stats[validation_name][metric_name] = AverageMeter()
+        self.stats[validation_name][score_metric].update(score)
+        if forced_expert_id in (None, 3):
+            self.stats[validation_name][
+                "FELT_ABSENT_BAL_ACC"].update(absent_score)
+        if forced_expert_id in (None, 3) and reappearance_score is not None:
+            if "FELT_REAPPEARANCE_PROXY" not in self.stats[validation_name]:
+                self.stats[validation_name][
                     "FELT_REAPPEARANCE_PROXY"] = AverageMeter()
-            self.stats["sequence_val"][
+            self.stats[validation_name][
                 "FELT_REAPPEARANCE_PROXY"].update(reappearance_score)
         if diagnostic_values is not None:
             for metric_name, metric_value in diagnostic_values.items():
-                if metric_name not in self.stats["sequence_val"]:
-                    self.stats["sequence_val"][metric_name] = AverageMeter()
-                self.stats["sequence_val"][metric_name].update(metric_value)
+                if metric_name not in self.stats[validation_name]:
+                    self.stats[validation_name][metric_name] = AverageMeter()
+                self.stats[validation_name][metric_name].update(metric_value)
         if expert_values is not None:
             for metric_name, metric_value in expert_values.items():
-                if metric_name not in self.stats["sequence_val"]:
-                    self.stats["sequence_val"][metric_name] = AverageMeter()
-                self.stats["sequence_val"][metric_name].update(metric_value)
+                if metric_name not in self.stats[validation_name]:
+                    self.stats[validation_name][metric_name] = AverageMeter()
+                self.stats[validation_name][metric_name].update(metric_value)
+        if small_target_values is not None:
+            for metric_name, metric_value in small_target_values.items():
+                if metric_name not in self.stats[validation_name]:
+                    self.stats[validation_name][metric_name] = AverageMeter()
+                self.stats[validation_name][metric_name].update(metric_value)
         if rank == 0:
-            print(
-                "SequenceVal epoch {}: FELT_SR_PROXY={:.6f}, "
-                "FELT_ABSENT_BAL_ACC={:.6f}, "
-                "FELT_REAPPEARANCE_PROXY={}, sequences={}".format(
-                    self.epoch,
-                    score,
-                    absent_score,
-                    (f"{reappearance_score:.6f}"
-                     if reappearance_score is not None else "n/a"),
-                    sequence_count,
-                ))
+            if forced_expert_id is None:
+                print(
+                    "SequenceVal epoch {}: FELT_SR_PROXY={:.6f}, "
+                    "FELT_ABSENT_BAL_ACC={:.6f}, "
+                    "FELT_REAPPEARANCE_PROXY={}, sequences={}".format(
+                        self.epoch,
+                        score,
+                        absent_score,
+                        (f"{reappearance_score:.6f}"
+                         if reappearance_score is not None else "n/a"),
+                        sequence_count,
+                    ))
+            else:
+                print(
+                    "ExpertVal epoch {}: expert={}, "
+                    "FORCED_SEQUENCE_SR_PROXY={:.6f}, sequences={}".format(
+                        self.epoch,
+                        EXPERT_NAMES[int(forced_expert_id)],
+                        score,
+                        sequence_count,
+                    ))
             if diagnostic_values:
                 print(
-                    "SequenceVal recovery: EventR@1/3/5={}/{}/{}, "
+                    "{} recovery: EventR@1/3/5={}/{}/{}, "
                     "RGB_FAR={}, latency={}, success={}, "
                     "IoU@1/3/5={}/{}/{}, visible_retention={}, "
                     "FPS(track/recovery)={}/{}".format(
+                        log_prefix,
                         *[
                             (f"{diagnostic_values[name]:.6f}"
                              if name in diagnostic_values else "n/a")
@@ -441,9 +665,10 @@ class LTRTrainer(BaseTrainer):
                     if f"{prefix}_iou" not in expert_values:
                         continue
                     print(
-                        "SequenceVal expert {}: count={:.0f}, IoU={:.6f}, "
+                        "{} expert {}: count={:.0f}, IoU={:.6f}, "
                         "generalist={:.6f}, delta={:.6f}, ensemble={:.6f}, "
                         "SR={:.6f}".format(
+                            log_prefix,
                             expert_name,
                             expert_values[f"{prefix}_count"],
                             expert_values[f"{prefix}_iou"],
@@ -452,6 +677,41 @@ class LTRTrainer(BaseTrainer):
                             expert_values[f"{prefix}_ensemble_iou"],
                             expert_values[f"{prefix}_sr"],
                         ))
+            if small_target_values:
+                print(
+                    "{} small-target: count={:.0f}, center_in={:.6f}, "
+                    "full_in={:.6f}, target_px={:.3f}x{:.3f}, "
+                    "state_iou={:.6f}, in_crop_iou={}, out_crop_iou={}, "
+                    "crop_miss={:.6f}, low_conf={:.6f}, loc_error={:.6f}, "
+                    "success={:.6f}, jsonl={}".format(
+                        log_prefix,
+                        small_target_values.get("SmallTargetDiag/count", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/center_in_crop_rate", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/full_box_in_crop_rate", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/target_width_px", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/target_height_px", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/state_iou", 0.0),
+                        (f"{small_target_values['SmallTargetDiag/in_crop_iou']:.6f}"
+                         if "SmallTargetDiag/in_crop_iou" in small_target_values
+                         else "n/a"),
+                        (f"{small_target_values['SmallTargetDiag/out_of_crop_iou']:.6f}"
+                         if "SmallTargetDiag/out_of_crop_iou" in small_target_values
+                         else "n/a"),
+                        small_target_values.get(
+                            "SmallTargetDiag/crop_miss_rate", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/in_window_low_confidence_rate", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/localization_error_rate", 0.0),
+                        small_target_values.get(
+                            "SmallTargetDiag/success_rate", 0.0),
+                        diagnostic_jsonl or "disabled",
+                    ))
         return score
 
     def _init_timing(self):

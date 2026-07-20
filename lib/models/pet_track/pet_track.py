@@ -14,14 +14,20 @@ from lib.models.layers.atu import build_atu
 from lib.models.layers.redetection import build_redetection_expert
 from lib.models.layers.event_recovery import RGBIdentityVerifier
 from lib.models.layers.srbt_controller import VisibilityGate
-from lib.models.layers.expert_fusion import ExpertFusionBank, build_expert_fusions
+from lib.models.layers.expert_fusion import (
+    ExpertFusionBank, ProposalBoxAdapter, build_expert_fusions,
+)
+from lib.models.layers.small_target_expert import SmallTargetExpert
+from lib.models.layers.search_window_controller import SearchWindowController
 from lib.utils.box_ops import box_xyxy_to_cxcywh
 
 
 class PETTrack(nn.Module):
-    ARCHITECTURE_VERSION = 11
+    ARCHITECTURE_VERSION = 26
     _PET_STATE_PREFIXES = (
-        "visibility_gate.", "rgb_identity_verifier.", "redetect_expert.")
+        "visibility_gate.", "rgb_identity_verifier.", "redetect_expert.",
+        "small_target_expert.", "proposal_adapters.",
+        "search_window_controller.")
 
     def __init__(self, transformer, memory, box_head, cfg,
                  aux_loss=False, head_type="CORNER"):
@@ -46,25 +52,69 @@ class PETTrack(nn.Module):
         expert_cfg = getattr(cfg.MODEL, "EXPERT", None)
         self.expert_enabled = bool(getattr(
             expert_cfg, "ENABLE", False)) if expert_cfg is not None else False
+        self.precision_refiner_name = "precision_refiner"
         if self.expert_enabled:
             self.expert_names = list(expert_cfg.NAMES)
             self.default_expert = str(expert_cfg.DEFAULT)
             if self.default_expert not in self.expert_names:
                 raise ValueError("default expert must belong to MODEL.EXPERT.NAMES")
+            self.shared_expert_names = [
+                name for name in self.expert_names
+                if name != self.precision_refiner_name
+            ]
             self.expert_fusion = ExpertFusionBank(
-                build_expert_fusions(self.expert_names, transformer.embed_dim),
+                build_expert_fusions(
+                    self.shared_expert_names, transformer.embed_dim),
                 default_expert=self.default_expert,
             )
             self.expert_heads = nn.ModuleDict({
                 name: copy.deepcopy(box_head)
-                for name in self.expert_names
+                for name in self.shared_expert_names
                 if name != self.default_expert
             })
+            data_cfg = getattr(cfg, "DATA", None)
+            search_cfg = getattr(data_cfg, "SEARCH", None)
+            search_size = int(getattr(search_cfg, "SIZE", 256))
+            self.small_target_expert = (
+                SmallTargetExpert(search_size=search_size)
+                if self.precision_refiner_name in self.expert_names else None
+            )
+            motion_name = next(
+                (name for name in self.shared_expert_names
+                 if "motion" in name.lower()), None)
+            discrimination_name = next(
+                (name for name in self.shared_expert_names
+                 if "discrimination" in name.lower()), None)
+            adapter_names = [
+                name for name in (
+                    motion_name,
+                    self.precision_refiner_name
+                    if self.small_target_expert is not None else None,
+                    discrimination_name,
+                )
+                if name is not None
+            ]
+            self.proposal_adapters = nn.ModuleDict({
+                name: ProposalBoxAdapter() for name in adapter_names
+            })
+            self.proposal_parents = {}
+            if motion_name is not None:
+                self.proposal_parents[motion_name] = self.default_expert
+            if discrimination_name is not None:
+                self.proposal_parents[discrimination_name] = (
+                    motion_name or self.default_expert)
+            if self.small_target_expert is not None:
+                self.proposal_parents[self.precision_refiner_name] = (
+                    discrimination_name or motion_name or self.default_expert)
         else:
             self.expert_names = ["generalist"]
+            self.shared_expert_names = list(self.expert_names)
             self.default_expert = "generalist"
             self.expert_fusion = None
             self.expert_heads = nn.ModuleDict()
+            self.small_target_expert = None
+            self.proposal_adapters = nn.ModuleDict()
+            self.proposal_parents = {}
 
         srbt_cfg = getattr(cfg.MODEL, "SRBT", None)
         self.srbt_enabled = bool(getattr(srbt_cfg, "ENABLE", False)) if srbt_cfg is not None else False
@@ -91,6 +141,19 @@ class PETTrack(nn.Module):
                 hidden_dim=int(getattr(gate_cfg, "HIDDEN_DIM", 64)),
             )
             if self.srbt_enabled else None
+        )
+        search_controller_cfg = getattr(
+            cfg.MODEL, "SEARCH_CONTROLLER", None)
+        self.search_window_controller = (
+            SearchWindowController(
+                expert_count=len(self.expert_names),
+                hidden_dim=int(getattr(
+                    search_controller_cfg, "HIDDEN_DIM", 64)),
+                max_center_step=float(getattr(
+                    search_controller_cfg, "MAX_CENTER_STEP", 1.0)),
+            )
+            if bool(getattr(search_controller_cfg, "ENABLE", False))
+            else None
         )
 
     def _z_feat(self, zi):
@@ -311,46 +374,31 @@ class PETTrack(nn.Module):
             prediction["batch_indices"] = indices
         return prediction
 
-    def _small_target_detail(self, rgb_image, event_image):
-        if rgb_image.dim() == 5:
-            rgb_image = rgb_image[:, -1]
-        if event_image.dim() == 5:
-            event_image = event_image[:, -1]
-        projection = getattr(
-            getattr(self.backbone, "patch_embed", None), "proj", None)
-        if not isinstance(projection, nn.Conv2d):
-            return None
+    def _fuse_expert_search(self, name, rgb, event, context):
+        return self.expert_fusion.forward_expert(
+            name, rgb, event, context=context)
 
-        patch_size = tuple(max(1, size // 2) for size in projection.kernel_size)
-        weight = F.interpolate(
-            projection.weight.detach(), size=patch_size,
-            mode="bilinear", align_corners=False)
-        bias = projection.bias.detach() if projection.bias is not None else None
-
-        def project(image):
-            return F.conv2d(
-                image, weight, bias, stride=patch_size,
-                groups=projection.groups)
-
-        rgb_detail = project(rgb_image)
-        event_detail = project(event_image)
-        detail = rgb_detail + event_detail + (rgb_detail - event_detail).abs()
-        output_size = (self.feat_sz_s, self.feat_sz_s)
-        detail = F.adaptive_avg_pool2d(detail, output_size) + F.adaptive_max_pool2d(
-            detail, output_size)
-        detail = detail.flatten(2).transpose(1, 2)
-        return F.layer_norm(detail, (detail.shape[-1],))
-
-    def _expert_context(self, cat_feature, search_images=None,
-                        include_small_target=False):
-        context = {
+    def _expert_context(self, cat_feature):
+        return {
             "template_tokens": cat_feature[:, :-self.feat_len_s * 2]
         }
-        if include_small_target and search_images is not None:
-            detail = self._small_target_detail(*search_images)
-            if detail is not None:
-                context["small_target_detail"] = detail.to(cat_feature.dtype)
-        return context
+
+    def _training_expert(self, training_expert_ids, batch_size, device):
+        if training_expert_ids is None:
+            return None
+        expert_ids = torch.as_tensor(
+            training_expert_ids, device=device, dtype=torch.long).reshape(-1)
+        if expert_ids.numel() != batch_size:
+            raise ValueError(
+                "training_expert_ids must provide one ID per batch row")
+        unique = expert_ids.unique()
+        if unique.numel() != 1:
+            raise ValueError(
+                "specialist batches must contain exactly one training expert")
+        expert_id = int(unique.item())
+        if expert_id < 1 or expert_id >= len(self.expert_names):
+            raise ValueError("training_expert_ids contains an invalid specialist")
+        return self.expert_names[expert_id]
 
     def _head_for_expert(self, name):
         if name == self.default_expert:
@@ -361,13 +409,24 @@ class PETTrack(nn.Module):
 
     def _forward_box_head(self, fused_search, gt_score_map=None,
                           expert_name=None):
-        opt = fused_search.unsqueeze(-1).permute((0, 3, 2, 1)).contiguous()
-        bs, nq, channels, _ = opt.size()
-        opt_feat = opt.view(-1, channels, self.feat_sz_s, self.feat_sz_s)
         head = (
             self.box_head if expert_name is None
             else self._head_for_expert(expert_name)
         )
+        feat_sz = int(head.feat_sz)
+        expected_tokens = feat_sz ** 2
+        if fused_search.shape[1] != expected_tokens:
+            raise ValueError(
+                f"{expert_name or self.default_expert} head expects "
+                f"{expected_tokens} search tokens, got {fused_search.shape[1]}")
+        opt = fused_search.unsqueeze(-1).permute((0, 3, 2, 1)).contiguous()
+        bs, nq, channels, _ = opt.size()
+        opt_feat = opt.view(-1, channels, feat_sz, feat_sz)
+        if gt_score_map is not None and gt_score_map.shape[-2:] != (feat_sz, feat_sz):
+            gt_score_map = F.interpolate(
+                gt_score_map.unsqueeze(1) if gt_score_map.ndim == 3 else gt_score_map,
+                size=(feat_sz, feat_sz), mode="bilinear", align_corners=False,
+            ).squeeze(1)
         if self.head_type == "CORNER":
             pred_box, score_map = head(opt_feat, True)
             return {'pred_boxes': box_xyxy_to_cxcywh(pred_box).view(bs, nq, 4),
@@ -378,64 +437,99 @@ class PETTrack(nn.Module):
                     'size_map': size_map, 'offset_map': offset_map}
         raise NotImplementedError
 
+    def _condition_expert_output(self, name, direct_output, upstream_output):
+        if name not in self.proposal_adapters:
+            return direct_output
+        output = dict(direct_output)
+        direct_boxes = output["pred_boxes"]
+        upstream_boxes = upstream_output["pred_boxes"]
+        corrected_boxes, gate = self.proposal_adapters[name](
+            direct_boxes, upstream_boxes, output["score_map"])
+        output.update({
+            "pred_boxes": corrected_boxes,
+            "direct_pred_boxes": direct_boxes,
+            "upstream_pred_boxes": upstream_boxes.detach(),
+            "proposal_gate": gate,
+        })
+        return output
+
+    def _forward_shared_expert(self, name, rgb, event, context,
+                               gt_score_map, cache,
+                               detach_dependencies=False):
+        if name in cache:
+            return cache[name]
+        parent = self.proposal_parents.get(name)
+        if parent in self.shared_expert_names and parent not in cache:
+            if detach_dependencies:
+                dependency_modules = [
+                    self.expert_fusion.experts[parent],
+                    self._head_for_expert(parent),
+                ]
+                if parent in self.proposal_adapters:
+                    dependency_modules.append(self.proposal_adapters[parent])
+                training_states = [
+                    module.training for module in dependency_modules]
+                try:
+                    for module in dependency_modules:
+                        module.eval()
+                    with torch.no_grad():
+                        self._forward_shared_expert(
+                            parent, rgb, event, context, gt_score_map, cache,
+                            detach_dependencies=True)
+                finally:
+                    for module, training in zip(
+                            dependency_modules, training_states):
+                        module.train(training)
+            else:
+                self._forward_shared_expert(
+                    parent, rgb, event, context, gt_score_map, cache)
+        fused = self._fuse_expert_search(
+            name, rgb, event, context=context)
+        output = self._forward_box_head(
+            fused, gt_score_map, expert_name=name)
+        if parent in cache:
+            output = self._condition_expert_output(
+                name, output, cache[parent])
+        cache[name] = output
+        return output
+
     def forward_head(self, cat_feature, gt_score_map=None,
-                     expert_owner_ids=None, search_images=None):
+                     training_expert_ids=None):
         search = cat_feature[:, -self.feat_len_s * 2:]
         rgb = search[:, :self.feat_len_s]
         event = search[:, self.feat_len_s:]
         if not self.expert_enabled:
             return self._forward_box_head(rgb + event, gt_score_map)
 
-        if expert_owner_ids is not None:
-            owner_ids = torch.as_tensor(
-                expert_owner_ids, device=rgb.device, dtype=torch.long).reshape(-1)
-            if owner_ids.numel() != rgb.shape[0]:
-                raise ValueError(
-                    "expert_owner_ids must provide one owner per batch row")
-            unique = owner_ids.unique()
-            if unique.numel() != 1:
-                raise ValueError(
-                    "specialist batches must contain exactly one expert owner")
-            owner_id = int(unique.item())
-            if owner_id < 0 or owner_id >= len(self.expert_names):
-                raise ValueError("expert_owner_ids contains an invalid owner")
-            name = self.expert_names[owner_id]
-            context = self._expert_context(
-                cat_feature,
-                search_images=search_images,
-                include_small_target=name == "small_target_st",
-            )
-            fused = self.expert_fusion.forward_expert(
-                name, rgb, event, context=context)
-            out = self._forward_box_head(
-                fused, gt_score_map, expert_name=name)
-            out["expert_owner_id"] = unique
+        if training_expert_ids is not None:
+            name = self._training_expert(
+                training_expert_ids, rgb.shape[0], rgb.device)
+            if name == self.precision_refiner_name:
+                raise RuntimeError(
+                    "precision expert must bypass the shared forward head")
+            out = self._forward_shared_expert(
+                name, rgb, event, self._expert_context(cat_feature),
+                gt_score_map, {}, detach_dependencies=True)
             return out
 
-        context = self._expert_context(
-            cat_feature, search_images=search_images,
-            include_small_target="small_target_st" in self.expert_names)
+        context = self._expert_context(cat_feature)
         expert_outputs = {}
-        for name in self.expert_names:
-            fused = self.expert_fusion.forward_expert(
-                name, rgb, event, context=context)
-            expert_outputs[name] = self._forward_box_head(
-                fused, gt_score_map, expert_name=name)
+        for name in self.shared_expert_names:
+            self._forward_shared_expert(
+                name, rgb, event, context, gt_score_map, expert_outputs)
         out = dict(expert_outputs[self.default_expert])
         out["expert_outputs"] = expert_outputs
         return out
 
     def _forward_amt_core(self, zi, ze, xi, xe, encoded_templates=None,
-                          expert_owner_ids=None, **kwargs):
+                          training_expert_ids=None, **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
         else:
             feat, aux = self._run_encoded_backbone(
                 *encoded_templates, xi, xe, **kwargs)
-        search_images = (xi, xe)
         out = self.forward_head(
-            feat, expert_owner_ids=expert_owner_ids,
-            search_images=search_images)
+            feat, training_expert_ids=training_expert_ids)
         out.update(aux)
         out["backbone_feat"] = feat
         return out
@@ -444,22 +538,22 @@ class PETTrack(nn.Module):
                       redetect_images=None,
                       redetect_event_images=None, redetect_mask=None,
                       encoded_templates=None,
-                      expert_owner_ids=None,
+                      training_expert_ids=None,
                       **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
         else:
             feat, aux = self._run_encoded_backbone(
                 *encoded_templates, xi, xe, **kwargs)
-        search_images = (xi, xe)
         out = self.forward_head(
             feat,
-            expert_owner_ids=expert_owner_ids,
-            search_images=search_images,
+            training_expert_ids=training_expert_ids,
         )
         out.update(aux)
         out["backbone_feat"] = feat
-        response_flat = out["score_map"].flatten(1)
+        presence_output = out.get("expert_outputs", {}).get(
+            "visibility_foc_ov", out)
+        response_flat = presence_output["score_map"].flatten(1)
         response_stats = torch.stack((
             response_flat.max(dim=-1).values,
             response_flat.mean(dim=-1),
@@ -487,37 +581,97 @@ class PETTrack(nn.Module):
     def forward(self, zi, ze, xi, xe, mask_z=None, ce_template_mask=None,
                 ce_keep_rate=None, return_last_attn=False,
                 redetect_images=None, redetect_event_images=None,
-                redetect_mask=None, expert_owner_ids=None):
+                redetect_mask=None, training_expert_ids=None):
+        training_expert_name = self._training_expert(
+            training_expert_ids, xi.shape[0], xi.device)
         kwargs = {
             "mask_z": mask_z,
             "ce_template_mask": ce_template_mask,
             "ce_keep_rate": ce_keep_rate,
             "return_last_attn": return_last_attn,
         }
+        if training_expert_name == self.precision_refiner_name:
+            if self.small_target_expert is None:
+                raise RuntimeError("small-target expert is not enabled")
+            parent_name = self.proposal_parents.get(
+                self.precision_refiner_name)
+            upstream = None
+            if parent_name in self.shared_expert_names:
+                parent_id = self.expert_names.index(parent_name)
+                parent_training_expert_ids = torch.full_like(
+                    training_expert_ids, parent_id)
+                with torch.no_grad():
+                    upstream = self._forward_amt_core(
+                        zi, ze, xi, xe,
+                        training_expert_ids=parent_training_expert_ids,
+                        **kwargs)
+            out = self.small_target_expert(zi, ze, xi, xe)
+            if upstream is not None:
+                out = self._condition_expert_output(
+                    self.precision_refiner_name, out, upstream)
+            return out
         if self.srbt_enabled:
             return self._forward_srbt(
                 zi, ze, xi, xe,
                 redetect_images=redetect_images,
                 redetect_event_images=redetect_event_images,
                 redetect_mask=redetect_mask,
-                expert_owner_ids=expert_owner_ids,
+                training_expert_ids=training_expert_ids,
                 **kwargs)
         return self._forward_amt_core(
             zi, ze, xi, xe,
-            expert_owner_ids=expert_owner_ids,
+            training_expert_ids=training_expert_ids,
             **kwargs)
 
-    def inference(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe):
+    def inference(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe,
+                  small_template_features=None):
+        raw_static_zi = static_zi
+        raw_static_ze = static_ze
+        if (self.small_target_expert is not None
+                and small_template_features is None and (
+                raw_static_zi.ndim not in (4, 5)
+                or raw_static_ze.ndim not in (4, 5))):
+            raise ValueError(
+                "independent small-target inference requires raw static "
+                "RGB/event template images")
         encoded_templates = self._encode_runtime_templates(
             static_zi, static_ze, dynamic_zi, dynamic_ze)
         static_zi, static_ze, _, _ = encoded_templates
         if self.srbt_enabled:
-            return self._forward_srbt(
+            out = self._forward_srbt(
                 static_zi, static_ze, xi, xe,
                 encoded_templates=encoded_templates)
-        return self._forward_amt_core(
-            static_zi, static_ze, xi, xe,
-            encoded_templates=encoded_templates)
+        else:
+            out = self._forward_amt_core(
+                static_zi, static_ze, xi, xe,
+                encoded_templates=encoded_templates)
+        if self.small_target_expert is None:
+            return out
+        shared_outputs = out.get("expert_outputs")
+        if shared_outputs is None:
+            raise RuntimeError("shared inference did not return expert outputs")
+        if small_template_features is None:
+            small_output = self.small_target_expert(
+                raw_static_zi, raw_static_ze, xi, xe)
+        else:
+            small_output = self.small_target_expert.track_with_template(
+                small_template_features, xi, xe)
+        parent_name = self.proposal_parents.get(self.precision_refiner_name)
+        if parent_name in shared_outputs:
+            small_output = self._condition_expert_output(
+                self.precision_refiner_name,
+                small_output,
+                shared_outputs[parent_name],
+            )
+        out["expert_outputs"] = {
+            name: (
+                small_output
+                if name == self.precision_refiner_name
+                else shared_outputs[name]
+            )
+            for name in self.expert_names
+        }
+        return out
 
     def redetect(self, full_feat, prior_H=None, template_tokens=None):
         if self.redetect_expert is None:
@@ -645,6 +799,66 @@ def _read_checkpoint_state(checkpoint_path, *, trusted_legacy_pickle=False):
     return checkpoint_path, normalized
 
 
+def _copy_resized_conv(source, target, *, allow_output_slice=False):
+    if not isinstance(source, nn.Conv2d) or not isinstance(target, nn.Conv2d):
+        return False
+    weight = source.weight.detach().float()
+    if weight.shape[0] != target.out_channels:
+        if not allow_output_slice or weight.shape[0] < target.out_channels:
+            return False
+        weight = weight[:target.out_channels]
+    source_norm = weight.flatten(1).norm(dim=1, keepdim=True).clamp_min(1e-8)
+    if weight.shape[-2:] != target.kernel_size:
+        weight = F.interpolate(
+            weight, size=target.kernel_size,
+            mode="bilinear", align_corners=False)
+    if weight.shape[1] != target.in_channels:
+        output_channels, _, height, width = weight.shape
+        weight = weight.permute(0, 2, 3, 1).reshape(
+            output_channels * height * width, 1, -1)
+        weight = F.interpolate(
+            weight, size=target.in_channels,
+            mode="linear", align_corners=False)
+        weight = weight.reshape(
+            output_channels, height, width, target.in_channels,
+        ).permute(0, 3, 1, 2)
+    resized_norm = weight.flatten(1).norm(
+        dim=1, keepdim=True).clamp_min(1e-8)
+    weight = weight * (source_norm / resized_norm).view(-1, 1, 1, 1)
+    with torch.no_grad():
+        target.weight.copy_(weight.to(target.weight))
+        if target.bias is not None and source.bias is not None:
+            target.bias.copy_(source.bias[:target.out_channels].to(target.bias))
+    return True
+
+
+def _initialize_small_target_from_baseline(model):
+    small = getattr(model, "small_target_expert", None)
+    if not isinstance(small, SmallTargetExpert):
+        return []
+    initialized = []
+    patch_projection = getattr(
+        getattr(getattr(model, "backbone", None), "patch_embed", None),
+        "proj", None)
+    for modality in ("rgb", "event"):
+        target = getattr(small.encoder, f"{modality}_stem")[0]
+        if _copy_resized_conv(
+                patch_projection, target, allow_output_slice=True):
+            initialized.append(
+                f"small_target_expert.encoder.{modality}_stem.0")
+    source_head = getattr(model, "box_head", None)
+    for branch, source_name in (
+            ("center", "conv5_ctr"),
+            ("size", "conv5_size"),
+            ("offset", "conv5_offset")):
+        source = getattr(source_head, source_name, None)
+        target = getattr(small.head, branch)[-1]
+        if _copy_resized_conv(source, target):
+            initialized.append(
+                f"small_target_expert.head.{branch}.3")
+    return initialized
+
+
 def _load_filtered_baseline_checkpoint(
         model, checkpoint_path, *, trusted_legacy_pickle=False):
     checkpoint_path, normalized = _read_checkpoint_state(
@@ -679,12 +893,19 @@ def _load_filtered_baseline_checkpoint(
         raise RuntimeError(
             "Baseline checkpoint load violated the audited state: "
             f"missing={inherited_missing}, unexpected={sorted(unexpected)}")
+    expert_heads = getattr(model, "expert_heads", None)
+    if expert_heads is not None:
+        baseline_head_state = model.box_head.state_dict()
+        for head in expert_heads.values():
+            head.load_state_dict(baseline_head_state, strict=True)
+    small_target_initialized_keys = _initialize_small_target_from_baseline(model)
     return {
         "path": checkpoint_path,
         "loaded_count": len(loaded),
         "loaded_keys": sorted(loaded),
         "missing_extension_keys": sorted(
             key for key in missing if not key.startswith(inherited_prefixes)),
+        "small_target_initialized_keys": small_target_initialized_keys,
     }
 
 
@@ -706,12 +927,64 @@ def _load_retained_model_checkpoint(
             continue
         loadable[target_key] = source.clone()
         migrated_head_keys.append(target_key)
-    extension_prefixes = (
-        "_pet_architecture_version",
-        "visibility_gate.",
-        "rgb_identity_verifier.",
-        "redetect_expert.",
+    source_version_tensor = normalized.get("_pet_architecture_version")
+    source_version = (
+        int(source_version_tensor.item())
+        if source_version_tensor is not None else None
     )
+    target_version = int(target["_pet_architecture_version"].item())
+    if source_version is not None and source_version > target_version:
+        raise RuntimeError(
+            f"{label} checkpoint architecture v{source_version} is newer "
+            f"than target architecture v{target_version}")
+    migrated_proposal_adapter_keys = []
+    if source_version is not None and source_version < 25:
+        old_prefix = "proposal_adapters.small_target_st."
+        new_prefix = "proposal_adapters.precision_refiner."
+        for target_key in sorted(target):
+            if not target_key.startswith(new_prefix) or target_key in loadable:
+                continue
+            source_key = target_key.replace(new_prefix, old_prefix, 1)
+            source = loadable.get(source_key)
+            if source is None or tuple(source.shape) != tuple(target[target_key].shape):
+                continue
+            loadable[target_key] = source
+            migrated_proposal_adapter_keys.append(target_key)
+    box_refiner_prefix = "small_target_expert.box_refiner."
+    if source_version is None or source_version < 13:
+        migration_prefixes = (
+            "visibility_gate.",
+            "rgb_identity_verifier.",
+            "redetect_expert.",
+            "small_target_expert.head.refine.",
+            "small_target_expert.encoder.rgb_s8_residual.",
+            "small_target_expert.encoder.event_s8_residual.",
+            box_refiner_prefix,
+        )
+    elif source_version == 13:
+        migration_prefixes = (
+            "small_target_expert.head.refine.",
+            "small_target_expert.encoder.rgb_s8_residual.",
+            "small_target_expert.encoder.event_s8_residual.",
+            box_refiner_prefix,
+        )
+    elif source_version < 18:
+        migration_prefixes = (
+            "small_target_expert.encoder.rgb_s8_residual.",
+            "small_target_expert.encoder.event_s8_residual.",
+            box_refiner_prefix,
+        )
+    elif source_version < 23:
+        migration_prefixes = (box_refiner_prefix,)
+    else:
+        migration_prefixes = ()
+    proposal_adapter_prefix = "proposal_adapters."
+    if source_version is None or source_version < 24:
+        migration_prefixes = (*migration_prefixes, proposal_adapter_prefix)
+    if source_version is None or source_version < 26:
+        migration_prefixes = (
+            *migration_prefixes, "search_window_controller.")
+    extension_prefixes = ("_pet_architecture_version", *migration_prefixes)
     retained = sorted(
         key for key in target if not key.startswith(extension_prefixes))
     missing = sorted(key for key in retained if key not in loadable)
@@ -732,10 +1005,18 @@ def _load_retained_model_checkpoint(
     loaded = {key: loadable[key] for key in retained}
     loaded["_pet_architecture_version"] = target["_pet_architecture_version"]
     initialized_extensions = []
+    reset_box_refiner = source_version is None or source_version < 23
+    reset_proposal_adapters = source_version is None or source_version < 24
     for key in sorted(target):
         if not key.startswith(extension_prefixes) or key == "_pet_architecture_version":
             continue
-        source = normalized.get(key)
+        reset_extension = (
+            reset_box_refiner and key.startswith(box_refiner_prefix)
+        ) or (
+            reset_proposal_adapters
+            and key.startswith(proposal_adapter_prefix)
+        )
+        source = None if reset_extension else normalized.get(key)
         if source is not None and tuple(source.shape) == tuple(target[key].shape):
             loaded[key] = source
         else:
@@ -752,7 +1033,11 @@ def _load_retained_model_checkpoint(
         key for key in normalized
         if key.startswith(("srbt_", "module.srbt_")))
     ignored_obsolete = sorted(
-        key for key in normalized if key.startswith("expert_router."))
+        key for key in normalized
+        if key.startswith((
+            "expert_router.",
+            "small_target_expert.detail_center.",
+        )))
     return {
         "path": checkpoint_path,
         "label": label,
@@ -761,6 +1046,7 @@ def _load_retained_model_checkpoint(
         "ignored_legacy_keys": ignored_legacy,
         "ignored_obsolete_keys": ignored_obsolete,
         "migrated_head_keys": migrated_head_keys,
+        "migrated_proposal_adapter_keys": migrated_proposal_adapter_keys,
     }
 
 
@@ -848,6 +1134,7 @@ def _print_stage_report(model, cfg):
         "specialize": ["base", "srbt", "redetect"],
         "refine": ["base", "srbt", "redetect"],
         "recovery": ["srbt", "redetect"],
+        "pursuit": ["pursuit"],
     }.get(expert_phase, ["invalid_configuration"])
     print("PETTrack stage report")
     print("  Train/expert_phase:", expert_phase)

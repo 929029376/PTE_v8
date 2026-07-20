@@ -332,6 +332,52 @@ def test_recovery_cycle_clips_zero_area_candidate_before_pending_search():
     assert tracker._last_redetect_conf == pytest.approx(0.9)
 
 
+def test_pending_recovery_box_is_refined_with_current_dynamic_templates(
+        monkeypatch):
+    sampled = []
+
+    def sample_target_for_test(**kwargs):
+        sampled.append(kwargs["target_bb"])
+        return (
+            torch.zeros(8, 8, 3),
+            torch.zeros(8, 8, 3),
+            2.0,
+            torch.zeros(8, 8),
+        )
+
+    monkeypatch.setattr(
+        "lib.test.tracker.pet_track.sample_target", sample_target_for_test)
+    tracker = object.__new__(PETTrackTracker)
+    tracker._pending_redetect_box = [10.0, 12.0, 6.0, 8.0]
+    tracker.params = SimpleNamespace(search_factor=3.0, search_size=8)
+    tracker.preprocessor = SimpleNamespace(
+        process=lambda patch, _mask: SimpleNamespace(
+            tensors=patch.permute(2, 0, 1).unsqueeze(0)))
+    tracker.dynamic_zi = torch.randn(1, 2, 4)
+    tracker.dynamic_ze = torch.randn(1, 2, 4)
+    calls = []
+
+    def run_local(*args, **kwargs):
+        calls.append(kwargs)
+        return {"state": [11.0, 13.0, 5.0, 7.0]}
+
+    tracker._run_local_candidate = run_local
+
+    refined = PETTrackTracker._refine_pending_recovery(
+        tracker,
+        torch.zeros(32, 32, 3),
+        torch.zeros(32, 32, 3),
+        32,
+        32,
+    )
+
+    assert sampled == [[10.0, 12.0, 6.0, 8.0]]
+    assert refined["state"] == [11.0, 13.0, 5.0, 7.0]
+    assert calls[0]["reference_state"] == sampled[0]
+    assert calls[0]["dynamic_templates"] == (
+        tracker.dynamic_zi, tracker.dynamic_ze)
+
+
 def test_verify_keeps_thor_frozen_and_does_not_write_memory(monkeypatch):
     class ThorProbe:
         def __init__(self):
@@ -467,6 +513,19 @@ def test_two_current_recovery_confirmations_resume_tracking(monkeypatch):
         lambda *_args, **_kwargs: ([10.0, 10.0, 12.0, 12.0], 0.9)
     )
     tracker._run_redetection = lambda *_args, **_kwargs: None
+    refine_calls = []
+
+    def refine_pending(*_args, **_kwargs):
+        refine_calls.append(list(tracker._pending_redetect_box))
+        return {
+            "state": [11.0, 11.0, 10.0, 10.0],
+            "score_peak": 0.95,
+            "presence_score": 0.95,
+            "response": torch.ones(1, 1, 2, 2),
+            "memory_frame_open": False,
+        }
+
+    tracker._refine_pending_recovery = refine_pending
 
     first = PETTrackTracker.track(
         tracker, torch.zeros(32, 32, 3), torch.zeros(32, 32, 3))
@@ -476,6 +535,7 @@ def test_two_current_recovery_confirmations_resume_tracking(monkeypatch):
     assert first["absent"] is True
     assert tracker.get_recovery_diagnostics()[0]["action"] == "verify"
     assert second["absent"] is False
-    assert second["target_bbox"] == pytest.approx([10.0, 10.0, 12.0, 12.0])
+    assert second["target_bbox"] == pytest.approx([11.0, 11.0, 10.0, 10.0])
+    assert refine_calls == [[10.0, 10.0, 12.0, 12.0]]
     assert tracker.get_recovery_diagnostics()[1]["action"] == "track"
     assert tracker.thor_wrapper.resume_calls == 1

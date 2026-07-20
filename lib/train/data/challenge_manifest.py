@@ -1,25 +1,24 @@
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 from lib.train.data.felt_challenges import (
+    CHALLENGE_NAMES,
+    DEFAULT_AMBIGUITY_THRESHOLD,
+    DEFAULT_SMALL_MAX_ASPECT_RATIO,
     DEFAULT_MOTION_NORM,
     DEFAULT_RECOVERY_WINDOW,
     DEFAULT_SMALL_AREA_RATIO,
-    assign_expert_owners,
+    classify_felt_challenges,
 )
 
-
-EXPERT_REASONS = (
-    "generalist",
-    "motion",
-    "small_target",
-    "visibility",
-    "discrimination",
-)
+DEFAULT_LOW_LIGHT_APS_MEAN = 8.2656
+DEFAULT_LOW_LIGHT_TARGET_MEAN = 6.8185
+DEFAULT_LOW_LIGHT_CONTRAST = 4.22215
 
 
 def _grayscale_frames(frames, name):
@@ -49,7 +48,7 @@ def _box_slice(box, height, width):
     return None if x2 <= x1 or y2 <= y1 else (slice(y1, y2), slice(x1, x2))
 
 
-def _aps_ambiguity(template_frame, search_frame, template_box):
+def _aps_ambiguity(template_frame, search_frame, template_box, search_box):
     target_slice = _box_slice(
         template_box, template_frame.shape[-2], template_frame.shape[-1])
     if target_slice is None:
@@ -73,17 +72,25 @@ def _aps_ambiguity(template_frame, search_frame, template_box):
     similarity = (template_vector[:, None] * patches).sum(dim=0)
     similarity = (similarity / (template_norm * patch_norms)).clamp_min(0.0)
     similarity = similarity.reshape(57, 57)
-    best_value, best_index = similarity.flatten().max(dim=0)
-    if best_value <= 1e-6:
+
+    x, y, width, height = torch.as_tensor(
+        search_box, dtype=torch.float32).tolist()
+    if width <= 0 or height <= 0:
         return template_frame.new_zeros(())
-    best_y = int(best_index.item()) // similarity.shape[1]
-    best_x = int(best_index.item()) % similarity.shape[1]
+    scale_x = 64.0 / search_frame.shape[-1]
+    scale_y = 64.0 / search_frame.shape[-2]
+    x1 = max(0, math.floor(x * scale_x) - 7)
+    y1 = max(0, math.floor(y * scale_y) - 7)
+    x2 = min(similarity.shape[1], math.ceil((x + width) * scale_x))
+    y2 = min(similarity.shape[0], math.ceil((y + height) * scale_y))
+    if x2 <= x1 or y2 <= y1:
+        return template_frame.new_zeros(())
+
+    target_value = similarity[y1:y2, x1:x2].max()
     suppressed = similarity.clone()
-    suppressed[
-        max(0, best_y - 4):min(similarity.shape[0], best_y + 5),
-        max(0, best_x - 4):min(similarity.shape[1], best_x + 5),
-    ] = 0.0
-    return (suppressed.max() / best_value).clamp(0.0, 1.0)
+    suppressed[y1:y2, x1:x2] = 0.0
+    distractor_value = suppressed.max()
+    return distractor_value / target_value.clamp_min(1e-6)
 
 
 def _event_motion_pair(current, previous, box):
@@ -135,7 +142,7 @@ def compute_observation_scores(aps, dvs, boxes, presence):
         if template_index is None:
             template_index = index
         ambiguity[index] = _aps_ambiguity(
-            aps[template_index], aps[index], boxes[template_index])
+            aps[template_index], aps[index], boxes[template_index], boxes[index])
         event_motion[index] = _event_motion_score(dvs, boxes, index)
     return {"ambiguity": ambiguity, "event_motion": event_motion}
 
@@ -143,9 +150,13 @@ def compute_observation_scores(aps, dvs, boxes, presence):
 def build_sequence_record(dataset, seq_id, thresholds=None):
     thresholds = {
         "small_area_ratio": DEFAULT_SMALL_AREA_RATIO,
+        "max_small_aspect_ratio": DEFAULT_SMALL_MAX_ASPECT_RATIO,
         "motion_norm": DEFAULT_MOTION_NORM,
-        "ambiguity_threshold": 0.8,
+        "ambiguity_threshold": DEFAULT_AMBIGUITY_THRESHOLD,
         "recovery_window": DEFAULT_RECOVERY_WINDOW,
+        "low_light_aps_mean": DEFAULT_LOW_LIGHT_APS_MEAN,
+        "low_light_target_mean": DEFAULT_LOW_LIGHT_TARGET_MEAN,
+        "low_light_contrast": DEFAULT_LOW_LIGHT_CONTRAST,
         **(thresholds or {}),
     }
     info = dataset.get_sequence_info(seq_id)
@@ -156,6 +167,7 @@ def build_sequence_record(dataset, seq_id, thresholds=None):
 
     ambiguity = torch.zeros(presence.numel(), dtype=torch.float32)
     event_motion = torch.zeros_like(ambiguity)
+    low_light = torch.zeros_like(presence)
     template_frame = None
     template_box = None
     previous_event = None
@@ -174,33 +186,48 @@ def build_sequence_record(dataset, seq_id, thresholds=None):
             and boxes[frame_id, 3] > 0
         )
         if valid:
+            target_slice = _box_slice(
+                boxes[frame_id], current_aps.shape[-2], current_aps.shape[-1])
+            target_mean = (
+                current_aps[target_slice].mean()
+                if target_slice is not None else current_aps.new_tensor(float("inf"))
+            )
+            frame_mean = current_aps.mean()
+            low_light[frame_id] = bool(
+                frame_mean <= thresholds["low_light_aps_mean"]
+                and target_mean <= thresholds["low_light_target_mean"]
+                and torch.abs(target_mean - frame_mean)
+                <= thresholds["low_light_contrast"]
+            )
             if template_frame is None:
                 template_frame = current_aps.clone()
                 template_box = boxes[frame_id].clone()
             ambiguity[frame_id] = _aps_ambiguity(
-                template_frame, current_aps, template_box)
+                template_frame, current_aps, template_box, boxes[frame_id])
             event_motion[frame_id] = _event_motion_pair(
                 current_event, previous_event, boxes[frame_id])
         previous_event = current_event
 
     if image_size is None:
         raise ValueError("sequence contains no frames")
-    result = assign_expert_owners(
+    result = classify_felt_challenges(
         boxes,
         presence,
         image_size,
         event_motion=event_motion,
+        low_light=low_light,
         ambiguity=ambiguity,
-        **thresholds,
+        small_area_ratio=thresholds["small_area_ratio"],
+        max_small_aspect_ratio=thresholds["max_small_aspect_ratio"],
+        motion_norm=thresholds["motion_norm"],
+        ambiguity_threshold=thresholds["ambiguity_threshold"],
+        recovery_window=thresholds["recovery_window"],
     )
-    owners = result["class_id"].tolist()
     return {
-        "owners": owners,
-        "reasons": [
-            EXPERT_REASONS[owner] if 0 <= owner < len(EXPERT_REASONS)
-            else "invalid"
-            for owner in owners
-        ],
+        "attributes": {
+            name: values.tolist()
+            for name, values in result["challenge_attributes"].items()
+        },
     }
 
 
@@ -212,8 +239,8 @@ def _config_hash(thresholds):
 
 
 def _validate_manifest(payload):
-    if payload.get("schema_version") != 1:
-        raise ValueError("unsupported expert ownership manifest schema")
+    if payload.get("schema_version") != 2:
+        raise ValueError("unsupported challenge manifest schema")
     thresholds = payload.get("thresholds")
     sequences = payload.get("sequences")
     if not isinstance(thresholds, dict) or not isinstance(sequences, dict):
@@ -221,22 +248,29 @@ def _validate_manifest(payload):
     if payload.get("config_sha256") != _config_hash(thresholds):
         raise ValueError("manifest threshold hash does not match its contents")
     for name, record in sequences.items():
-        owners = record.get("owners") if isinstance(record, dict) else None
-        reasons = record.get("reasons") if isinstance(record, dict) else None
-        if not isinstance(name, str) or not isinstance(owners, list):
-            raise ValueError("manifest sequence records require owner lists")
-        if reasons is not None and len(reasons) != len(owners):
-            raise ValueError("manifest owners and reasons must have equal length")
-        if any(not isinstance(owner, int) or owner < 0 or owner > 4
-               for owner in owners):
-            raise ValueError("manifest owners must be integer IDs in [0, 4]")
+        attributes = record.get("attributes") if isinstance(record, dict) else None
+        if not isinstance(name, str) or not isinstance(record, dict):
+            raise ValueError("manifest sequence records must be mappings")
+        if set(record) != {"attributes"}:
+            raise ValueError("manifest records must contain only attributes")
+        if (not isinstance(attributes, dict)
+                or set(attributes) != set(CHALLENGE_NAMES)):
+            raise ValueError("manifest records require every challenge attribute")
+        if any(not isinstance(values, list) for values in attributes.values()):
+            raise ValueError("manifest challenge attributes must be lists")
+        lengths = {len(values) for values in attributes.values()}
+        if len(lengths) != 1:
+            raise ValueError("manifest challenge attributes must have equal lengths")
+        if any(type(value) is not bool
+               for values in attributes.values() for value in values):
+            raise ValueError("manifest challenge attributes must contain booleans")
     return payload
 
 
 def write_manifest(path, sequences, thresholds):
     path = Path(path)
     payload = _validate_manifest({
-        "schema_version": 1,
+        "schema_version": 2,
         "config_sha256": _config_hash(thresholds),
         "thresholds": dict(thresholds),
         "sequences": dict(sequences),

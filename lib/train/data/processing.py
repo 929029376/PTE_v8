@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torchvision.transforms as transforms
 from lib.utils import TensorDict
@@ -83,8 +85,26 @@ class STARKProcessing(BaseProcessing):
         self.scale_jitter_factor = scale_jitter_factor 
         self.mode = mode  
         self.settings = settings
+        self.pursuit_enabled = bool(getattr(settings, "pursuit_enabled", False))
+        self.pursuit_canvas_size = int(getattr(
+            settings, "pursuit_canvas_size", self.output_sz['search']))
+        if self.pursuit_canvas_size < self.output_sz['search']:
+            raise ValueError(
+                "pursuit canvas must be at least as large as the search input")
+        self.motion_center_jitter_multiplier = float(getattr(
+            settings, "motion_center_jitter_multiplier", 1.0))
+        if (not math.isfinite(self.motion_center_jitter_multiplier)
+                or self.motion_center_jitter_multiplier < 1.0):
+            raise ValueError(
+                "motion center jitter multiplier must be finite and >= 1")
+        self.precision_search_scale_multiplier = float(getattr(
+            settings, "precision_search_scale_multiplier", 1.0))
+        if (not math.isfinite(self.precision_search_scale_multiplier)
+                or self.precision_search_scale_multiplier < 1.0):
+            raise ValueError(
+                "precision search scale multiplier must be finite and >= 1")
 
-    def _get_jittered_box(self, box, mode): 
+    def _get_jittered_box(self, box, mode, training_expert_id=None):
         """ Jitter the input box
         args:
             box - input bounding box: (x_top_left--[0], y_top_left--[1], width--[2], height[3])
@@ -93,8 +113,20 @@ class STARKProcessing(BaseProcessing):
         returns:
             torch.Tensor - jittered box
         """
-        jittered_size = box[2:4] * torch.exp(torch.randn(2) * self.scale_jitter_factor[mode])
-        max_offset = (jittered_size.prod().sqrt() * torch.tensor(self.center_jitter_factor[mode]).float())
+        scale = (
+            self.precision_search_scale_multiplier
+            if mode == 'search' and training_expert_id == 2 else 1.0)
+        jittered_size = (
+            box[2:4]
+            * torch.exp(torch.randn(2) * self.scale_jitter_factor[mode])
+            * scale)
+        center_jitter = self.center_jitter_factor[mode]
+        if mode == 'search' and training_expert_id == 1:
+            center_jitter *= getattr(
+                self, "motion_center_jitter_multiplier", 1.0)
+        max_offset = (
+            jittered_size.prod().sqrt()
+            * torch.tensor(center_jitter).float())
         jittered_center = box[0:2] + 0.5 * box[2:4] + max_offset * (torch.rand(2) - 0.5)
         return torch.cat((jittered_center - 0.5 * jittered_size, jittered_size), dim=0)
 
@@ -126,13 +158,16 @@ class STARKProcessing(BaseProcessing):
             _full_frame_anchor(frame, factor, box)
             for frame, box in zip(data[image_key], data[anno_key])
         ]
+        output_size = (
+            self.pursuit_canvas_size
+            if prefix == 'pursuit_search' else self.output_sz['search'])
         crops, crops_event, boxes, att_mask, mask_crops = prutils.jittered_center_crop(
             frames=data[image_key],
             event_frames=data[event_key],
             box_extract=anchors,
             box_gt=data[anno_key],
             search_area_factor=factor,
-            output_sz=self.output_sz['search'],
+            output_sz=output_size,
             masks=data[mask_key])
         data[image_key], data[anno_key], transformed_att, transformed_masks = \
             self.transform['search'](
@@ -156,24 +191,43 @@ class STARKProcessing(BaseProcessing):
             TensorDict - output data block with following fields:
                 'template_images', 'search_images', 'template_anno', 'search_anno', 'test_proposals', 'proposal_iou'
         """
+        pursuit_only = 'pursuit_search_images' in data
         if self.transform['joint'] is not None:  
             data['template_images'], data['template_anno'], data['template_masks'] = self.transform['joint'](
                 image=data['template_images'], bbox=data['template_anno'], mask=data['template_masks'])
-            data['search_images'], data['search_anno'], data['search_masks'] = self.transform['joint'](
-                image=data['search_images'], bbox=data['search_anno'], mask=data['search_masks'], new_roll=False)
             data['template_event_images'] = self.transform['joint'](image=data['template_event_images'], new_roll=False)
-            data['search_event_images'] = self.transform['joint'](image=data['search_event_images'], new_roll=False)
+            if not pursuit_only:
+                data['search_images'], data['search_anno'], data['search_masks'] = self.transform['joint'](
+                    image=data['search_images'], bbox=data['search_anno'], mask=data['search_masks'], new_roll=False)
+                data['search_event_images'] = self.transform['joint'](
+                    image=data['search_event_images'], new_roll=False)
             if 'redetect_search_images' in data:
                 data['redetect_search_images'], data['redetect_search_anno'], data['redetect_search_masks'] = self.transform['joint'](
                     image=data['redetect_search_images'], bbox=data['redetect_search_anno'],
                     mask=data['redetect_search_masks'], new_roll=False)
                 data['redetect_search_event_images'] = self.transform['joint'](
                     image=data['redetect_search_event_images'], new_roll=False)
+            if 'pursuit_search_images' in data:
+                data['pursuit_search_images'], data['pursuit_search_anno'], data['pursuit_search_masks'] = self.transform['joint'](
+                    image=data['pursuit_search_images'], bbox=data['pursuit_search_anno'],
+                    mask=data['pursuit_search_masks'], new_roll=False)
+                data['pursuit_search_event_images'] = self.transform['joint'](
+                    image=data['pursuit_search_event_images'], new_roll=False)
 
-        for s in ['template', 'search']:
+        training_expert_id = data.get('training_expert_id')
+        if training_expert_id is not None:
+            expert_values = torch.as_tensor(training_expert_id).reshape(-1)
+            if expert_values.numel() != 1:
+                raise ValueError(
+                    "processing requires one training expert per sample")
+            training_expert_id = int(expert_values.item())
+
+        for s in ['template'] if pursuit_only else ['template', 'search']:
             assert self.mode == 'sequence' or len(data[s + '_images']) == 1, \
                 "In pair mode, num train/test frames must be 1"
-            jittered_anno = [self._get_jittered_box(a, s) for a in data[s + '_anno']]
+            jittered_anno = [
+                self._get_jittered_box(a, s, training_expert_id)
+                for a in data[s + '_anno']]
 
             # 2021.1.9 Check whether data is valid. Avoid too small bounding boxes
             w, h = torch.stack(jittered_anno, dim=0)[:, 2], torch.stack(jittered_anno, dim=0)[:, 3]
@@ -221,10 +275,20 @@ class STARKProcessing(BaseProcessing):
                 data, 'redetect_search', factor, keep_auxiliary=True,
                 new_roll=True)
 
+        if pursuit_only:
+            self._process_full_frame_sequence(
+                data, 'pursuit_search', 1.0, keep_auxiliary=True,
+                new_roll=True)
+            for key in (
+                    'search_images', 'search_event_images',
+                    'search_anno', 'search_masks'):
+                data.pop(key, None)
+
         data['valid'] = True
 
-        if data["template_masks"] is None or data["search_masks"] is None:
+        if data["template_masks"] is None:
             data["template_masks"] = torch.zeros((1, self.output_sz["template"], self.output_sz["template"]))
+        if not pursuit_only and data["search_masks"] is None:
             data["search_masks"] = torch.zeros((1, self.output_sz["search"], self.output_sz["search"]))
 
         if self.mode == 'sequence':

@@ -46,39 +46,6 @@ class MotionFusion(nn.Module):
         )
 
 
-class SmallTargetFusion(nn.Module):
-    def __init__(self, embed_dim):
-        super().__init__()
-        hidden_dim = max(embed_dim // 4, 4)
-        self.detail_adapter = _ResidualAdapter(embed_dim)
-        self.token_gate = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
-        )
-        nn.init.zeros_(self.token_gate[-2].weight)
-        nn.init.zeros_(self.token_gate[-2].bias)
-
-    def forward(self, rgb_tokens, event_tokens, context=None):
-        fused = rgb_tokens + event_tokens
-        local_contrast = fused - fused.mean(dim=1, keepdim=True)
-        modality_detail = rgb_tokens - event_tokens
-        modality_detail = modality_detail - modality_detail.mean(dim=1, keepdim=True)
-        detail_input = local_contrast + modality_detail
-        gate_input = local_contrast
-        if context and context.get("small_target_detail") is not None:
-            high_resolution = context["small_target_detail"]
-            if high_resolution.shape != fused.shape:
-                raise ValueError(
-                    "small-target detail must match the search-token shape")
-            detail_input = detail_input + high_resolution
-            gate_input = gate_input + high_resolution
-        detail = self.detail_adapter(detail_input)
-        return fused + self.token_gate(gate_input) * detail
-
-
 class TemplateBridgeFusion(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
@@ -170,6 +137,45 @@ class VisibilityRecoveryFusion(ModalityGateFusion):
         return fused + self.recovery_gate(recovery_features) * self.recovery_out(recovery_state)
 
 
+class ProposalBoxAdapter(nn.Module):
+    """Let one expert softly correct a detached upstream box proposal."""
+
+    def __init__(self, hidden_dim=32):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Linear(13, hidden_dim),
+            nn.GELU(),
+        )
+        self.output = nn.Linear(hidden_dim, 4)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, direct_boxes, upstream_boxes, score_map):
+        if (
+                direct_boxes.ndim != 3
+                or direct_boxes.shape[-1] != 4
+                or upstream_boxes.shape != direct_boxes.shape):
+            raise ValueError(
+                "direct and upstream boxes must have matching (B, N, 4) shapes")
+        if score_map.ndim < 2 or score_map.shape[0] != direct_boxes.shape[0]:
+            raise ValueError("score_map batch must match box batch")
+
+        upstream = upstream_boxes.detach()
+        peak = score_map.flatten(1).amax(dim=1, keepdim=True)
+        peak = peak[:, None, :].expand(-1, direct_boxes.shape[1], -1)
+        features = torch.cat([
+            direct_boxes,
+            upstream,
+            upstream - direct_boxes,
+            peak,
+        ], dim=-1)
+        gate = torch.tanh(self.output(self.features(features)))
+        corrected = direct_boxes + gate * (upstream - direct_boxes)
+        center = corrected[..., :2].clamp(0.0, 1.0)
+        size = corrected[..., 2:].clamp(1e-4, 1.0)
+        return torch.cat([center, size], dim=-1), gate
+
+
 class ExpertFusionBank(nn.Module):
     def __init__(self, experts, default_expert="generalist"):
         super().__init__()
@@ -199,8 +205,6 @@ def build_expert_fusions(expert_names, embed_dim):
             experts[name] = GeneralistFusion(embed_dim)
         elif key == "fm" or key.endswith("_fm") or "motion" in key:
             experts[name] = MotionFusion(embed_dim)
-        elif key == "st" or key.endswith("_st") or "small" in key:
-            experts[name] = SmallTargetFusion(embed_dim)
         elif key == "bi" or key.endswith("_bi") or "discrimination" in key:
             experts[name] = TemplateBridgeFusion(embed_dim)
         elif "visibility" in key or "foc" in key or key.endswith("_ov") or "_ov" in key:

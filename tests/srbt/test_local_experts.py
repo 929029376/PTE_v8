@@ -4,20 +4,76 @@ import torch.nn.functional as F
 from easydict import EasyDict as edict
 from types import SimpleNamespace
 
+import lib.models.layers.expert_fusion as expert_fusion_module
 from lib.models.layers.expert_fusion import ExpertFusionBank, build_expert_fusions
 from lib.train.actors.pet_track import PETTrackActor
 from lib.train.actors.pet_track_base import PETTrackBaseActor
-from tests.srbt.test_srbt_model_integration import _cfg, TinyBackbone, TinyHead, TinyMemory
+from tests.srbt.test_srbt_model_integration import (
+    _cfg, _images, TinyBackbone, TinyHead, TinyMemory,
+)
 from lib.models.pet_track.pet_track import PETTrack
+from lib.train.base_functions import _optimizer_groups
+from lib.train.data.loader import ltr_collate_stack1
+from lib.utils import TensorDict
 
 
 EXPERT_NAMES = (
     "generalist",
     "motion_fm",
-    "small_target_st",
+    "precision_refiner",
     "visibility_foc_ov",
     "discrimination_bi",
 )
+SHARED_EXPERT_NAMES = tuple(
+    name for name in EXPERT_NAMES if name != "precision_refiner")
+_EXPERT_CHALLENGE_INDEX = {1: 1, 2: 0, 3: 3, 4: 2}
+
+
+def _challenge_labels(expert_id, batch_size):
+    labels = torch.zeros(batch_size, 7, dtype=torch.bool)
+    labels[:, _EXPERT_CHALLENGE_INDEX[expert_id]] = True
+    return labels
+
+
+def test_proposal_box_adapter_starts_as_exact_direct_prediction():
+    adapter = expert_fusion_module.ProposalBoxAdapter()
+    direct = torch.tensor([[[0.5, 0.4, 0.2, 0.1]]])
+    upstream = torch.tensor([[[0.7, 0.6, 0.3, 0.2]]])
+    score_map = torch.rand(1, 1, 4, 4)
+
+    corrected, gate = adapter(direct, upstream, score_map)
+
+    assert torch.equal(corrected, direct)
+    assert torch.equal(gate, torch.zeros_like(gate))
+
+
+def test_proposal_box_adapter_detaches_upstream_but_trains_correction():
+    adapter = expert_fusion_module.ProposalBoxAdapter()
+    with torch.no_grad():
+        adapter.output.bias.fill_(0.5)
+    direct = torch.tensor(
+        [[[0.5, 0.4, 0.2, 0.1]]], requires_grad=True)
+    upstream = torch.tensor(
+        [[[0.7, 0.6, 0.3, 0.2]]], requires_grad=True)
+    score_map = torch.rand(1, 1, 4, 4)
+
+    corrected, _ = adapter(direct, upstream, score_map)
+    corrected.sum().backward()
+
+    assert direct.grad is not None
+    assert upstream.grad is None
+    assert adapter.output.bias.grad is not None
+
+
+def test_proposal_box_adapter_rejects_incompatible_boxes():
+    adapter = expert_fusion_module.ProposalBoxAdapter()
+
+    with pytest.raises(ValueError, match="matching.*B, N, 4"):
+        adapter(
+            torch.rand(2, 1, 4),
+            torch.rand(1, 1, 4),
+            torch.rand(2, 1, 4, 4),
+        )
 
 
 def test_model_has_no_router_or_route_options():
@@ -32,7 +88,7 @@ def test_model_has_no_router_or_route_options():
 
 
 def test_expert_bank_uses_distinct_rgb_event_fusion_mechanisms():
-    experts = build_expert_fusions(EXPERT_NAMES, embed_dim=8)
+    experts = build_expert_fusions(SHARED_EXPERT_NAMES, embed_dim=8)
     bank = ExpertFusionBank(experts, default_expert="generalist")
     rgb = torch.randn(2, 4, 8)
     event = torch.randn(2, 4, 8)
@@ -41,102 +97,320 @@ def test_expert_bank_uses_distinct_rgb_event_fusion_mechanisms():
     outputs = [
         bank.forward_expert(
             name, rgb, event, context={"template_tokens": template})
-        for name in EXPERT_NAMES
+        for name in SHARED_EXPERT_NAMES
     ]
 
     assert all(output.shape == rgb.shape for output in outputs)
-    assert len({type(module).__name__ for module in experts.values()}) == 5
-    assert tuple(bank.experts) == EXPERT_NAMES
+    assert len({type(module).__name__ for module in experts.values()}) == 4
+    assert tuple(bank.experts) == SHARED_EXPERT_NAMES
 
 
-def test_high_resolution_context_changes_only_small_target_expert():
-    torch.manual_seed(7)
-    experts = build_expert_fusions(EXPERT_NAMES, embed_dim=8)
-    bank = ExpertFusionBank(experts, default_expert="generalist")
-    torch.nn.init.normal_(
-        experts["small_target_st"].detail_adapter.net[-1].weight)
-    rgb = torch.randn(1, 4, 8)
-    event = torch.randn(1, 4, 8)
-    detail = torch.randn(1, 4, 8)
+def test_small_target_expert_is_outside_shared_fusion_and_head_banks():
+    model = _expert_model()
 
-    small_without = bank.forward_expert("small_target_st", rgb, event)
-    small_with = bank.forward_expert(
-        "small_target_st", rgb, event,
-        context={"small_target_detail": detail})
-    general_without = bank.forward_expert("generalist", rgb, event)
-    general_with = bank.forward_expert(
-        "generalist", rgb, event,
-        context={"small_target_detail": detail})
-
-    assert not torch.allclose(small_with, small_without)
-    assert torch.allclose(general_with, general_without)
+    assert tuple(model.expert_fusion.experts) == SHARED_EXPERT_NAMES
+    assert "precision_refiner" not in model.expert_heads
+    assert model.small_target_expert is not None
 
 
-def test_small_target_detail_reuses_detached_half_patch_projection():
-    class DetailBackbone(TinyBackbone):
-        def __init__(self):
-            super().__init__()
-            self.patch_embed = SimpleNamespace(
-                proj=torch.nn.Conv2d(3, 8, kernel_size=4, stride=4))
+def test_precision_refiner_is_the_external_expert_name():
+    model = _expert_model()
 
-    cfg = _cfg()
-    cfg.MODEL.EXPERT = edict({
-        "ENABLE": True,
-        "DEFAULT": "generalist",
-        "NAMES": list(EXPERT_NAMES),
+    assert model.precision_refiner_name == "precision_refiner"
+    assert "precision_refiner" in model.expert_names
+    assert "precision_refiner" in model.proposal_adapters
+    assert "small_target_st" not in model.expert_names
+
+
+def test_localization_loss_matches_high_resolution_expert_score_map():
+    actor = object.__new__(PETTrackBaseActor)
+    actor.cfg = edict({
+        "DATA": {"SEARCH": {"SIZE": 16}},
+        "MODEL": {"BACKBONE": {"STRIDE": 4}},
     })
-    model = PETTrack(
-        DetailBackbone(), TinyMemory(), TinyHead(), cfg, head_type="CENTER")
-    rgb = torch.randn(2, 3, 8, 8)
-    event = torch.randn(2, 3, 8, 8)
+    actor.loss_weight = {"giou": 2.0, "l1": 5.0, "focal": 1.0}
+    observed = {}
 
-    detail = model._small_target_detail(rgb, event)
+    def focal(prediction, target):
+        observed["target"] = target.detach().clone()
+        return F.mse_loss(prediction, target)
 
-    assert detail.shape == (2, model.feat_len_s, 8)
-    assert not detail.requires_grad
+    actor.objective = {"focal": focal}
+    zero = torch.tensor(0.0, requires_grad=True)
+    actor._box_losses = lambda *args, **kwargs: (
+        zero, zero, torch.ones(1), None)
+    prediction = {
+        "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2]]]),
+        "score_map": torch.zeros(1, 1, 8, 8, requires_grad=True),
+    }
+    target = {
+        "search_anno": torch.tensor([[[0.4, 0.4, 0.2, 0.2]]]),
+        "search_absent": torch.ones(1, 1),
+    }
+
+    loss, status = actor.compute_losses(prediction, target)
+
+    assert torch.isfinite(loss)
+    assert status["Loss/location"] >= 0.0
+    assert observed["target"].shape == prediction["score_map"].shape
+    assert observed["target"].amax().item() == pytest.approx(1.0)
 
 
-def test_non_small_owner_skips_high_resolution_extraction(monkeypatch):
-    cfg = _cfg()
-    cfg.MODEL.EXPERT = edict({
-        "ENABLE": True,
-        "DEFAULT": "generalist",
-        "NAMES": list(EXPERT_NAMES),
+def test_small_target_center_rank_loss_changes_only_specialist_loss():
+    actor = object.__new__(PETTrackBaseActor)
+    actor.cfg = edict({
+        "DATA": {"SEARCH": {"SIZE": 16}},
+        "MODEL": {"BACKBONE": {"STRIDE": 4}},
+        "TRAIN": {
+            "SMALL_TARGET_CENTER_RANK_WEIGHT": 4.0,
+            "SMALL_TARGET_MATCH_RANK_WEIGHT": 2.0,
+            "SMALL_TARGET_DENSE_SIZE_WEIGHT": 8.0,
+            "SMALL_TARGET_DENSE_OFFSET_WEIGHT": 2.0,
+            "SMALL_TARGET_SOFT_BOX_TEMPERATURE": 0.20,
+        },
     })
-    model = PETTrack(
-        TinyBackbone(), TinyMemory(), TinyHead(), cfg, head_type="CENTER")
-    feature = torch.randn(1, 12, 8)
-    images = (torch.randn(1, 3, 8, 8), torch.randn(1, 3, 8, 8))
-    calls = []
-    monkeypatch.setattr(
-        model, "_small_target_detail",
-        lambda *_: calls.append(True) or torch.randn(1, 4, 8),
+    actor.loss_weight = {"giou": 2.0, "l1": 5.0, "focal": 1.0}
+    actor.objective = {
+        "focal": lambda prediction, target: F.mse_loss(prediction, target),
+    }
+    zero = torch.tensor(0.0, requires_grad=True)
+    actor._box_losses = lambda *args, **kwargs: (
+        zero, zero, torch.ones(2), None)
+    prediction = {
+        "pred_boxes": torch.tensor([
+            [[0.5, 0.5, 0.1, 0.1]],
+            [[0.2, 0.2, 0.2, 0.2]],
+        ]),
+        "small_base_pred_boxes": torch.tensor([
+            [[0.45, 0.5, 0.1, 0.1]],
+            [[0.2, 0.2, 0.2, 0.2]],
+        ]),
+        "small_box_delta": torch.tensor([
+            [[0.05, 0.0, 0.0, 0.0]],
+            [[0.5, -0.5, 0.25, -0.25]],
+        ]),
+        "score_map": torch.tensor([
+            [[[0.1, 0.2], [0.3, 0.8]]],
+            [[[0.7, 0.1], [0.2, 0.3]]],
+        ], requires_grad=True),
+        "small_match_map": torch.tensor([
+            [[[0.2, 0.4], [0.6, 1.8]]],
+            [[[1.4, 0.2], [0.4, 0.6]]],
+        ], requires_grad=True),
+        "size_map": torch.full(
+            (2, 2, 2, 2), 0.5, requires_grad=True),
+        "offset_map": torch.full(
+            (2, 2, 2, 2), 0.25, requires_grad=True),
+    }
+    target = {
+        "search_anno": torch.tensor([[[
+            [0.45, 0.45, 0.1, 0.1],
+            [-0.1, -0.1, 0.2, 0.2],
+        ]]]).squeeze(0),
+        "search_absent": torch.ones(1, 2),
+        "training_expert_id": torch.tensor([2, 1]),
+    }
+
+    specialist_loss, status = actor.compute_losses(prediction, target)
+    ordinary_target = dict(target)
+    ordinary_target["training_expert_id"] = torch.tensor([1, 1])
+    ordinary_loss, ordinary_status = actor.compute_losses(
+        prediction, ordinary_target)
+
+    assert specialist_loss.item() > ordinary_loss.item()
+    assert status["Loss/small_center_rank"] > 0.0
+    assert status["Loss/small_center_rank_weighted"] == pytest.approx(
+        4.0 * status["Loss/small_center_rank"])
+    assert status["Loss/small_match_rank"] > 0.0
+    assert status["Loss/small_match_rank_weighted"] == pytest.approx(
+        2.0 * status["Loss/small_match_rank"])
+    assert status["Loss/small_dense_size"] > 0.0
+    assert status["Loss/small_dense_offset"] > 0.0
+    assert status["Loss/small_dense_size_weighted"] == pytest.approx(
+        8.0 * status["Loss/small_dense_size"])
+    assert status["Loss/small_dense_offset_weighted"] == pytest.approx(
+        2.0 * status["Loss/small_dense_offset"])
+    assert status["Loss/small_dense_geometry_weighted"] == pytest.approx(
+        status["Loss/small_dense_size_weighted"]
+        + status["Loss/small_dense_offset_weighted"])
+    assert specialist_loss.item() - ordinary_loss.item() == pytest.approx(
+        status["Loss/small_center_rank_weighted"]
+        + status["Loss/small_match_rank_weighted"]
+        + status["Loss/small_dense_geometry_weighted"])
+    assert ordinary_status["Loss/small_center_rank"] == pytest.approx(0.0)
+    assert ordinary_status["Loss/small_match_rank"] == pytest.approx(0.0)
+    assert ordinary_status["Loss/small_dense_size"] == pytest.approx(0.0)
+    assert ordinary_status["Loss/small_dense_offset"] == pytest.approx(0.0)
+    assert ordinary_status[
+        "Loss/small_dense_size_weighted"] == pytest.approx(0.0)
+    assert ordinary_status[
+        "Loss/small_dense_offset_weighted"] == pytest.approx(0.0)
+    specialist_loss.backward()
+    assert prediction["small_match_map"].grad is not None
+    assert prediction["small_match_map"].grad.abs().sum() > 0.0
+    assert prediction["size_map"].grad is not None
+    assert prediction["size_map"].grad.abs().sum() > 0.0
+    assert prediction["offset_map"].grad is not None
+    assert prediction["offset_map"].grad.abs().sum() > 0.0
+    assert ordinary_status.keys().isdisjoint({
+        "SmallTargetTrain/count",
+        "SmallTargetTrain/center_in_crop",
+    })
+    assert status["SmallTargetTrain/count"] == 1
+    assert status["SmallTargetTrain/center_in_crop"] == pytest.approx(1.0)
+    assert status["SmallTargetTrain/full_box_in_crop"] == pytest.approx(1.0)
+    assert status["SmallTargetTrain/visible_fraction"] == pytest.approx(1.0)
+    assert status["SmallTargetTrain/target_width_px"] == pytest.approx(1.6)
+    assert status["SmallTargetTrain/target_height_px"] == pytest.approx(1.6)
+    assert status["SmallTargetTrain/center_error_px"] == pytest.approx(0.0)
+    assert status["SmallTargetTrain/size_error_px"] == pytest.approx(0.0)
+    assert status["SmallTargetTrain/score_peak"] == pytest.approx(0.8)
+    assert status["SmallTargetMatch/center_error_px"] == pytest.approx(0.0)
+    assert status["SmallTargetMatch/peak"] == pytest.approx(1.8)
+    assert status["SmallTargetMatch/gt_value"] == pytest.approx(1.8)
+    assert status["SmallTargetMatch/gt_rank"] == pytest.approx(1.0)
+    assert status["SmallTargetBox/base_iou"] == pytest.approx(1.0 / 3.0)
+    assert status["SmallTargetBox/combined_iou_delta"] == pytest.approx(
+        2.0 / 3.0)
+    assert status["SmallTargetBox/delta_abs"] == pytest.approx(0.0125)
+    assert status["SmallTargetBox/center_delta_abs"] == pytest.approx(0.025)
+    assert status["SmallTargetBox/size_delta_abs"] == pytest.approx(0.0)
+
+
+def test_small_target_center_rank_loss_prefers_gt_peak_and_backpropagates():
+    actor = object.__new__(PETTrackBaseActor)
+    wrong = torch.full((1, 1, 4, 4), 0.1, requires_grad=True)
+    correct = torch.full((1, 1, 4, 4), 0.1)
+    wrong.data[0, 0, 0, 0] = 0.9
+    correct[0, 0, 3, 3] = 0.9
+    gt_bbox = torch.tensor([[0.7, 0.7, 0.1, 0.1]])
+    owners = torch.tensor([2])
+
+    wrong_loss = actor._small_target_center_rank_loss(
+        wrong, gt_bbox, owners, present_mask=None)
+    correct_loss = actor._small_target_center_rank_loss(
+        correct, gt_bbox, owners, present_mask=None)
+    ordinary_loss = actor._small_target_center_rank_loss(
+        wrong, gt_bbox, torch.tensor([0]), present_mask=None)
+
+    assert wrong_loss > correct_loss
+    assert ordinary_loss.item() == pytest.approx(0.0)
+    wrong_loss.backward()
+    assert wrong.grad is not None
+    assert wrong.grad.abs().sum() > 0
+
+
+def test_small_target_center_rank_loss_ignores_out_of_grid_rounded_center():
+    actor = object.__new__(PETTrackBaseActor)
+    score_map = torch.full((1, 1, 4, 4), 0.1, requires_grad=True)
+    boundary_bbox = torch.tensor([[0.95, 0.95, 0.1, 0.1]])
+
+    loss = actor._small_target_center_rank_loss(
+        score_map, boundary_bbox, torch.tensor([2]), present_mask=None)
+
+    assert loss.item() == pytest.approx(0.0)
+
+
+def test_small_target_dense_geometry_loss_is_owner_specific_and_local():
+    actor = object.__new__(PETTrackBaseActor)
+    size_map = torch.full(
+        (2, 2, 4, 4), 0.5, requires_grad=True)
+    offset_map = torch.full(
+        (2, 2, 4, 4), 0.25, requires_grad=True)
+    gt_bbox = torch.tensor([
+        [0.2, 0.3, 0.1, 0.2],
+        [0.1, 0.1, 0.2, 0.2],
+    ])
+
+    size_loss, offset_loss = actor._small_target_dense_geometry_loss(
+        size_map, offset_map, gt_bbox, torch.tensor([2, 0]))
+    ordinary_size, ordinary_offset = (
+        actor._small_target_dense_geometry_loss(
+            size_map, offset_map, gt_bbox, torch.tensor([0, 0])))
+
+    assert size_loss > 0.0
+    assert offset_loss > 0.0
+    assert ordinary_size.item() == pytest.approx(0.0)
+    assert ordinary_offset.item() == pytest.approx(0.0)
+    (size_loss + offset_loss).backward()
+    assert torch.count_nonzero(size_map.grad[0]) == 2
+    assert torch.count_nonzero(offset_map.grad[0]) == 2
+    assert torch.count_nonzero(size_map.grad[0, :, 2, 1]) == 2
+    assert torch.count_nonzero(offset_map.grad[0, :, 2, 1]) == 2
+    assert torch.count_nonzero(size_map.grad[1]) == 0
+    assert torch.count_nonzero(offset_map.grad[1]) == 0
+
+
+def test_small_target_straight_through_boxes_keep_hard_values_and_spread_gradients():
+    actor = object.__new__(PETTrackBaseActor)
+    hard_boxes = torch.tensor(
+        [[[0.0, 0.0, 0.2, 0.3]]], requires_grad=True)
+    score_map = torch.tensor(
+        [[[[0.8, 0.2], [0.1, 0.1]]]], requires_grad=True)
+    size_map = torch.full(
+        (1, 2, 2, 2), 0.25, requires_grad=True)
+    offset_map = torch.zeros(
+        (1, 2, 2, 2), requires_grad=True)
+
+    train_boxes = actor._small_target_straight_through_boxes(
+        hard_boxes,
+        score_map,
+        size_map,
+        offset_map,
+        torch.tensor([2]),
+        temperature=0.1,
     )
 
-    model.forward_head(
-        feature, expert_owner_ids=torch.tensor([0]), search_images=images)
-    assert calls == []
+    assert torch.equal(train_boxes.detach(), hard_boxes)
+    train_boxes.sum().backward()
+    assert hard_boxes.grad is not None
+    assert torch.count_nonzero(hard_boxes.grad) == 4
+    assert score_map.grad is not None
+    assert score_map.grad.abs().sum() > 0.0
+    assert size_map.grad is not None
+    assert torch.count_nonzero(size_map.grad) > 2
+    assert offset_map.grad is not None
+    assert torch.count_nonzero(offset_map.grad) > 2
 
-    model.forward_head(
-        feature, expert_owner_ids=torch.tensor([2]), search_images=images)
-    assert calls == [True]
 
-
-def test_inference_returns_independent_outputs_from_all_five_experts():
+def test_shared_forward_head_returns_only_shared_expert_outputs():
     model = _expert_model()
 
     output = model.forward_head(torch.randn(2, 12, 8))
 
-    assert tuple(output["expert_outputs"]) == EXPERT_NAMES
+    assert tuple(output["expert_outputs"]) == SHARED_EXPERT_NAMES
     assert output["pred_boxes"] is output["expert_outputs"]["generalist"][
         "pred_boxes"]
     assert all(
         expert_output["pred_boxes"].shape == (2, 1, 4)
         for expert_output in output["expert_outputs"].values()
     )
+    assert output["expert_outputs"]["generalist"]["score_map"].shape[-2:] == (2, 2)
 
 
-def test_specialize_phase_passes_homogeneous_owner_ids_to_model():
+def test_shared_experts_keep_direct_boxes_and_use_fixed_soft_dependencies():
+    model = _expert_model()
+
+    output = model.forward_head(torch.randn(2, 12, 8))["expert_outputs"]
+
+    assert tuple(model.proposal_adapters) == (
+        "motion_fm", "precision_refiner", "discrimination_bi")
+    assert torch.equal(
+        output["motion_fm"]["upstream_pred_boxes"],
+        output["generalist"]["pred_boxes"],
+    )
+    assert torch.equal(
+        output["discrimination_bi"]["upstream_pred_boxes"],
+        output["motion_fm"]["pred_boxes"],
+    )
+    for name in ("motion_fm", "discrimination_bi"):
+        assert torch.equal(
+            output[name]["pred_boxes"], output[name]["direct_pred_boxes"])
+        assert torch.count_nonzero(output[name]["proposal_gate"]) == 0
+    assert "upstream_pred_boxes" not in output["visibility_foc_ov"]
+
+
+def test_specialize_phase_passes_training_expert_and_full_compound_labels():
     class CaptureNet:
         expert_names = list(EXPERT_NAMES)
 
@@ -159,19 +433,85 @@ def test_specialize_phase_passes_homogeneous_owner_ids_to_model():
         "search_images": torch.zeros(1, 3, 3, 8, 8),
         "search_event_images": torch.zeros(1, 3, 3, 8, 8),
         "template_anno": torch.zeros(1, 3, 4),
-        "expert_owner_id": torch.tensor([2, 2, 2]),
+        "training_expert_id": torch.tensor([2, 2, 2]),
+        "challenge_labels": torch.tensor([
+            [True, True, False, False, False, False, False],
+        ]).repeat(3, 1),
     }
 
     actor.forward_pass(data)
 
     assert torch.equal(
-        actor.net.kwargs["expert_owner_ids"], torch.tensor([2, 2, 2]))
+        actor.net.kwargs["training_expert_ids"], torch.tensor([2, 2, 2]))
     assert "route" not in actor.net.kwargs
 
 
-@pytest.mark.parametrize("owner_id, expects_recovery", [(2, False), (3, True)])
-def test_only_visibility_owner_forwards_global_recovery(
-        owner_id, expects_recovery):
+def test_specialize_phase_accepts_challenge_labels_from_training_loader():
+    class CaptureNet:
+        expert_names = list(EXPERT_NAMES)
+
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return {"pred_boxes": torch.zeros(3, 1, 4)}
+
+    actor = object.__new__(PETTrackActor)
+    actor.net = CaptureNet()
+    actor.cfg = edict({"MODEL": {"BACKBONE": {"CE_LOC": []}}})
+    actor.settings = SimpleNamespace(num_template=1)
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+
+    sample = TensorDict({
+        "template_images": torch.zeros(1, 3, 8, 8),
+        "template_event_images": torch.zeros(1, 3, 8, 8),
+        "search_images": torch.zeros(1, 3, 8, 8),
+        "search_event_images": torch.zeros(1, 3, 8, 8),
+        "template_anno": torch.zeros(1, 4),
+        "training_expert_id": torch.tensor(2),
+        "challenge_labels": torch.tensor(
+            [True, True, False, False, False, False, False]),
+    })
+    data = ltr_collate_stack1([sample, sample, sample])
+
+    assert data["challenge_labels"].shape == (7, 3)
+    actor.forward_pass(data)
+
+    assert torch.equal(
+        actor.net.kwargs["training_expert_ids"], torch.tensor([2, 2, 2]))
+
+
+def test_specialize_phase_rejects_expert_not_eligible_for_challenge_labels():
+    class CaptureNet:
+        expert_names = list(EXPERT_NAMES)
+
+        def __call__(self, **kwargs):
+            return {"pred_boxes": torch.zeros(1, 1, 4)}
+
+    actor = object.__new__(PETTrackActor)
+    actor.net = CaptureNet()
+    actor.cfg = edict({"MODEL": {"BACKBONE": {"CE_LOC": []}}})
+    actor.settings = SimpleNamespace(num_template=1)
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+    data = {
+        "template_images": torch.zeros(1, 1, 3, 8, 8),
+        "template_event_images": torch.zeros(1, 1, 3, 8, 8),
+        "search_images": torch.zeros(1, 1, 3, 8, 8),
+        "search_event_images": torch.zeros(1, 1, 3, 8, 8),
+        "template_anno": torch.zeros(1, 1, 4),
+        "training_expert_id": torch.tensor([2]),
+        "challenge_labels": torch.tensor([
+            [False, True, False, False, False, False, False],
+        ]),
+    }
+
+    with pytest.raises(ValueError, match="not eligible"):
+        actor.forward_pass(data)
+
+
+@pytest.mark.parametrize("expert_id, expects_recovery", [(2, False), (3, True)])
+def test_only_visibility_expert_forwards_global_recovery(
+        expert_id, expects_recovery):
     class CaptureNet:
         expert_names = list(EXPERT_NAMES)
 
@@ -191,7 +531,8 @@ def test_only_visibility_owner_forwards_global_recovery(
         "search_images": torch.zeros(1, 2, 3, 8, 8),
         "search_event_images": torch.zeros(1, 2, 3, 8, 8),
         "template_anno": torch.zeros(1, 2, 4),
-        "expert_owner_id": torch.full((2,), owner_id),
+        "training_expert_id": torch.full((2,), expert_id),
+        "challenge_labels": _challenge_labels(expert_id, 2),
         "is_reappear": torch.ones(1, 2),
         "redetect_search_images": torch.zeros(1, 2, 3, 8, 8),
         "redetect_search_event_images": torch.zeros(1, 2, 3, 8, 8),
@@ -204,7 +545,7 @@ def test_only_visibility_owner_forwards_global_recovery(
     assert (actor.net.kwargs["redetect_event_images"] is not None) is expects_recovery
 
 
-def test_specialize_phase_reports_owner_iou_without_batch_dilution(monkeypatch):
+def test_specialize_phase_reports_training_expert_iou_without_dilution(monkeypatch):
     monkeypatch.setattr(
         PETTrackBaseActor,
         "compute_losses",
@@ -216,11 +557,17 @@ def test_specialize_phase_reports_owner_iou_without_batch_dilution(monkeypatch):
     actor.srbt_enabled = False
     actor.expert_enabled = True
     actor.expert_phase = "specialize"
+    actor.expert_advantage_weight = 2.0
+    actor.expert_advantage_margin = 0.10
     pred_dict = {
         "pred_boxes": torch.tensor([
             [[0.5, 0.5, 0.8, 0.8]],
             [[0.5, 0.5, 0.6, 0.6]],
         ], requires_grad=True),
+        "upstream_pred_boxes": torch.tensor([
+            [[0.5, 0.5, 0.8, 0.8]],
+            [[0.5, 0.5, 0.6, 0.6]],
+        ]),
     }
     gt_dict = {
         "search_anno": torch.tensor([[
@@ -228,13 +575,122 @@ def test_specialize_phase_reports_owner_iou_without_batch_dilution(monkeypatch):
             [0.2, 0.2, 0.6, 0.6],
         ]]),
         "search_absent": torch.ones(1, 2),
-        "expert_owner_id": torch.tensor([0, 1]),
+        "training_expert_id": torch.tensor([1, 1]),
+        "challenge_labels": _challenge_labels(1, 2),
     }
 
     _, status = actor.compute_losses(pred_dict, gt_dict)
 
-    assert status["Expert/owner_iou_0"] == pytest.approx(1.0)
-    assert status["Expert/owner_iou_1"] == pytest.approx(1.0)
+    assert status["Expert/train_count_1"] == 2
+    assert status["Expert/train_iou_1"] == pytest.approx(1.0)
+    assert status["Expert/train_count_0"] == 0
+
+
+@pytest.mark.parametrize("expert_id", [1, 2, 4])
+def test_specialist_advantage_loss_trains_active_expert_not_upstream(
+        monkeypatch, expert_id):
+    monkeypatch.setattr(
+        PETTrackBaseActor,
+        "compute_losses",
+        lambda self, pred_dict, gt_dict, return_status=True: (
+            pred_dict["pred_boxes"].sum() * 0.0, {}),
+    )
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.srbt_enabled = False
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+    actor.expert_advantage_weight = 2.0
+    actor.expert_advantage_margin = 0.10
+
+    predicted = torch.tensor(
+        [[[0.30, 0.30, 0.20, 0.20]]], requires_grad=True)
+    upstream = torch.tensor(
+        [[[0.50, 0.50, 0.20, 0.20]]], requires_grad=True)
+    pred_dict = {
+        "pred_boxes": predicted,
+        "upstream_pred_boxes": upstream,
+    }
+    gt_dict = {
+        "search_anno": torch.tensor([[[0.40, 0.40, 0.20, 0.20]]]),
+        "search_absent": torch.ones(1, 1),
+        "training_expert_id": torch.tensor([expert_id]),
+        "challenge_labels": _challenge_labels(expert_id, 1),
+    }
+
+    loss, status = actor.compute_losses(pred_dict, gt_dict)
+    loss.backward()
+
+    expert_name = EXPERT_NAMES[expert_id]
+    assert status["Loss/expert_advantage"] > 0.0
+    assert status[f"Loss/expert_advantage_{expert_name}"] > 0.0
+    assert status["Loss/expert_advantage_weighted"] == pytest.approx(
+        2.0 * status["Loss/expert_advantage"])
+    assert predicted.grad is not None
+    assert predicted.grad.abs().sum() > 0.0
+    assert upstream.grad is None
+
+
+def test_visibility_expert_does_not_use_proposal_advantage(monkeypatch):
+    monkeypatch.setattr(
+        PETTrackBaseActor,
+        "compute_losses",
+        lambda self, pred_dict, gt_dict, return_status=True: (
+            pred_dict["pred_boxes"].sum() * 0.0, {}),
+    )
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.srbt_enabled = False
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+    actor.expert_advantage_weight = 2.0
+    actor.expert_advantage_margin = 0.10
+    predicted = torch.tensor(
+        [[[0.30, 0.30, 0.20, 0.20]]], requires_grad=True)
+    pred_dict = {"pred_boxes": predicted}
+    gt_dict = {
+        "search_anno": torch.tensor([[[0.40, 0.40, 0.20, 0.20]]]),
+        "search_absent": torch.ones(1, 1),
+        "training_expert_id": torch.tensor([3]),
+        "challenge_labels": _challenge_labels(3, 1),
+    }
+
+    loss, status = actor.compute_losses(pred_dict, gt_dict)
+
+    assert loss.item() == pytest.approx(0.0)
+    assert status["Loss/expert_advantage"] == pytest.approx(0.0)
+    assert status["Loss/expert_advantage_weighted"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("expert_id", [1, 2, 4])
+def test_specialist_advantage_requires_frozen_upstream_box(
+        monkeypatch, expert_id):
+    monkeypatch.setattr(
+        PETTrackBaseActor,
+        "compute_losses",
+        lambda self, pred_dict, gt_dict, return_status=True: (
+            pred_dict["pred_boxes"].sum() * 0.0, {}),
+    )
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.srbt_enabled = False
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+    actor.expert_advantage_weight = 2.0
+    actor.expert_advantage_margin = 0.10
+    pred_dict = {
+        "pred_boxes": torch.tensor(
+            [[[0.30, 0.30, 0.20, 0.20]]], requires_grad=True),
+    }
+    gt_dict = {
+        "search_anno": torch.tensor([[[0.40, 0.40, 0.20, 0.20]]]),
+        "search_absent": torch.ones(1, 1),
+        "training_expert_id": torch.tensor([expert_id]),
+        "challenge_labels": _challenge_labels(expert_id, 1),
+    }
+
+    with pytest.raises(RuntimeError, match="upstream_pred_boxes"):
+        actor.compute_losses(pred_dict, gt_dict)
 
 
 def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
@@ -251,6 +707,8 @@ def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
     actor.expert_phase = "recovery"
     actor.presence_loss_weight = 1.0
     actor.presence_focal_gamma = 2.0
+    actor.presence_present_threshold = 0.70
+    actor.presence_recover_threshold = 0.75
 
     base_boxes = torch.ones(2, 1, 4, requires_grad=True)
     presence_logits = torch.tensor(
@@ -260,6 +718,7 @@ def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
         predictions["signal"], {"Loss/redetect": predictions["signal"].item()})
     pred_dict = {
         "pred_boxes": base_boxes,
+        "upstream_pred_boxes": base_boxes.detach().clone(),
         "presence_predictions": {
             "logits": presence_logits,
             "score": presence_logits.softmax(dim=-1)[:, 1],
@@ -281,7 +740,48 @@ def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
     assert status["Expert/phase_id"] == 2
 
 
-def test_non_visibility_owner_does_not_train_presence_or_recovery(monkeypatch):
+def test_presence_loss_enforces_controller_thresholds(monkeypatch):
+    monkeypatch.setattr(
+        PETTrackBaseActor,
+        "compute_losses",
+        lambda self, pred_dict, gt_dict, return_status=True: (
+            pred_dict["pred_boxes"].sum() * 0.0, {}),
+    )
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.srbt_enabled = True
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+    actor.presence_loss_weight = 1.0
+    actor.presence_focal_gamma = 2.0
+    actor.presence_present_threshold = 0.70
+    actor.presence_recover_threshold = 0.75
+
+    probabilities = torch.tensor([0.72, 0.72, 0.65])
+    logits = torch.stack(
+        (1.0 - probabilities, probabilities), dim=-1
+    ).log().requires_grad_()
+    pred_dict = {
+        "pred_boxes": torch.zeros(3, 1, 4, requires_grad=True),
+        "presence_predictions": {
+            "logits": logits,
+            "score": probabilities,
+        },
+    }
+    gt_dict = {
+        "search_anno": torch.zeros(1, 3, 4),
+        "search_absent": torch.tensor([[1, 1, 0]]),
+        "is_reappear": torch.tensor([[0, 1, 0]]),
+        "training_expert_id": torch.full((3,), 3),
+        "challenge_labels": _challenge_labels(3, 3),
+    }
+
+    _, status = actor.compute_losses(pred_dict, gt_dict)
+
+    assert status["Loss/presence_threshold"] == pytest.approx(0.01)
+
+
+def test_non_visibility_expert_does_not_train_presence_or_recovery(monkeypatch):
     monkeypatch.setattr(
         PETTrackBaseActor,
         "compute_losses",
@@ -295,6 +795,8 @@ def test_non_visibility_owner_does_not_train_presence_or_recovery(monkeypatch):
     actor.expert_phase = "specialize"
     actor.presence_loss_weight = 1.0
     actor.presence_focal_gamma = 2.0
+    actor.expert_advantage_weight = 2.0
+    actor.expert_advantage_margin = 0.10
 
     base_boxes = torch.ones(2, 1, 4, requires_grad=True)
     presence_logits = torch.randn(2, 2, requires_grad=True)
@@ -303,6 +805,7 @@ def test_non_visibility_owner_does_not_train_presence_or_recovery(monkeypatch):
         predictions["signal"], {"Loss/redetect": predictions["signal"].item()})
     pred_dict = {
         "pred_boxes": base_boxes,
+        "upstream_pred_boxes": base_boxes.detach().clone(),
         "presence_predictions": {
             "logits": presence_logits,
             "score": presence_logits.softmax(dim=-1)[:, 1],
@@ -312,7 +815,8 @@ def test_non_visibility_owner_does_not_train_presence_or_recovery(monkeypatch):
     gt_dict = {
         "search_anno": torch.zeros(1, 2, 4),
         "search_absent": torch.tensor([[1, 0]]),
-        "expert_owner_id": torch.full((2,), 2),
+        "training_expert_id": torch.full((2,), 2),
+        "challenge_labels": _challenge_labels(2, 2),
     }
 
     loss, status = actor.compute_losses(pred_dict, gt_dict)
@@ -371,7 +875,16 @@ def test_recovery_loss_trains_localization_and_rgb_identity():
     assert status["Loss/recovery_ranking"] > 0.0
 
 
-def _expert_model():
+class _BatchNormTinyHead(TinyHead):
+    def __init__(self):
+        super().__init__()
+        self.norm = torch.nn.BatchNorm2d(8)
+
+    def forward(self, feat, gt_score_map):
+        return super().forward(self.norm(feat), gt_score_map)
+
+
+def _expert_model(box_head=None):
     cfg = _cfg()
     cfg.MODEL.EXPERT = edict({
         "ENABLE": True,
@@ -379,28 +892,51 @@ def _expert_model():
         "NAMES": list(EXPERT_NAMES),
     })
     return PETTrack(
-        TinyBackbone(), TinyMemory(), TinyHead(), cfg, head_type="CENTER")
+        TinyBackbone(), TinyMemory(), box_head or TinyHead(),
+        cfg, head_type="CENTER")
 
 
-def test_each_expert_has_an_independent_prediction_head():
+def test_detached_parent_forward_keeps_generalist_batch_norm_buffers_frozen():
+    model = _expert_model(_BatchNormTinyHead())
+    model.train()
+    before = {
+        name: value.detach().clone()
+        for name, value in model.box_head.named_buffers()
+    }
+
+    model.forward_head(
+        torch.randn(4, 12, 8),
+        training_expert_ids=torch.full((4,), 1),
+    )
+
+    current = dict(model.box_head.named_buffers())
+    assert all(torch.equal(current[name], value)
+               for name, value in before.items())
+
+
+def test_shared_experts_have_independent_heads_and_small_expert_is_disjoint():
     model = _expert_model()
 
-    heads = [model._head_for_expert(name) for name in EXPERT_NAMES]
+    heads = [model._head_for_expert(name) for name in SHARED_EXPERT_NAMES]
 
     assert heads[0] is model.box_head
-    assert len({id(head) for head in heads}) == len(EXPERT_NAMES)
+    assert len({id(head) for head in heads}) == len(SHARED_EXPERT_NAMES)
     parameter_ids = [
         {id(parameter) for parameter in head.parameters()} for head in heads
     ]
     assert all(parameter_ids[i].isdisjoint(parameter_ids[j])
-               for i in range(5) for j in range(i + 1, 5))
+               for i in range(4) for j in range(i + 1, 4))
+    small_parameter_ids = {
+        id(parameter) for parameter in model.small_target_expert.parameters()
+    }
+    assert all(small_parameter_ids.isdisjoint(ids) for ids in parameter_ids)
 
 
-def test_owner_batch_executes_one_fusion_and_one_head(monkeypatch):
+def test_motion_expert_executes_generalist_dependency_and_motion_only(monkeypatch):
     model = _expert_model()
-    fusion_calls = {name: 0 for name in EXPERT_NAMES}
-    head_calls = {name: 0 for name in EXPERT_NAMES}
-    for name in EXPERT_NAMES:
+    fusion_calls = {name: 0 for name in SHARED_EXPERT_NAMES}
+    head_calls = {name: 0 for name in SHARED_EXPERT_NAMES}
+    for name in SHARED_EXPERT_NAMES:
         fusion = model.expert_fusion.experts[name]
         fusion_forward = fusion.forward
         monkeypatch.setattr(
@@ -424,64 +960,96 @@ def test_owner_batch_executes_one_fusion_and_one_head(monkeypatch):
 
     output = model.forward_head(
         torch.randn(4, 12, 8),
-        expert_owner_ids=torch.full((4,), 2),
+        training_expert_ids=torch.full((4,), 1),
     )
 
-    assert output["expert_owner_id"].item() == 2
+    assert "expert_owner_id" not in output
     assert fusion_calls == {
-        "generalist": 0,
-        "motion_fm": 0,
-        "small_target_st": 1,
+        "generalist": 1,
+        "motion_fm": 1,
         "visibility_foc_ov": 0,
         "discrimination_bi": 0,
     }
     assert head_calls == fusion_calls
 
 
-def test_specialist_batch_rejects_mixed_owner_ids():
+def test_specialist_batch_rejects_mixed_training_expert_ids():
     model = _expert_model()
 
-    with pytest.raises(ValueError, match="exactly one expert owner"):
+    with pytest.raises(ValueError, match="exactly one training expert"):
         model.forward_head(
             torch.randn(2, 12, 8),
-            expert_owner_ids=torch.tensor([0, 1]),
+            training_expert_ids=torch.tensor([1, 2]),
         )
 
 
-def test_non_owner_parameters_are_bitwise_unchanged_after_step():
-    torch.manual_seed(11)
+def test_precision_expert_rejects_shared_head_without_owner_terminology():
     model = _expert_model()
-    owner_id = 2
-    owner_name = EXPERT_NAMES[owner_id]
-    trainable = []
-    per_expert = {}
-    for index, name in enumerate(EXPERT_NAMES):
-        parameters = list(model.expert_fusion.experts[name].parameters())
-        parameters.append(model.expert_fusion.residual_scale_logits[name])
-        parameters.extend(model._head_for_expert(name).parameters())
-        per_expert[index] = parameters
-        trainable.extend(parameters)
+
+    with pytest.raises(RuntimeError, match="precision expert must bypass"):
+        model.forward_head(
+            torch.randn(2, 12, 8),
+            training_expert_ids=torch.full((2,), 2),
+        )
+
+
+@pytest.mark.parametrize("expert_id, allowed_prefixes", (
+    (1, (
+        "expert_fusion.experts.motion_fm.",
+        "expert_fusion.residual_scale_logits.motion_fm",
+        "expert_heads.motion_fm.",
+        "proposal_adapters.motion_fm.",
+    )),
+    (2, (
+        "small_target_expert.",
+        "proposal_adapters.precision_refiner.",
+    )),
+    (3, (
+        "expert_fusion.experts.visibility_foc_ov.",
+        "expert_fusion.residual_scale_logits.visibility_foc_ov",
+        "expert_heads.visibility_foc_ov.",
+        "visibility_gate.",
+    )),
+    (4, (
+        "expert_fusion.experts.discrimination_bi.",
+        "expert_fusion.residual_scale_logits.discrimination_bi",
+        "expert_heads.discrimination_bi.",
+        "proposal_adapters.discrimination_bi.",
+    )),
+))
+def test_non_selected_expert_parameters_are_bitwise_unchanged_after_step(
+        expert_id, allowed_prefixes):
+    torch.manual_seed(11 + expert_id)
+    model = _expert_model()
+    model.cfg.TRAIN = edict({
+        "EXPERT_PHASE": "specialize",
+        "SPECIALIST_EXPERT_IDS": [1, 2, 3, 4],
+        "SMALL_TARGET_ADAPTER_LR": 0.0,
+        "LR": 1e-3,
+        "WEIGHT_DECAY": 0.1,
+        "EXPERT_LR_MULTIPLIER": 5.0,
+    })
+    optimizer = torch.optim.AdamW(
+        _optimizer_groups(model, model.cfg), lr=1e-3, weight_decay=0.1)
     before = {
-        id(parameter): parameter.detach().clone()
-        for parameter in trainable
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
     }
-    optimizer = torch.optim.SGD(trainable, lr=0.1)
 
-    output = model.forward_head(
-        torch.randn(3, 12, 8),
-        expert_owner_ids=torch.full((3,), owner_id),
+    output = model(
+        *_images(batch=3),
+        training_expert_ids=torch.full((3,), expert_id),
     )
-    output["score_map"].sum().backward()
-
-    for index, parameters in per_expert.items():
-        if index != owner_id:
-            assert all(parameter.grad is None for parameter in parameters)
+    loss = output["score_map"].mean() + output["pred_boxes"].mean()
+    if expert_id == 3:
+        loss = loss + output["presence_predictions"]["logits"].square().mean()
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
     optimizer.step()
-    for index, parameters in per_expert.items():
-        if index != owner_id:
-            assert all(torch.equal(parameter, before[id(parameter)])
-                       for parameter in parameters)
-    assert any(
-        not torch.equal(parameter, before[id(parameter)])
-        for parameter in per_expert[owner_id]
-    ), owner_name
+
+    changed = [
+        name for name, parameter in model.named_parameters()
+        if not torch.equal(before[name], parameter.detach())
+    ]
+    assert changed
+    assert all(name.startswith(allowed_prefixes) for name in changed)

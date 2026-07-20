@@ -7,9 +7,11 @@ import torch
 from easydict import EasyDict as edict
 
 from lib.train.actors.pet_track import PETTrackActor
+from lib.train.data.processing import STARKProcessing
 from lib.train.data.sampler import TrackingSampler
 from lib.train.trainers import BaseTrainer, base_trainer
 from lib.train.trainers.ltr_trainer import LTRTrainer
+from lib.train.trainers.ltr_trainer import _set_loader_epoch
 import lib.train.train_script as train_script_module
 from lib.test.evaluation.tracker import Tracker
 from lib.test.evaluation.running import _save_tracker_output
@@ -31,6 +33,75 @@ def _state():
         "best_val_epoch": 4,
         "config_summary": {"MODEL.SRBT.ENABLE": True},
     }
+
+
+def test_loader_epoch_reaches_challenge_curriculum_dataset():
+    class Dataset:
+        epoch = None
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+    loader = SimpleNamespace(
+        dataset=Dataset(),
+        batch_sampler=SimpleNamespace(),
+        sampler=SimpleNamespace(),
+    )
+
+    _set_loader_epoch(loader, 101)
+
+    assert loader.dataset.epoch == 101
+
+
+def test_precision_training_expert_uses_larger_search_context_only():
+    processing = object.__new__(STARKProcessing)
+    processing.scale_jitter_factor = {"template": 0.0, "search": 0.0}
+    processing.center_jitter_factor = {"template": 0.0, "search": 0.0}
+    processing.precision_search_scale_multiplier = 1.75
+    box = torch.tensor([10.0, 20.0, 4.0, 6.0])
+
+    ordinary = processing._get_jittered_box(
+        box, "search", training_expert_id=1)
+    precision = processing._get_jittered_box(
+        box, "search", training_expert_id=2)
+    template = processing._get_jittered_box(
+        box, "template", training_expert_id=2)
+
+    assert torch.equal(ordinary, box)
+    assert torch.equal(template, box)
+    assert torch.allclose(precision[2:], box[2:] * 1.75)
+    assert torch.allclose(
+        precision[:2] + 0.5 * precision[2:],
+        box[:2] + 0.5 * box[2:],
+    )
+
+
+def test_motion_training_expert_uses_wider_center_jitter_only(monkeypatch):
+    processing = object.__new__(STARKProcessing)
+    processing.scale_jitter_factor = {"template": 0.0, "search": 0.0}
+    processing.center_jitter_factor = {"template": 0.0, "search": 1.5}
+    processing.precision_search_scale_multiplier = 1.75
+    processing.motion_center_jitter_multiplier = 2.5
+    box = torch.tensor([10.0, 20.0, 4.0, 4.0])
+    monkeypatch.setattr(torch, "randn", lambda *args: torch.zeros(*args))
+    monkeypatch.setattr(torch, "rand", lambda *args: torch.ones(*args))
+
+    generalist = processing._get_jittered_box(
+        box, "search", training_expert_id=0)
+    motion = processing._get_jittered_box(
+        box, "search", training_expert_id=1)
+    precision = processing._get_jittered_box(
+        box, "search", training_expert_id=2)
+    template = processing._get_jittered_box(
+        box, "template", training_expert_id=1)
+
+    box_center = box[:2] + 0.5 * box[2:]
+    generalist_offset = (
+        generalist[:2] + 0.5 * generalist[2:] - box_center)
+    motion_offset = motion[:2] + 0.5 * motion[2:] - box_center
+    assert torch.allclose(motion_offset, generalist_offset * 2.5)
+    assert torch.allclose(precision[2:], box[2:] * 1.75)
+    assert torch.equal(template, box)
 
 
 class _UnsafeCheckpointPayload:
@@ -155,6 +226,61 @@ def test_srbt_checkpoint_round_trip_saves_scaler_state_dict(tmp_path):
         assert torch.equal(expected, actual)
 
 
+def test_resume_rebases_step_scheduler_to_current_specialist_plan(tmp_path):
+    class TinyActor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = torch.nn.Linear(1, 1)
+
+    settings = SimpleNamespace(
+        env=SimpleNamespace(workspace_dir=str(tmp_path)),
+        save_dir=None,
+        local_rank=0,
+        project_path="srbt",
+        use_gpu=False,
+        scheduler_type="step",
+        rebase_scheduler_on_resume=True,
+    )
+    actor = TinyActor()
+    optimizer = torch.optim.AdamW(actor.net.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50)
+    optimizer.param_groups[0]["lr"] = 1e-5
+    scheduler.last_epoch = 53
+    scheduler._last_lr = [1e-5]
+    checkpoint = tmp_path / "old_schedule.pth.tar"
+    torch.save({
+        "schema_version": 1,
+        "net_type": "Linear",
+        "net": actor.net.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "lr_scheduler": scheduler.state_dict(),
+        "amp_scaler": None,
+        "epoch": 53,
+        "best_val_score": None,
+        "best_val_epoch": 0,
+        "config_summary": {"TRAIN.BEST_METRIC": "IoU"},
+    }, checkpoint)
+
+    restored_actor = TinyActor()
+    restored_optimizer = torch.optim.AdamW(
+        restored_actor.net.parameters(), lr=1e-4)
+    restored_scheduler = torch.optim.lr_scheduler.StepLR(
+        restored_optimizer, step_size=100)
+    restored = BaseTrainer(
+        restored_actor, [], restored_optimizer, settings, restored_scheduler)
+
+    restored.load_checkpoint(str(checkpoint))
+
+    assert restored.epoch == 53
+    assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(1e-4)
+    assert restored_optimizer.param_groups[0]["initial_lr"] == pytest.approx(
+        1e-4)
+    assert restored_scheduler.step_size == 100
+    assert restored_scheduler.last_epoch == 53
+    assert restored_scheduler.base_lrs == pytest.approx([1e-4])
+    assert restored_scheduler.get_last_lr() == pytest.approx([1e-4])
+
+
 def test_resume_resets_legacy_iou_best_when_metric_changes_to_felt_auc(tmp_path):
     class TinyActor(torch.nn.Module):
         def __init__(self):
@@ -215,7 +341,7 @@ def test_refine_startup_loads_stage1_gate_reference(tmp_path):
         "generalist_iou": 0.70,
         "specialists": {
             "motion_fm": 0.62,
-            "small_target_st": 0.61,
+            "precision_refiner": 0.61,
             "visibility_foc_ov": 0.60,
             "discrimination_bi": 0.63,
         },
@@ -789,7 +915,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.EXPERT.NAMES == [
         "generalist",
         "motion_fm",
-        "small_target_st",
+        "precision_refiner",
         "visibility_foc_ov",
         "discrimination_bi",
     ]
@@ -799,41 +925,73 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_BASELINE_CKPT == (
         "pretrained_networks/AMTTrack_ep0098.pth.tar")
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
-    assert configured.MODEL.PRETRAINED_EXPERT_CKPT == (
-        "pretrained_networks/PETTrack_specialists_best_ep0020.pth.tar")
-    assert configured.MODEL.INIT_CHECKPOINT == ""
+    assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
+    assert configured.MODEL.INIT_CHECKPOINT.endswith(
+        "multilabel_specialists_v29_20260720/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_latest.pth.tar")
+    assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
+    assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is False
+    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
 
 
-def test_canonical_training_strategy_matches_dual_4090_capacity():
+def test_canonical_pursuit_strategy_is_closed_loop_and_baseline_safe():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
 
     configured = deepcopy(cfg)
     update_config_from_file("experiments/pet_track/felt_pet_track.yaml", configured)
 
-    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 4200
-    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 10000
+    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 2400
+    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 1200
     assert configured.TRAIN.BATCH_SIZE == 6
-    assert configured.TRAIN.NUM_WORKER == 4
-    assert configured.TRAIN.PERSISTENT_WORKERS is False
+    assert configured.TRAIN.NUM_WORKER == 5
+    assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
-    assert configured.TRAIN.EXPERT_PHASE == "specialize"
-    assert configured.TRAIN.MIN_EPOCH == 25
+    assert configured.MODEL.INIT_CHECKPOINT.endswith(
+        "multilabel_specialists_v29_20260720/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_latest.pth.tar")
+    assert configured.TRAIN.EXPERT_PHASE == "pursuit"
+    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1, 2, 3, 4]
+    assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
+    assert configured.DATA.PURSUIT.ENABLE is True
+    assert configured.DATA.PURSUIT.WINDOW_LENGTH == 8
+    assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
+    assert configured.DATA.PURSUIT.TRANSITION_PROBABILITY == pytest.approx(0.5)
+    assert configured.DATA.PURSUIT.REAPPEAR_PROBABILITY == pytest.approx(0.25)
+    assert configured.DATA.SEARCH.FACTOR == 4.0
+    assert configured.DATA.SEARCH.CENTER_JITTER == pytest.approx(1.5)
+    assert configured.DATA.SEARCH.MOTION_CENTER_JITTER_MULTIPLIER == pytest.approx(
+        2.5)
+    assert configured.DATA.SEARCH.PRECISION_SCALE_MULTIPLIER == pytest.approx(
+        1.75)
+    assert configured.TRAIN.MIN_EPOCH == 20
     assert configured.TRAIN.EPOCH == 60
     assert configured.TRAIN.REFINE_MAX_EPOCH == 12
-    assert configured.TRAIN.LR == 0.00002
-    assert configured.TRAIN.LR_DROP_EPOCH == 50
+    assert configured.TRAIN.LR == 0.00001
+    assert configured.TRAIN.PURSUIT_LR == pytest.approx(0.0001)
+    assert configured.TRAIN.SMALL_TARGET_ADAPTER_LR == pytest.approx(0.0)
+    assert "SMALL_TARGET_CHANNEL_LR" not in configured.TRAIN
+    assert configured.TRAIN.GRAD_CLIP_NORM == 30.0
+    assert configured.TRAIN.GIOU_WEIGHT == 6.0
+    assert configured.TRAIN.L1_WEIGHT == 10.0
+    assert configured.TRAIN.FOCAL_WEIGHT == pytest.approx(1.0)
+    assert configured.TRAIN.SMALL_TARGET_CENTER_RANK_WEIGHT == 1.0
+    assert configured.TRAIN.SMALL_TARGET_MATCH_RANK_WEIGHT == 0.5
+    assert configured.TRAIN.SMALL_TARGET_DENSE_SIZE_WEIGHT == 1.0
+    assert configured.TRAIN.SMALL_TARGET_DENSE_OFFSET_WEIGHT == 1.0
+    assert "SMALL_TARGET_DENSE_GEOMETRY_WEIGHT" not in configured.TRAIN
+    assert configured.TRAIN.SMALL_TARGET_SOFT_BOX_TEMPERATURE == pytest.approx(
+        0.2)
+    assert configured.TRAIN.LR_DROP_EPOCH == 45
+    assert configured.TRAIN.REBASE_SCHEDULER_ON_RESUME is True
     assert configured.TRAIN.REFINE_TAIL_LR == 0.000001
     assert configured.TRAIN.REFINE_MEMORY_LR == 0.0000005
-    assert configured.TRAIN.VAL_START_EPOCH == 1
-    expected_schedule = [
-        [1, 1, 1],
-        [5, 5, 1],
-        [10, 50, 5],
-        [51, 60, 1],
-    ]
-    assert configured.TRAIN.VAL_SCHEDULE == expected_schedule
-    assert configured.TRAIN.SEQUENCE_VAL_SCHEDULE == expected_schedule
+    assert configured.TRAIN.VAL_START_EPOCH == 10
+    assert configured.TRAIN.VAL_SCHEDULE == [[10, 60, 5]]
+    assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
+    assert configured.TRAIN.SEQUENCE_VAL_SCHEDULE == []
+    assert configured.TRAIN.SEQUENCE_VAL_TRAIN_IOU_THRESHOLD == pytest.approx(
+        0.0)
     assert configured.TRAIN.REFINE_SEQUENCE_VAL_SCHEDULE == [[1, -1, 1]]
     assert configured.TRAIN.SRBT_LOSS.EXISTENCE_WEIGHT == 1.0
     assert configured.TRAIN.SRBT_LOSS.FOCAL_GAMMA == 2.0
@@ -841,31 +999,58 @@ def test_canonical_training_strategy_matches_dual_4090_capacity():
     assert configured.TRAIN.RECOVERY_LOSS.RANKING_WEIGHT == 0.5
     assert configured.TRAIN.RECOVERY_LOSS.RANKING_MARGIN == 0.2
     assert "EXPERT_LOSS" not in configured.TRAIN
-    assert configured.DATA.CHALLENGE_SAMPLING.ENABLE is True
-    assert configured.DATA.CHALLENGE_SAMPLING.PRECISE is True
+    assert configured.DATA.CHALLENGE_SAMPLING.ENABLE is False
+    assert configured.DATA.CHALLENGE_SAMPLING.PRECISE is False
+    assert "MODE" not in configured.DATA.CHALLENGE_SAMPLING
     assert configured.DATA.CHALLENGE_SAMPLING.MANIFEST == (
-        "/root/fnvme/PTE_v8_manifests/felt_train_expert_owners.json")
+        "/root/fnvme/PTE_v8_manifests/felt_train_challenges_v2.json")
     assert configured.DATA.CHALLENGE_SAMPLING.VAL_MANIFEST == (
-        "/root/fnvme/PTE_v8_manifests/felt_val_expert_owners.json")
+        "/root/fnvme/PTE_v8_manifests/felt_val_challenges_v2.json")
+    assert configured.MODEL.SRBT.ENABLE is True
+    assert configured.DATA.SRBT.ENABLE is False
     assert configured.MODEL.SRBT.CONTROLLER.THETA_PRESENT == 0.70
     assert configured.MODEL.SRBT.CONTROLLER.ABSENT_FRAMES == 4
-    assert configured.TRAIN.SAVE_EPOCHS == []
+    assert configured.TEST.POLICY_MODE == "stateful"
+    assert configured.TRAIN.SAVE_EPOCHS == [10, 20, 30, 40, 50, 60]
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is True
-    assert configured.TRAIN.SPECIALIST_GATE_ENABLE is True
+    assert configured.TRAIN.BEST_LOADER == "val"
+    assert configured.TRAIN.BEST_METRIC == "Pursuit/next_in_crop_rate"
+    assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
     assert configured.TRAIN.SPECIALIST_MIN_DELTA == 0.02
     assert configured.TRAIN.GENERALIST_MAX_DROP == 0.005
 
 
-def test_supervisor_uses_fresh_route_free_stage1_run_directory():
+def test_supervisor_uses_search_pursuit_v30_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "route_free_specialize_20260716" in supervisor
+    assert "search_pursuit_v30_20260720" in supervisor
+    assert "multilabel_specialists_v29_20260720" not in supervisor
+    assert "multilabel_specialists_v28_20260719" not in supervisor
+    assert "direct_box_refiner_v23_20260717" not in supervisor
+    assert "base_conditioned_geometry_v22_20260717" not in supervisor
+    assert "prefusion_match_small_v18b_20260717" not in supervisor
+    assert "joint_small_v18c_20260717" not in supervisor
+    assert "channel_preserving_small_v19_20260717" not in supervisor
+    assert "center_aligned_small_v17b_20260717" not in supervisor
+    assert "spatial_identity_small_v17_20260717" not in supervisor
+    assert "template_low_rank_small_v16_20260717" not in supervisor
+    assert "template_channel_calibration_v15_20260717" not in supervisor
+    assert "template_conditioned_small_v15_20260717" not in supervisor
+    assert "independent_small_v14_20260716" not in supervisor
+    assert "independent_small_v13_20260716" not in supervisor
+    assert "baseline_safe_small_v2_20260716" not in supervisor
+    assert "route_free_specialize_20260716" not in supervisor
     assert "expert_route_20260715" not in supervisor
+    assert "--nproc_per_node 1" in supervisor
+    assert "--nproc_per_node 2" not in supervisor
+    assert supervisor.count(
+        "mkdir -p /root/fnvme/PTE_v8_runs/"
+        "search_pursuit_v30_20260720/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

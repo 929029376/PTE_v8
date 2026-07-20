@@ -60,6 +60,34 @@ def _load_refine_gate_reference(cfg):
     }
 
 
+def _validate_pursuit_stage(cfg):
+    phase = str(getattr(
+        cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
+    if phase != "pursuit":
+        return
+    controller_cfg = getattr(cfg.MODEL, "SEARCH_CONTROLLER", None)
+    pursuit_cfg = getattr(cfg.DATA, "PURSUIT", None)
+    errors = []
+    if not bool(getattr(controller_cfg, "ENABLE", False)):
+        errors.append("MODEL.SEARCH_CONTROLLER.ENABLE must be true")
+    if not bool(getattr(pursuit_cfg, "ENABLE", False)):
+        errors.append("DATA.PURSUIT.ENABLE must be true")
+    if not str(getattr(cfg.MODEL, "INIT_CHECKPOINT", "") or "").strip():
+        errors.append("MODEL.INIT_CHECKPOINT must load the completed expert model")
+    if int(getattr(pursuit_cfg, "WINDOW_LENGTH", 0)) < 3:
+        errors.append("DATA.PURSUIT.WINDOW_LENGTH must be at least 3")
+    if int(getattr(cfg.DATA.TEMPLATE, "NUMBER", 0)) < 2:
+        errors.append("DATA.TEMPLATE.NUMBER must be at least 2")
+    if int(getattr(pursuit_cfg, "CANVAS_SIZE", 0)) < int(
+            getattr(cfg.DATA.SEARCH, "SIZE", 0)):
+        errors.append("DATA.PURSUIT.CANVAS_SIZE must cover the search input")
+    if bool(getattr(controller_cfg, "USE_INFERENCE", False)):
+        errors.append("MODEL.SEARCH_CONTROLLER.USE_INFERENCE must stay false while training")
+    if errors:
+        raise RuntimeError(
+            "Invalid pursuit stage: " + "; ".join(errors))
+
+
 def run(settings):
     settings.description = 'SRBT PETTrack training'
 
@@ -69,6 +97,7 @@ def run(settings):
     config_module = importlib.import_module("lib.config.%s.config" % settings.script_name)
     cfg = config_module.cfg
     config_module.update_config_from_file(settings.cfg_file)
+    _validate_pursuit_stage(cfg)
     if settings.local_rank in [-1, 0]:
         print("New configuration is shown below.")
         for key in cfg.keys():
@@ -116,6 +145,12 @@ def run(settings):
         cfg.TRAIN, "SEQUENCE_VAL_ENABLE", False)
     settings.sequence_val_schedule = getattr(
         cfg.TRAIN, "SEQUENCE_VAL_SCHEDULE", None)
+    settings.specialist_expert_schedule = getattr(
+        cfg.TRAIN, "SPECIALIST_EXPERT_SCHEDULE", None)
+    settings.sequence_val_train_iou_threshold = getattr(
+        cfg.TRAIN, "SEQUENCE_VAL_TRAIN_IOU_THRESHOLD", 0.0)
+    settings.rebase_scheduler_on_resume = bool(getattr(
+        cfg.TRAIN, "REBASE_SCHEDULER_ON_RESUME", False))
     settings.save_latest_each_epoch = getattr(cfg.TRAIN, "SAVE_LATEST_EACH_EPOCH", False)
     settings.save_final_checkpoint = getattr(cfg.TRAIN, "SAVE_FINAL_CHECKPOINT", True)
     settings.save_best = getattr(cfg.TRAIN, "SAVE_BEST", False)

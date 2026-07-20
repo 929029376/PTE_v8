@@ -17,6 +17,14 @@ def update_settings(settings, cfg):
                                      'search': cfg.DATA.SEARCH.CENTER_JITTER}
     settings.scale_jitter_factor = {'template': cfg.DATA.TEMPLATE.SCALE_JITTER,
                                     'search': cfg.DATA.SEARCH.SCALE_JITTER}
+    settings.motion_center_jitter_multiplier = float(getattr(
+        cfg.DATA.SEARCH, "MOTION_CENTER_JITTER_MULTIPLIER", 1.0))
+    settings.precision_search_scale_multiplier = float(getattr(
+        cfg.DATA.SEARCH, "PRECISION_SCALE_MULTIPLIER", 1.0))
+    pursuit_cfg = getattr(cfg.DATA, "PURSUIT", None)
+    settings.pursuit_enabled = bool(getattr(pursuit_cfg, "ENABLE", False))
+    settings.pursuit_canvas_size = int(getattr(
+        pursuit_cfg, "CANVAS_SIZE", cfg.DATA.SEARCH.SIZE))
     settings.grad_clip_norm = cfg.TRAIN.GRAD_CLIP_NORM
     settings.print_stats = None
     settings.batchsize = cfg.TRAIN.BATCH_SIZE
@@ -50,12 +58,13 @@ def names2datasets(name_list: list, settings, image_loader):
     return datasets
 
 
-def _validate_precise_expert_epoch(samples_per_epoch, batch_size, world_size):
-    divisor = 5 * int(batch_size) * int(world_size)
+def _validate_precise_expert_epoch(
+        samples_per_epoch, batch_size, world_size, expert_count):
+    divisor = int(expert_count) * int(batch_size) * int(world_size)
     if divisor <= 0 or int(samples_per_epoch) % divisor != 0:
         raise ValueError(
             "precise expert sampling requires SAMPLE_PER_EPOCH divisible by "
-            f"5 * BATCH_SIZE * world_size ({divisor})")
+            f"{expert_count} * BATCH_SIZE * world_size ({divisor})")
 
 
 def build_dataloaders(cfg, settings):
@@ -87,7 +96,12 @@ def build_dataloaders(cfg, settings):
                                                      settings=settings)
 
     settings.num_template = getattr(cfg.DATA.TEMPLATE, "NUMBER", 1)
-    settings.num_search = getattr(cfg.DATA.SEARCH, "NUMBER", 1)
+    settings.num_search = (
+        int(getattr(cfg.DATA.PURSUIT, "WINDOW_LENGTH", 8))
+        if str(getattr(cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
+        == "pursuit"
+        else getattr(cfg.DATA.SEARCH, "NUMBER", 1)
+    )
     sampler_mode = getattr(cfg.DATA, "SAMPLER_MODE", "causal")
     train_cls = getattr(cfg.TRAIN, "TRAIN_CLS", False)
     dataset_train = sampler.TrackingSampler(datasets=names2datasets(cfg.DATA.TRAIN.DATASETS_NAME, settings, opencv_loader),
@@ -109,6 +123,7 @@ def build_dataloaders(cfg, settings):
             cfg.DATA.TRAIN.SAMPLE_PER_EPOCH,
             cfg.TRAIN.BATCH_SIZE,
             world_size,
+            len(dataset_train.training_expert_ids),
         )
     train_sampler = (
         DistributedSampler(dataset_train, shuffle=not precise_expert_sampling)
@@ -170,11 +185,22 @@ def _optimizer_groups(net, cfg):
     model = _unwrap_net(net)
     expert_phase = str(getattr(
         cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
-    if expert_phase not in {"specialize", "refine", "recovery"}:
+    if expert_phase not in {"specialize", "refine", "recovery", "pursuit"}:
         raise ValueError(
-            "TRAIN.EXPERT_PHASE must be specialize, refine, or recovery")
+            "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, or pursuit")
     expert_fusion = getattr(model, "expert_fusion", None)
     expert_heads = getattr(model, "expert_heads", None)
+    specialist_expert_ids = tuple(int(expert_id) for expert_id in getattr(
+        cfg.TRAIN, "SPECIALIST_EXPERT_IDS", ()))
+    small_target_only = (
+        expert_phase == "specialize"
+        and bool(specialist_expert_ids)
+        and set(specialist_expert_ids) == {2}
+    )
+    small_target_adapter_lr = float(getattr(
+        cfg.TRAIN, "SMALL_TARGET_ADAPTER_LR", 0.0))
+    small_target_adapter_training = (
+        small_target_only and small_target_adapter_lr > 0.0)
     if expert_phase == "specialize" and (
             expert_fusion is None or expert_heads is None):
         raise ValueError(
@@ -182,17 +208,42 @@ def _optimizer_groups(net, cfg):
     if expert_phase == "specialize":
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        specialist_modules = [
-            expert_fusion,
-            expert_heads,
-            getattr(model, "box_head", None),
-            getattr(model, "visibility_gate", None),
-            getattr(model, "rgb_identity_verifier", None),
-            getattr(model, "redetect_expert", None),
-        ]
-        for module in specialist_modules:
-            if module is not None:
-                for parameter in module.parameters():
+        if small_target_only:
+            small_target_expert = getattr(
+                model, "small_target_expert", None)
+            if small_target_expert is None:
+                raise ValueError(
+                    "precision specialization requires small_target_expert")
+            for name, parameter in small_target_expert.named_parameters():
+                parameter.requires_grad_(
+                    not small_target_adapter_training
+                    or name.startswith("box_refiner."))
+            proposal_adapters = getattr(model, "proposal_adapters", None)
+            if (proposal_adapters is not None
+                    and "precision_refiner" in proposal_adapters):
+                for parameter in proposal_adapters[
+                        "precision_refiner"].parameters():
+                    parameter.requires_grad_(True)
+        else:
+            specialist_modules = [
+                expert_heads,
+                getattr(model, "proposal_adapters", None),
+                getattr(model, "small_target_expert", None),
+                getattr(model, "visibility_gate", None),
+                getattr(model, "rgb_identity_verifier", None),
+                getattr(model, "redetect_expert", None),
+            ]
+            for module in specialist_modules:
+                if module is not None:
+                    for parameter in module.parameters():
+                        parameter.requires_grad_(True)
+            default_expert = getattr(model, "default_expert", "generalist")
+            for name, expert in expert_fusion.experts.items():
+                if name != default_expert:
+                    for parameter in expert.parameters():
+                        parameter.requires_grad_(True)
+            for name, parameter in expert_fusion.residual_scale_logits.items():
+                if name != default_expert:
                     parameter.requires_grad_(True)
     elif expert_phase == "refine":
         for parameter in model.parameters():
@@ -220,6 +271,15 @@ def _optimizer_groups(net, cfg):
         for module in recovery_modules:
             for parameter in module.parameters():
                 parameter.requires_grad_(True)
+    elif expert_phase == "pursuit":
+        controller = getattr(model, "search_window_controller", None)
+        if controller is None:
+            raise ValueError(
+                "TRAIN.EXPERT_PHASE=pursuit requires MODEL.SEARCH_CONTROLLER.ENABLE=true")
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in controller.parameters():
+            parameter.requires_grad_(True)
     lr = cfg.TRAIN.LR
     wd = cfg.TRAIN.WEIGHT_DECAY
     used = set()
@@ -242,7 +302,12 @@ def _optimizer_groups(net, cfg):
             "param_count": sum(p.numel() for p in params),
         })
 
-    if expert_phase == "refine":
+    if expert_phase == "pursuit":
+        add_group(
+            "search_window_controller",
+            float(getattr(cfg.TRAIN, "PURSUIT_LR", lr)),
+            lambda name: name.startswith("search_window_controller."))
+    elif expert_phase == "refine":
         add_group(
             "vit_tail_refine",
             float(getattr(cfg.TRAIN, "REFINE_TAIL_LR", 1e-6)),
@@ -255,6 +320,24 @@ def _optimizer_groups(net, cfg):
             float(getattr(cfg.TRAIN, "REFINE_MEMORY_LR", 5e-7)),
             lambda name: name.startswith("memory."))
     else:
+        if small_target_only:
+            if small_target_adapter_training:
+                add_group(
+                    "precision_refiner_box_refiner",
+                    small_target_adapter_lr,
+                    lambda name: name.startswith((
+                        "small_target_expert.box_refiner.",
+                        "proposal_adapters.precision_refiner.",
+                    )))
+            else:
+                add_group(
+                    "precision_refiner",
+                    lr * float(getattr(
+                        cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0)),
+                    lambda name: name.startswith((
+                        "small_target_expert.",
+                        "proposal_adapters.precision_refiner.",
+                    )))
         add_group(
             "vit_blocks_1_8", lr * 0.1,
             lambda name: (
@@ -272,18 +355,20 @@ def _optimizer_groups(net, cfg):
                 and int(name.split(".")[2]) >= 8
             ) or name.startswith((
                 "backbone.norm.", "backbone.amah_", "memory.")))
-        add_group(
-            "expert_fusion_heads", lr * float(getattr(
-                cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0)),
-            lambda name: name.startswith((
-                "expert_fusion.", "expert_heads.", "box_head.")))
-        add_group(
-            "recovery",
-            lr * float(getattr(cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0))
-            if expert_phase == "specialize" else lr,
-            lambda name: name.startswith((
-                "rgb_identity_verifier.", "visibility_gate.",
-                "redetect_expert.")))
+        if not small_target_only:
+            add_group(
+                "expert_fusion_heads", lr * float(getattr(
+                    cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0)),
+                lambda name: name.startswith((
+                    "expert_fusion.", "expert_heads.", "box_head.",
+                    "small_target_expert.", "proposal_adapters.")))
+            add_group(
+                "recovery",
+                lr * float(getattr(cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0))
+                if expert_phase == "specialize" else lr,
+                lambda name: name.startswith((
+                    "rgb_identity_verifier.", "visibility_gate.",
+                    "redetect_expert.")))
 
     other = [name for name, param in named_params
              if param.requires_grad and id(param) not in used]
