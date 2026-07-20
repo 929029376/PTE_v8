@@ -668,6 +668,7 @@ def test_dispatch_targets_keep_multilabel_eligibility_but_require_utility():
     actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
     actor.expert_phase = "dispatch"
     actor.activation_advantage_margin = 0.02
+    actor.activation_pos_weight = (4.0, 5.0, 1.5, 2.5)
     logits = torch.zeros(2, 4, requires_grad=True)
     generalist = torch.tensor([
         [[0.70, 0.70, 0.20, 0.20]],
@@ -723,6 +724,54 @@ def test_dispatch_targets_keep_multilabel_eligibility_but_require_utility():
     assert status["Activation/macro_f1"] == pytest.approx(1.0 / 3.0)
     assert logits.grad is not None
     assert logits.grad.abs().sum() > 0.0
+
+
+def test_dispatch_training_keeps_frozen_modules_in_eval_mode():
+    class DispatchModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Sequential(
+                torch.nn.Linear(2, 2),
+                torch.nn.BatchNorm1d(2),
+            )
+            self.expert_activator = torch.nn.Linear(2, 4)
+
+    actor = object.__new__(PETTrackActor)
+    actor.net = DispatchModel()
+    actor.expert_phase = "dispatch"
+
+    actor.train(True)
+
+    assert actor.net.training is False
+    assert actor.net.backbone.training is False
+    assert actor.net.expert_activator.training is True
+
+    actor.train(False)
+    assert actor.net.training is False
+    assert actor.net.expert_activator.training is False
+
+
+def test_dispatch_loss_uses_configured_positive_class_weights(monkeypatch):
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.expert_phase = "dispatch"
+    actor.activation_pos_weight = (4.0, 5.0, 1.5, 2.5)
+    logits = torch.zeros(2, 4, requires_grad=True)
+    targets = torch.tensor([
+        [True, False, False, False],
+        [False, True, True, False],
+    ])
+    monkeypatch.setattr(actor, "_dispatch_targets", lambda pred, gt: targets)
+
+    loss, _ = actor._compute_dispatch_loss(
+        {"expert_activation_logits": logits}, {}, return_status=True)
+    expected = F.binary_cross_entropy_with_logits(
+        logits,
+        targets.to(logits.dtype),
+        pos_weight=logits.new_tensor(actor.activation_pos_weight),
+    )
+
+    torch.testing.assert_close(loss, expected)
 
 
 @pytest.mark.parametrize("expert_id", [1, 2, 4])

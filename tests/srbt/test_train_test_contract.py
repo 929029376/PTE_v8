@@ -977,6 +977,7 @@ def test_canonical_dispatch_strategy_trains_only_input_driven_activation():
     assert configured.TRAIN.PURSUIT_LR == pytest.approx(0.0001)
     assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
     assert configured.TRAIN.ACTIVATOR_ADVANTAGE_MARGIN == pytest.approx(0.02)
+    assert configured.TRAIN.ACTIVATOR_POS_WEIGHT == [4.0, 5.0, 1.5, 2.5]
     assert configured.TRAIN.SMALL_TARGET_ADAPTER_LR == pytest.approx(0.0)
     assert "SMALL_TARGET_CHANNEL_LR" not in configured.TRAIN
     assert configured.TRAIN.GRAD_CLIP_NORM == 30.0
@@ -1030,13 +1031,14 @@ def test_canonical_dispatch_strategy_trains_only_input_driven_activation():
     assert configured.TRAIN.GENERALIST_MAX_DROP == 0.005
 
 
-def test_supervisor_uses_sparse_dispatch_v31_run_directory():
+def test_supervisor_uses_balanced_sparse_dispatch_v32_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "sparse_dispatch_v31_20260720" in supervisor
+    assert "sparse_dispatch_balanced_v32_20260720" in supervisor
+    assert "sparse_dispatch_v31_20260720" not in supervisor
     assert "multilabel_specialists_v29_20260720" not in supervisor
     assert "multilabel_specialists_v28_20260719" not in supervisor
     assert "direct_box_refiner_v23_20260717" not in supervisor
@@ -1058,7 +1060,7 @@ def test_supervisor_uses_sparse_dispatch_v31_run_directory():
     assert "--nproc_per_node 2" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "sparse_dispatch_v31_20260720/logs && exec") == 2
+        "sparse_dispatch_balanced_v32_20260720/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

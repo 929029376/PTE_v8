@@ -60,6 +60,8 @@ class PETTrackActor(PETTrackBaseActor):
             cfg.TRAIN, "EXPERT_ADVANTAGE_MARGIN", 0.10))
         self.activation_advantage_margin = float(getattr(
             cfg.TRAIN, "ACTIVATOR_ADVANTAGE_MARGIN", 0.02))
+        self.activation_pos_weight = tuple(float(value) for value in getattr(
+            cfg.TRAIN, "ACTIVATOR_POS_WEIGHT", (1.0, 1.0, 1.0, 1.0)))
         if (not math.isfinite(self.expert_advantage_weight)
                 or self.expert_advantage_weight <= 0.0):
             raise ValueError(
@@ -82,6 +84,15 @@ class PETTrackActor(PETTrackBaseActor):
             raise ValueError(
                 "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, "
                 "pursuit, or dispatch")
+        if self.expert_phase == "dispatch":
+            specialist_count = max(
+                len(getattr(expert_cfg, "NAMES", ())) - 1, 0)
+            if (len(self.activation_pos_weight) != specialist_count
+                    or any(not math.isfinite(value) or value <= 0.0
+                           for value in self.activation_pos_weight)):
+                raise ValueError(
+                    "TRAIN.ACTIVATOR_POS_WEIGHT must contain one finite "
+                    "positive value per specialist")
         self.stage = self.expert_phase if self.expert_enabled else (
             "srbt" if self.srbt_enabled else "base")
         self.active_losses = (
@@ -97,6 +108,14 @@ class PETTrackActor(PETTrackBaseActor):
                   if self.srbt_enabled
                   else {"base", "expert_advantage"})
         )
+
+    # ------------------------------------------------------------------ #
+    def train(self, mode=True):
+        if self.expert_phase != "dispatch":
+            return super().train(mode)
+        self.net.eval()
+        model = self.net.module if hasattr(self.net, "module") else self.net
+        model.expert_activator.train(mode)
 
     # ------------------------------------------------------------------ #
     def _validated_training_expert_ids(self, data, batch_size, device):
@@ -648,8 +667,9 @@ class PETTrackActor(PETTrackBaseActor):
     def _compute_dispatch_loss(self, pred_dict, gt_dict, return_status=True):
         logits = pred_dict["expert_activation_logits"].float()
         targets = self._dispatch_targets(pred_dict, gt_dict)
+        pos_weight = logits.new_tensor(self.activation_pos_weight)
         loss = F.binary_cross_entropy_with_logits(
-            logits, targets.to(logits.dtype))
+            logits, targets.to(logits.dtype), pos_weight=pos_weight)
         if not return_status:
             return loss
         model = self.net.module if hasattr(self.net, "module") else self.net
