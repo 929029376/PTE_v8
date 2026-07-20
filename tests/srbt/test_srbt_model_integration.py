@@ -504,6 +504,80 @@ def test_auto_activation_executes_only_selected_specialist(monkeypatch):
     }
 
 
+def test_auto_activation_does_not_expand_selected_specialists(monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    calls = {name: 0 for name in model.shared_expert_names}
+    for name in model.shared_expert_names:
+        fusion = model.expert_fusion.experts[name]
+        original = fusion.forward
+        monkeypatch.setattr(
+            fusion,
+            "forward",
+            lambda *args, _name=name, _forward=original, **kwargs: (
+                calls.__setitem__(_name, calls[_name] + 1)
+                or _forward(*args, **kwargs)
+            ),
+        )
+    monkeypatch.setattr(
+        model.expert_activator,
+        "forward",
+        lambda rgb, event, score, boxes: score.new_tensor(
+            [[-10.0, 10.0, 9.0, -10.0]]),
+    )
+
+    with torch.no_grad():
+        output = model.inference(
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            auto_activate=True,
+        )
+
+    assert tuple(output["expert_outputs"]) == (
+        "generalist", "precision_refiner", "visibility_foc_ov")
+    assert torch.equal(
+        output["expert_activation_mask"],
+        torch.tensor([[True, False, True, True, False]]),
+    )
+    assert calls == {
+        "generalist": 1,
+        "motion_fm": 0,
+        "visibility_foc_ov": 1,
+        "discrimination_bi": 0,
+    }
+
+
+def test_auto_activation_composes_only_selected_motion_and_precision(monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    monkeypatch.setattr(
+        model.expert_activator,
+        "forward",
+        lambda rgb, event, score, boxes: score.new_tensor(
+            [[10.0, 9.0, -10.0, -10.0]]),
+    )
+
+    with torch.no_grad():
+        output = model.inference(
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            auto_activate=True,
+        )
+
+    assert tuple(output["expert_outputs"]) == (
+        "generalist", "motion_fm", "precision_refiner")
+    assert torch.equal(
+        output["expert_outputs"]["precision_refiner"]["upstream_pred_boxes"],
+        output["expert_outputs"]["motion_fm"]["pred_boxes"],
+    )
+
+
 def test_explicit_and_automatic_activation_are_mutually_exclusive():
     model = _model(expert_enabled=True).eval()
 

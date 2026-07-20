@@ -90,6 +90,8 @@ class PETTrack(nn.Module):
             discrimination_name = next(
                 (name for name in self.shared_expert_names
                  if "discrimination" in name.lower()), None)
+            self.motion_expert_name = motion_name
+            self.discrimination_expert_name = discrimination_name
             adapter_names = [
                 name for name in (
                     motion_name,
@@ -131,6 +133,8 @@ class PETTrack(nn.Module):
             self.small_target_expert = None
             self.proposal_adapters = nn.ModuleDict()
             self.proposal_parents = {}
+            self.motion_expert_name = None
+            self.discrimination_expert_name = None
             self.expert_activator = None
 
         srbt_cfg = getattr(cfg.MODEL, "SRBT", None)
@@ -435,7 +439,7 @@ class PETTrack(nn.Module):
                 pending.append(parent)
         return tuple(name for name in self.expert_names if name in requested)
 
-    def _activation_mask_with_dependencies(self, specialist_mask):
+    def _activation_mask(self, specialist_mask):
         if specialist_mask.ndim != 2 \
                 or specialist_mask.shape[1] != len(self.specialist_names):
             raise ValueError("specialist activation mask has invalid shape")
@@ -444,12 +448,47 @@ class PETTrack(nn.Module):
             dtype=torch.bool, device=specialist_mask.device)
         active[:, self.expert_names.index(self.default_expert)] = True
         for specialist_id, name in enumerate(self.specialist_names):
-            selected = specialist_mask[:, specialist_id]
-            current = name
-            while current is not None:
-                active[:, self.expert_names.index(current)] |= selected
-                current = self.proposal_parents.get(current)
+            active[:, self.expert_names.index(name)] = specialist_mask[
+                :, specialist_id]
         return active
+
+    def _selected_upstream_output(self, name, expert_outputs,
+                                  activation_mask):
+        upstream_boxes = expert_outputs[self.default_expert][
+            "pred_boxes"]
+        parent_candidates = ()
+        if name == self.discrimination_expert_name:
+            parent_candidates = (self.motion_expert_name,)
+        elif name == self.precision_refiner_name:
+            parent_candidates = (
+                self.motion_expert_name,
+                self.discrimination_expert_name,
+            )
+        for parent in parent_candidates:
+            if parent is None or parent not in expert_outputs:
+                continue
+            parent_id = self.expert_names.index(parent)
+            selected = activation_mask[:, parent_id]
+            upstream_boxes = torch.where(
+                selected[:, None, None],
+                expert_outputs[parent]["pred_boxes"],
+                upstream_boxes,
+            )
+        return {"pred_boxes": upstream_boxes}
+
+    def _condition_auto_activated_shared_outputs(
+            self, expert_outputs, activation_mask):
+        for name in (
+                self.motion_expert_name,
+                self.discrimination_expert_name):
+            if name is None or name not in expert_outputs:
+                continue
+            expert_outputs[name] = self._condition_expert_output(
+                name,
+                expert_outputs[name],
+                self._selected_upstream_output(
+                    name, expert_outputs, activation_mask),
+            )
 
     def _head_for_expert(self, name):
         if name == self.default_expert:
@@ -579,7 +618,7 @@ class PETTrack(nn.Module):
                 rgb, event, generalist["score_map"],
                 generalist["pred_boxes"])
         if auto_activate:
-            activation_mask = self._activation_mask_with_dependencies(
+            activation_mask = self._activation_mask(
                 self.expert_activator.select(activation_logits))
             active_experts = tuple(
                 name for expert_id, name in enumerate(self.expert_names)
@@ -587,10 +626,19 @@ class PETTrack(nn.Module):
         else:
             active_experts = self._resolve_active_experts(active_expert_names)
         for name in active_experts:
-            if name not in self.shared_expert_names:
+            if name not in self.shared_expert_names or name in expert_outputs:
                 continue
-            self._forward_shared_expert(
-                name, rgb, event, context, gt_score_map, expert_outputs)
+            if auto_activate:
+                fused = self._fuse_expert_search(
+                    name, rgb, event, context=context)
+                expert_outputs[name] = self._forward_box_head(
+                    fused, gt_score_map, expert_name=name)
+            else:
+                self._forward_shared_expert(
+                    name, rgb, event, context, gt_score_map, expert_outputs)
+        if auto_activate:
+            self._condition_auto_activated_shared_outputs(
+                expert_outputs, activation_mask)
         out = dict(expert_outputs[self.default_expert])
         out["expert_outputs"] = expert_outputs
         if activation_logits is not None:
@@ -795,12 +843,21 @@ class PETTrack(nn.Module):
         else:
             small_output = self.small_target_expert.track_with_template(
                 small_template_features, xi, xe)
-        parent_name = self.proposal_parents.get(self.precision_refiner_name)
-        if parent_name in shared_outputs:
+        if auto_activate:
+            upstream_output = self._selected_upstream_output(
+                self.precision_refiner_name,
+                shared_outputs,
+                out["expert_activation_mask"],
+            )
+        else:
+            parent_name = self.proposal_parents.get(
+                self.precision_refiner_name)
+            upstream_output = shared_outputs.get(parent_name)
+        if upstream_output is not None:
             small_output = self._condition_expert_output(
                 self.precision_refiner_name,
                 small_output,
-                shared_outputs[parent_name],
+                upstream_output,
             )
         active_experts = tuple(
             name for name in self.expert_names
