@@ -400,6 +400,24 @@ class PETTrack(nn.Module):
             raise ValueError("training_expert_ids contains an invalid specialist")
         return self.expert_names[expert_id]
 
+    def _resolve_active_experts(self, active_expert_names):
+        if active_expert_names is None:
+            return tuple(self.expert_names)
+        if isinstance(active_expert_names, str):
+            active_expert_names = (active_expert_names,)
+        requested = {self.default_expert}
+        for name in active_expert_names:
+            if name not in self.expert_names:
+                raise ValueError(f"unknown active expert: {name}")
+            requested.add(name)
+        pending = list(requested)
+        while pending:
+            parent = self.proposal_parents.get(pending.pop())
+            if parent is not None and parent not in requested:
+                requested.add(parent)
+                pending.append(parent)
+        return tuple(name for name in self.expert_names if name in requested)
+
     def _head_for_expert(self, name):
         if name == self.default_expert:
             return self.box_head
@@ -494,7 +512,7 @@ class PETTrack(nn.Module):
         return output
 
     def forward_head(self, cat_feature, gt_score_map=None,
-                     training_expert_ids=None):
+                     training_expert_ids=None, active_expert_names=None):
         search = cat_feature[:, -self.feat_len_s * 2:]
         rgb = search[:, :self.feat_len_s]
         event = search[:, self.feat_len_s:]
@@ -502,6 +520,9 @@ class PETTrack(nn.Module):
             return self._forward_box_head(rgb + event, gt_score_map)
 
         if training_expert_ids is not None:
+            if active_expert_names is not None:
+                raise ValueError(
+                    "training_expert_ids and active_expert_names are exclusive")
             name = self._training_expert(
                 training_expert_ids, rgb.shape[0], rgb.device)
             if name == self.precision_refiner_name:
@@ -514,7 +535,10 @@ class PETTrack(nn.Module):
 
         context = self._expert_context(cat_feature)
         expert_outputs = {}
-        for name in self.shared_expert_names:
+        active_experts = self._resolve_active_experts(active_expert_names)
+        for name in active_experts:
+            if name not in self.shared_expert_names:
+                continue
             self._forward_shared_expert(
                 name, rgb, event, context, gt_score_map, expert_outputs)
         out = dict(expert_outputs[self.default_expert])
@@ -522,14 +546,17 @@ class PETTrack(nn.Module):
         return out
 
     def _forward_amt_core(self, zi, ze, xi, xe, encoded_templates=None,
-                          training_expert_ids=None, **kwargs):
+                          training_expert_ids=None,
+                          active_expert_names=None, **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
         else:
             feat, aux = self._run_encoded_backbone(
                 *encoded_templates, xi, xe, **kwargs)
-        out = self.forward_head(
-            feat, training_expert_ids=training_expert_ids)
+        head_kwargs = {"training_expert_ids": training_expert_ids}
+        if active_expert_names is not None:
+            head_kwargs["active_expert_names"] = active_expert_names
+        out = self.forward_head(feat, **head_kwargs)
         out.update(aux)
         out["backbone_feat"] = feat
         return out
@@ -539,16 +566,17 @@ class PETTrack(nn.Module):
                       redetect_event_images=None, redetect_mask=None,
                       encoded_templates=None,
                       training_expert_ids=None,
+                      active_expert_names=None,
                       **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
         else:
             feat, aux = self._run_encoded_backbone(
                 *encoded_templates, xi, xe, **kwargs)
-        out = self.forward_head(
-            feat,
-            training_expert_ids=training_expert_ids,
-        )
+        head_kwargs = {"training_expert_ids": training_expert_ids}
+        if active_expert_names is not None:
+            head_kwargs["active_expert_names"] = active_expert_names
+        out = self.forward_head(feat, **head_kwargs)
         out.update(aux)
         out["backbone_feat"] = feat
         presence_output = out.get("expert_outputs", {}).get(
@@ -624,10 +652,12 @@ class PETTrack(nn.Module):
             **kwargs)
 
     def inference(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe,
-                  small_template_features=None):
+                  small_template_features=None, active_expert_names=None):
+        active_experts = self._resolve_active_experts(active_expert_names)
         raw_static_zi = static_zi
         raw_static_ze = static_ze
-        if (self.small_target_expert is not None
+        precision_is_active = self.precision_refiner_name in active_experts
+        if (precision_is_active and self.small_target_expert is not None
                 and small_template_features is None and (
                 raw_static_zi.ndim not in (4, 5)
                 or raw_static_ze.ndim not in (4, 5))):
@@ -640,12 +670,14 @@ class PETTrack(nn.Module):
         if self.srbt_enabled:
             out = self._forward_srbt(
                 static_zi, static_ze, xi, xe,
-                encoded_templates=encoded_templates)
+                encoded_templates=encoded_templates,
+                active_expert_names=active_experts)
         else:
             out = self._forward_amt_core(
                 static_zi, static_ze, xi, xe,
-                encoded_templates=encoded_templates)
-        if self.small_target_expert is None:
+                encoded_templates=encoded_templates,
+                active_expert_names=active_experts)
+        if self.small_target_expert is None or not precision_is_active:
             return out
         shared_outputs = out.get("expert_outputs")
         if shared_outputs is None:
@@ -669,7 +701,7 @@ class PETTrack(nn.Module):
                 if name == self.precision_refiner_name
                 else shared_outputs[name]
             )
-            for name in self.expert_names
+            for name in active_experts
         }
         return out
 

@@ -369,6 +369,96 @@ def test_inference_reuses_cached_independent_template_features(monkeypatch):
     assert "precision_refiner" in output["expert_outputs"]
 
 
+def test_sparse_inference_runs_only_motion_and_required_generalist(monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    calls = {name: 0 for name in model.shared_expert_names}
+    for name in model.shared_expert_names:
+        fusion = model.expert_fusion.experts[name]
+        original = fusion.forward
+        monkeypatch.setattr(
+            fusion,
+            "forward",
+            lambda *args, _name=name, _forward=original, **kwargs: (
+                calls.__setitem__(_name, calls[_name] + 1)
+                or _forward(*args, **kwargs)
+            ),
+        )
+    small_calls = {"count": 0}
+    monkeypatch.setattr(
+        model.small_target_expert,
+        "forward",
+        lambda *args, **kwargs: small_calls.__setitem__(
+            "count", small_calls["count"] + 1),
+    )
+
+    with torch.no_grad():
+        output = model.inference(
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            active_expert_names=("motion_fm",),
+        )
+
+    assert tuple(output["expert_outputs"]) == ("generalist", "motion_fm")
+    assert calls == {
+        "generalist": 1,
+        "motion_fm": 1,
+        "visibility_foc_ov": 0,
+        "discrimination_bi": 0,
+    }
+    assert small_calls == {"count": 0}
+
+
+def test_sparse_generalist_inference_accepts_encoded_static_templates(
+        monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    monkeypatch.setattr(
+        model.small_target_expert,
+        "forward",
+        lambda *args, **kwargs: pytest.fail(
+            "inactive precision expert must not execute"),
+    )
+    static_zi = model.backbone._z_feat(torch.randn(1, 1, 3, 16, 16))
+    static_ze = model.backbone._z_feat(torch.randn(1, 1, 3, 16, 16))
+
+    with torch.no_grad():
+        output = model.inference(
+            static_zi,
+            static_ze,
+            torch.randn(1, 4, 8),
+            torch.randn(1, 4, 8),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            active_expert_names=(),
+        )
+
+    assert tuple(output["expert_outputs"]) == ("generalist",)
+
+
+def test_sparse_inference_rejects_unknown_expert_before_backbone(monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    monkeypatch.setattr(
+        model,
+        "_encode_runtime_templates",
+        lambda *args, **kwargs: pytest.fail(
+            "unknown expert must fail before backbone work"),
+    )
+
+    with pytest.raises(ValueError, match="unknown active expert"):
+        model.inference(
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            active_expert_names=("not_an_expert",),
+        )
+
+
 def test_training_forward_runs_redetect_only_when_observations_are_requested():
     model = _model()
     probe = ProbeRedetect()
