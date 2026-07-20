@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from lib.models.layers.expert_ensemble import (
+    ExpertActivator,
     fuse_expert_predictions,
     normalized_response_psr,
 )
@@ -115,3 +116,47 @@ def test_response_psr_is_finite_and_bounded_for_flat_maps():
     assert psr.shape == (5,)
     assert torch.isfinite(psr).all()
     assert torch.all((0.0 <= psr) & (psr <= 1.0))
+
+
+def test_expert_activator_selects_at_most_two_specialists_above_threshold():
+    activator = ExpertActivator(
+        embed_dim=4,
+        specialist_count=4,
+        hidden_dim=8,
+        threshold=0.60,
+        max_specialists=2,
+    )
+    logits = torch.tensor([
+        [2.0, 1.0, -2.0, 0.5],
+        [-2.0, -3.0, -4.0, -5.0],
+    ])
+
+    selected = activator.select(logits)
+
+    assert torch.equal(
+        selected,
+        torch.tensor([
+            [True, True, False, False],
+            [False, False, False, False],
+        ]),
+    )
+
+
+def test_expert_activator_uses_rgb_event_and_generalist_observations():
+    activator = ExpertActivator(
+        embed_dim=4,
+        specialist_count=4,
+        hidden_dim=8,
+        threshold=0.50,
+        max_specialists=2,
+    )
+    rgb = torch.randn(2, 6, 4)
+    event = torch.randn(2, 6, 4)
+    score_map = torch.randn(2, 1, 3, 3)
+    boxes = torch.rand(2, 1, 4)
+
+    logits = activator(rgb, event, score_map, boxes)
+    logits.sum().backward()
+
+    assert logits.shape == (2, 4)
+    assert all(parameter.grad is not None for parameter in activator.parameters())

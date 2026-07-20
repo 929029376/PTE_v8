@@ -149,7 +149,18 @@ def build_dataloaders(cfg, settings):
                                           processing=data_processing_val,
                                           frame_sample_mode=sampler_mode, train_cls=train_cls,
                                           cfg=cfg, training=False)
-    val_sampler = DistributedSampler(dataset_val) if settings.local_rank != -1 else None  # None
+    val_precise_expert_sampling = dataset_val.precise_expert_sampling
+    if val_precise_expert_sampling:
+        _validate_precise_expert_epoch(
+            cfg.DATA.VAL.SAMPLE_PER_EPOCH,
+            cfg.TRAIN.BATCH_SIZE,
+            world_size,
+            len(dataset_val.training_expert_ids),
+        )
+    val_sampler = (
+        DistributedSampler(
+            dataset_val, shuffle=not val_precise_expert_sampling)
+        if settings.local_rank != -1 else None)
 
     loader_val = LTRLoader('val', dataset_val, training=False, batch_size=cfg.TRAIN.BATCH_SIZE,
                            num_workers=cfg.TRAIN.NUM_WORKER, drop_last=True, stack_dim=1, sampler=val_sampler,
@@ -185,9 +196,11 @@ def _optimizer_groups(net, cfg):
     model = _unwrap_net(net)
     expert_phase = str(getattr(
         cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
-    if expert_phase not in {"specialize", "refine", "recovery", "pursuit"}:
+    if expert_phase not in {
+            "specialize", "refine", "recovery", "pursuit", "dispatch"}:
         raise ValueError(
-            "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, or pursuit")
+            "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, pursuit, "
+            "or dispatch")
     expert_fusion = getattr(model, "expert_fusion", None)
     expert_heads = getattr(model, "expert_heads", None)
     specialist_expert_ids = tuple(int(expert_id) for expert_id in getattr(
@@ -280,6 +293,15 @@ def _optimizer_groups(net, cfg):
             parameter.requires_grad_(False)
         for parameter in controller.parameters():
             parameter.requires_grad_(True)
+    elif expert_phase == "dispatch":
+        activator = getattr(model, "expert_activator", None)
+        if activator is None:
+            raise ValueError(
+                "TRAIN.EXPERT_PHASE=dispatch requires MODEL.EXPERT.ENABLE=true")
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in activator.parameters():
+            parameter.requires_grad_(True)
     lr = cfg.TRAIN.LR
     wd = cfg.TRAIN.WEIGHT_DECAY
     used = set()
@@ -302,7 +324,12 @@ def _optimizer_groups(net, cfg):
             "param_count": sum(p.numel() for p in params),
         })
 
-    if expert_phase == "pursuit":
+    if expert_phase == "dispatch":
+        add_group(
+            "expert_activator",
+            float(getattr(cfg.TRAIN, "ACTIVATOR_LR", lr)),
+            lambda name: name.startswith("expert_activator."))
+    elif expert_phase == "pursuit":
         add_group(
             "search_window_controller",
             float(getattr(cfg.TRAIN, "PURSUIT_LR", lr)),

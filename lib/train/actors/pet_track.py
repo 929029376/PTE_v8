@@ -58,6 +58,8 @@ class PETTrackActor(PETTrackBaseActor):
             cfg.TRAIN, "EXPERT_ADVANTAGE_WEIGHT", 1.0))
         self.expert_advantage_margin = float(getattr(
             cfg.TRAIN, "EXPERT_ADVANTAGE_MARGIN", 0.10))
+        self.activation_advantage_margin = float(getattr(
+            cfg.TRAIN, "ACTIVATOR_ADVANTAGE_MARGIN", 0.02))
         if (not math.isfinite(self.expert_advantage_weight)
                 or self.expert_advantage_weight <= 0.0):
             raise ValueError(
@@ -66,18 +68,26 @@ class PETTrackActor(PETTrackBaseActor):
                 or not 0.0 < self.expert_advantage_margin <= 1.0):
             raise ValueError(
                 "TRAIN.EXPERT_ADVANTAGE_MARGIN must be in (0, 1]")
+        if (not math.isfinite(self.activation_advantage_margin)
+                or not 0.0 <= self.activation_advantage_margin <= 1.0):
+            raise ValueError(
+                "TRAIN.ACTIVATOR_ADVANTAGE_MARGIN must be in [0, 1]")
         expert_cfg = getattr(cfg.MODEL, "EXPERT", None)
         self.expert_enabled = bool(getattr(
             expert_cfg, "ENABLE", False)) if expert_cfg is not None else False
         self.expert_phase = str(getattr(
             cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
         if self.expert_phase not in {
-                "specialize", "refine", "recovery", "pursuit"}:
+                "specialize", "refine", "recovery", "pursuit", "dispatch"}:
             raise ValueError(
-                "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, or pursuit")
+                "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, "
+                "pursuit, or dispatch")
         self.stage = self.expert_phase if self.expert_enabled else (
             "srbt" if self.srbt_enabled else "base")
         self.active_losses = (
+            {"activation"}
+            if self.expert_phase == "dispatch"
+            else
             {"pursuit"}
             if self.expert_phase == "pursuit"
             else
@@ -143,7 +153,8 @@ class PETTrackActor(PETTrackBaseActor):
 
     def forward_pass(self, data):
         """Forward pass for baseline localization plus causal SRBT outputs."""
-        if getattr(self, "expert_phase", "specialize") == "pursuit":
+        expert_phase = getattr(self, "expert_phase", "specialize")
+        if expert_phase == "pursuit":
             return self._forward_pursuit(data)
         zi = data['template_images'].permute(1, 0, 2, 3, 4)
         ze = data['template_event_images'].permute(1, 0, 2, 3, 4)
@@ -174,7 +185,8 @@ class PETTrackActor(PETTrackBaseActor):
             or bool(torch.all(
                 training_expert_ids == VISIBILITY_EXPERT_ID))
         )
-        if is_reappear is not None and trains_visibility:
+        if (expert_phase != "dispatch"
+                and is_reappear is not None and trains_visibility):
             redetect_mask = torch.as_tensor(
                 is_reappear[-1], device=xi.device, dtype=torch.bool).reshape(-1)
             if redetect_mask.numel() != xi.shape[0]:
@@ -205,6 +217,8 @@ class PETTrackActor(PETTrackBaseActor):
         }
         if training_expert_ids is not None:
             forward_kwargs["training_expert_ids"] = training_expert_ids
+        if expert_phase == "dispatch":
+            forward_kwargs["return_activation_logits"] = True
         out_dict = self.net(**forward_kwargs)
 
         return out_dict
@@ -268,6 +282,14 @@ class PETTrackActor(PETTrackBaseActor):
         current_quality_values = []
         present_next_values = []
         crop_anchors = []
+        expert_cfg = getattr(
+            getattr(self.cfg, "MODEL", None), "EXPERT", None)
+        use_activation = bool(getattr(
+            expert_cfg, "USE_ACTIVATION_INFERENCE", False))
+        if use_activation and not bool(getattr(
+                expert_cfg, "ACTIVATOR_TRAINED", False)):
+            raise RuntimeError(
+                "pursuit sparse activation requires a trained expert activator")
         was_training = model.training
         model.eval()
         controller.train(was_training)
@@ -281,19 +303,57 @@ class PETTrackActor(PETTrackBaseActor):
                     event_frames[:, frame_index], planned_anchor,
                     search_factor, search_size)
                 with torch.no_grad():
-                    output = model.inference(
+                    inference_kwargs = dict(
                         static_zi=zi[:, 0], static_ze=ze[:, 0],
                         dynamic_zi=zi[:, 1:], dynamic_ze=ze[:, 1:],
                         xi=search, xe=event_search)
+                    if use_activation:
+                        inference_kwargs["auto_activate"] = True
+                    output = model.inference(**inference_kwargs)
                     expert_outputs = output.get("expert_outputs")
                     if not expert_outputs:
                         raise RuntimeError(
-                            "pursuit training requires all expert outputs")
+                            "pursuit training requires expert outputs")
+                    generalist_name = model.expert_names[0]
+                    generalist = expert_outputs.get(generalist_name)
+                    if generalist is None:
+                        raise RuntimeError(
+                            "pursuit training requires the generalist output")
+                    if use_activation:
+                        active_mask = output.get("expert_activation_mask")
+                        expected_shape = (
+                            search.shape[0], len(model.expert_names))
+                        if active_mask is None or tuple(active_mask.shape) != expected_shape:
+                            raise RuntimeError(
+                                "pursuit sparse activation requires a valid "
+                                "expert_activation_mask")
+                        active_mask = active_mask.to(
+                            device=search.device, dtype=torch.bool)
+                        if not bool(active_mask[:, 0].all()):
+                            raise RuntimeError(
+                                "the generalist must be active for every pursuit row")
+                    else:
+                        active_mask = torch.ones(
+                            search.shape[0], len(model.expert_names),
+                            device=search.device, dtype=torch.bool)
+                    missing_active = [
+                        name for expert_id, name in enumerate(model.expert_names)
+                        if bool(active_mask[:, expert_id].any())
+                        and name not in expert_outputs
+                    ]
+                    if missing_active:
+                        raise RuntimeError(
+                            "pursuit activation is missing expert outputs: "
+                            + ", ".join(missing_active))
                     ordered = [
-                        expert_outputs[name] for name in model.expert_names]
+                        expert_outputs.get(name, generalist)
+                        for name in model.expert_names]
                     crop_boxes = torch.cat([
                         item["pred_boxes"][:, :1] for item in ordered
                     ], dim=1)
+                    crop_boxes = torch.where(
+                        active_mask[..., None], crop_boxes,
+                        crop_boxes[:, :1].expand_as(crop_boxes))
                     expert_boxes = crop_box_to_image(
                         crop_boxes, crop_region)
                     response_peaks = torch.stack([
@@ -304,12 +364,19 @@ class PETTrackActor(PETTrackBaseActor):
                         normalized_response_psr(item["score_map"])
                         for item in ordered
                     ], dim=1)
+                    response_peaks = response_peaks.masked_fill(
+                        ~active_mask, 0.0)
+                    response_psr = response_psr.masked_fill(
+                        ~active_mask, 0.0)
                     reliability = (
                         response_peaks.clamp(0.0, 1.0)
                         * response_psr.clamp(0.0, 1.0)
-                    ).clamp_min(1e-6)
+                    )
+                    reliability = torch.where(
+                        active_mask, reliability.clamp_min(1e-6),
+                        torch.zeros_like(reliability))
                     expert_weights = reliability / reliability.sum(
-                        dim=1, keepdim=True)
+                        dim=1, keepdim=True).clamp_min(1e-6)
                     observation = (
                         expert_weights[..., None] * expert_boxes
                     ).sum(dim=1)
@@ -372,6 +439,9 @@ class PETTrackActor(PETTrackBaseActor):
     # ------------------------------------------------------------------ #
     def compute_losses(self, pred_dict, gt_dict, return_status=True):
         """Present-masked localization plus the combined SRBT loss."""
+        if self.expert_phase == "dispatch":
+            return self._compute_dispatch_loss(
+                pred_dict, gt_dict, return_status=return_status)
         if self.expert_phase == "pursuit":
             return self._compute_pursuit_losses(
                 pred_dict, return_status=return_status)
@@ -504,9 +574,112 @@ class PETTrackActor(PETTrackBaseActor):
         status.setdefault("Loss/redetect", redetect_loss.item())
         status["Expert/phase_id"] = {
             "specialize": 0, "refine": 1, "recovery": 2, "pursuit": 3,
+            "dispatch": 4,
         }[self.expert_phase]
         status.setdefault("Redetect/count", 0)
         status["Loss/total"] = loss.item()
+        return loss, status
+
+    def _dispatch_targets(self, pred_dict, gt_dict):
+        logits = pred_dict.get("expert_activation_logits")
+        expert_outputs = pred_dict.get("expert_outputs")
+        if logits is None or not expert_outputs:
+            raise RuntimeError(
+                "dispatch training requires activation logits and all expert outputs")
+        model = self.net.module if hasattr(self.net, "module") else self.net
+        expert_names = tuple(model.expert_names)
+        if logits.ndim != 2 or logits.shape[1] != len(expert_names) - 1:
+            raise ValueError(
+                "expert activation logits must provide one value per specialist")
+        missing = [name for name in expert_names if name not in expert_outputs]
+        if missing:
+            raise RuntimeError(
+                "dispatch training is missing expert outputs: "
+                + ", ".join(missing))
+
+        challenge_labels = gt_dict.get("challenge_labels")
+        if challenge_labels is None:
+            raise RuntimeError(
+                "dispatch training requires challenge_labels")
+        challenge_labels = torch.as_tensor(
+            challenge_labels, device=logits.device, dtype=torch.bool)
+        batch_size = logits.shape[0]
+        loader_shape = (len(CHALLENGE_NAMES), batch_size)
+        if challenge_labels.shape == loader_shape:
+            challenge_labels = challenge_labels.transpose(0, 1)
+        if challenge_labels.shape != (batch_size, len(CHALLENGE_NAMES)):
+            raise ValueError(
+                "challenge_labels must have shape "
+                f"({batch_size}, {len(CHALLENGE_NAMES)})")
+        attributes = {
+            name: challenge_labels[:, index]
+            for index, name in enumerate(CHALLENGE_NAMES)
+        }
+        eligible = expert_supervision_mask(attributes).to(logits.device)
+        present = self._present_search_mask(
+            gt_dict, logits.device, batch_size)
+        if present is None:
+            raise RuntimeError(
+                "dispatch training requires official presence annotations")
+
+        target_xyxy = box_xywh_to_xyxy(
+            gt_dict["search_anno"][-1].to(
+                device=logits.device, dtype=logits.dtype)
+        ).clamp(0.0, 1.0)
+
+        def aligned_iou(output):
+            boxes = output["pred_boxes"][:, 0].detach()
+            predicted_xyxy = box_cxcywh_to_xyxy(boxes).clamp(0.0, 1.0)
+            return box_iou(predicted_xyxy, target_xyxy)[0]
+
+        generalist_iou = aligned_iou(expert_outputs[expert_names[0]])
+        targets = torch.zeros_like(logits, dtype=torch.bool)
+        for expert_id, name in enumerate(expert_names[1:], start=1):
+            specialist_target = eligible[:, expert_id]
+            if expert_id == VISIBILITY_EXPERT_ID:
+                targets[:, expert_id - 1] = specialist_target
+                continue
+            specialist_iou = aligned_iou(expert_outputs[name])
+            useful = specialist_iou >= (
+                generalist_iou + self.activation_advantage_margin)
+            targets[:, expert_id - 1] = specialist_target & present & useful
+        return targets
+
+    def _compute_dispatch_loss(self, pred_dict, gt_dict, return_status=True):
+        logits = pred_dict["expert_activation_logits"].float()
+        targets = self._dispatch_targets(pred_dict, gt_dict)
+        loss = F.binary_cross_entropy_with_logits(
+            logits, targets.to(logits.dtype))
+        if not return_status:
+            return loss
+        model = self.net.module if hasattr(self.net, "module") else self.net
+        predicted = logits.sigmoid() >= 0.5
+        exact_match = (predicted == targets).all(dim=1).float().mean()
+        status = {
+            "Loss/activation": float(loss.detach()),
+            "Loss/total": float(loss.detach()),
+            "Activation/accuracy": float((predicted == targets).float().mean()),
+            "Activation/positive_count": int(targets.sum()),
+            "Activation/predicted_count": int(predicted.sum()),
+            "Activation/mean_specialists": float(
+                predicted.float().sum(dim=1).mean()),
+            "Activation/exact_match": float(exact_match),
+            "Expert/phase_id": 4,
+        }
+        expert_f1 = []
+        for expert_id, name in enumerate(model.expert_names[1:], start=1):
+            target = targets[:, expert_id - 1]
+            prediction = predicted[:, expert_id - 1]
+            true_positive = (target & prediction).float().sum()
+            precision = true_positive / prediction.float().sum().clamp_min(1.0)
+            recall = true_positive / target.float().sum().clamp_min(1.0)
+            f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-8)
+            status[f"Activation/positive_{name}"] = int(target.sum())
+            status[f"Activation/precision_{name}"] = float(precision)
+            status[f"Activation/recall_{name}"] = float(recall)
+            status[f"Activation/f1_{name}"] = float(f1)
+            expert_f1.append(f1)
+        status["Activation/macro_f1"] = float(torch.stack(expert_f1).mean())
         return loss, status
 
     def _compute_pursuit_losses(self, predictions, return_status=True):

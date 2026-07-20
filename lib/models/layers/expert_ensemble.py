@@ -4,6 +4,69 @@ from dataclasses import dataclass
 from itertools import combinations
 
 import torch
+from torch import nn
+
+
+class ExpertActivator(nn.Module):
+    """Predict useful specialists from the shared RGBE observation."""
+
+    def __init__(self, embed_dim, specialist_count, hidden_dim=64,
+                 threshold=0.5, max_specialists=2):
+        super().__init__()
+        if specialist_count < 1:
+            raise ValueError("specialist_count must be positive")
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("threshold must be in (0, 1)")
+        if not 1 <= max_specialists <= specialist_count:
+            raise ValueError(
+                "max_specialists must be within the specialist count")
+        input_dim = int(embed_dim) * 3 + 7
+        self.threshold = float(threshold)
+        self.max_specialists = int(max_specialists)
+        self.specialist_count = int(specialist_count)
+        self.network = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), self.specialist_count),
+        )
+
+    def forward(self, rgb_tokens, event_tokens, score_map, pred_boxes):
+        if rgb_tokens.shape != event_tokens.shape or rgb_tokens.ndim != 3:
+            raise ValueError(
+                "RGB and event tokens must share shape (B,N,C)")
+        if score_map.ndim != 4 or score_map.shape[0] != rgb_tokens.shape[0]:
+            raise ValueError("score_map must have shape (B,C,H,W)")
+        if pred_boxes.ndim != 3 or pred_boxes.shape[0] != rgb_tokens.shape[0] \
+                or pred_boxes.shape[-1] != 4:
+            raise ValueError("pred_boxes must have shape (B,Q,4)")
+        rgb_state = rgb_tokens.mean(dim=1)
+        event_state = event_tokens.mean(dim=1)
+        response = score_map.flatten(1)
+        response_stats = torch.stack((
+            response.max(dim=1).values,
+            response.mean(dim=1),
+            response.std(dim=1, unbiased=False),
+        ), dim=1)
+        features = torch.cat((
+            rgb_state,
+            event_state,
+            (rgb_state - event_state).abs(),
+            response_stats,
+            pred_boxes[:, 0],
+        ), dim=1)
+        return self.network(features)
+
+    def select(self, logits):
+        if logits.ndim != 2 or logits.shape[1] != self.specialist_count:
+            raise ValueError(
+                "activation logits must have shape (B,specialist_count)")
+        probabilities = logits.sigmoid()
+        _, top_ids = probabilities.topk(
+            self.max_specialists, dim=1, largest=True, sorted=True)
+        top_mask = torch.zeros_like(probabilities, dtype=torch.bool)
+        top_mask.scatter_(1, top_ids, True)
+        return top_mask & (probabilities >= self.threshold)
 
 
 @dataclass(frozen=True)

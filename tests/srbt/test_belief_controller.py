@@ -329,6 +329,63 @@ def test_tracker_stage_validation_commits_the_forced_expert_box():
     assert candidate["state"] == candidate["expert_states"][1]
 
 
+def test_tracker_maps_sparse_activation_outputs_to_global_expert_slots():
+    class Thor:
+        @staticmethod
+        def begin_frame():
+            return torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)
+
+    class Network:
+        expert_names = (
+            "generalist", "motion_fm", "precision_refiner",
+            "visibility_foc_ov", "discrimination_bi",
+        )
+
+        def __init__(self):
+            self.calls = []
+
+        def inference(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "presence_score": torch.tensor([0.8]),
+                "expert_outputs": {
+                    "generalist": {
+                        "score_map": torch.full((1, 1, 2, 2), 0.2),
+                        "pred_boxes": torch.tensor([[[0.3, 0.5, 0.2, 0.2]]]),
+                    },
+                    "discrimination_bi": {
+                        "score_map": torch.full((1, 1, 2, 2), 0.95),
+                        "pred_boxes": torch.tensor([[[0.3, 0.5, 0.2, 0.2]]]),
+                    },
+                },
+            }
+
+    tracker = object.__new__(PETTrack)
+    tracker.thor_wrapper = Thor()
+    tracker.network = Network()
+    tracker.static_zi = torch.zeros(1, 4, 8)
+    tracker.static_ze = torch.zeros(1, 4, 8)
+    tracker.output_window = torch.ones(1, 1, 2, 2)
+    tracker.params = SimpleNamespace(search_size=32)
+    tracker.map_box_back = lambda box, factor, reference: box
+    tracker.auto_expert_activation = True
+    tracker.forced_expert_id = None
+
+    candidate = tracker._run_local_candidate(
+        torch.zeros(1, 3, 32, 32),
+        torch.zeros(1, 3, 32, 32),
+        1.0, 100, 100,
+        reference_state=[0.0, 0.0, 16.0, 16.0],
+    )
+
+    assert tracker.network.calls[0]["auto_activate"] is True
+    assert candidate["active_expert_ids"] == (0, 4)
+    assert candidate["retained_expert_ids"] == (4,)
+    assert candidate["ensemble_weights"].shape == (5,)
+    assert int(candidate["ensemble_weights"].argmax()) == 4
+    assert candidate["state"] == candidate["expert_states"][4]
+
+
 def test_tracker_replaces_small_template_cache_for_each_sequence(monkeypatch):
     class SmallExpert:
         def __init__(self):

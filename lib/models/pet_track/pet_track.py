@@ -17,17 +17,18 @@ from lib.models.layers.srbt_controller import VisibilityGate
 from lib.models.layers.expert_fusion import (
     ExpertFusionBank, ProposalBoxAdapter, build_expert_fusions,
 )
+from lib.models.layers.expert_ensemble import ExpertActivator
 from lib.models.layers.small_target_expert import SmallTargetExpert
 from lib.models.layers.search_window_controller import SearchWindowController
 from lib.utils.box_ops import box_xyxy_to_cxcywh
 
 
 class PETTrack(nn.Module):
-    ARCHITECTURE_VERSION = 26
+    ARCHITECTURE_VERSION = 27
     _PET_STATE_PREFIXES = (
         "visibility_gate.", "rgb_identity_verifier.", "redetect_expert.",
         "small_target_expert.", "proposal_adapters.",
-        "search_window_controller.")
+        "search_window_controller.", "expert_activator.")
 
     def __init__(self, transformer, memory, box_head, cfg,
                  aux_loss=False, head_type="CORNER"):
@@ -61,6 +62,10 @@ class PETTrack(nn.Module):
             self.shared_expert_names = [
                 name for name in self.expert_names
                 if name != self.precision_refiner_name
+            ]
+            self.specialist_names = [
+                name for name in self.expert_names
+                if name != self.default_expert
             ]
             self.expert_fusion = ExpertFusionBank(
                 build_expert_fusions(
@@ -106,15 +111,27 @@ class PETTrack(nn.Module):
             if self.small_target_expert is not None:
                 self.proposal_parents[self.precision_refiner_name] = (
                     discrimination_name or motion_name or self.default_expert)
+            self.expert_activator = ExpertActivator(
+                transformer.embed_dim,
+                specialist_count=len(self.specialist_names),
+                hidden_dim=int(getattr(
+                    expert_cfg, "ACTIVATOR_HIDDEN_DIM", 64)),
+                threshold=float(getattr(
+                    expert_cfg, "ACTIVATION_THRESHOLD", 0.5)),
+                max_specialists=int(getattr(
+                    expert_cfg, "MAX_ACTIVE_SPECIALISTS", 2)),
+            )
         else:
             self.expert_names = ["generalist"]
             self.shared_expert_names = list(self.expert_names)
+            self.specialist_names = []
             self.default_expert = "generalist"
             self.expert_fusion = None
             self.expert_heads = nn.ModuleDict()
             self.small_target_expert = None
             self.proposal_adapters = nn.ModuleDict()
             self.proposal_parents = {}
+            self.expert_activator = None
 
         srbt_cfg = getattr(cfg.MODEL, "SRBT", None)
         self.srbt_enabled = bool(getattr(srbt_cfg, "ENABLE", False)) if srbt_cfg is not None else False
@@ -418,6 +435,22 @@ class PETTrack(nn.Module):
                 pending.append(parent)
         return tuple(name for name in self.expert_names if name in requested)
 
+    def _activation_mask_with_dependencies(self, specialist_mask):
+        if specialist_mask.ndim != 2 \
+                or specialist_mask.shape[1] != len(self.specialist_names):
+            raise ValueError("specialist activation mask has invalid shape")
+        active = torch.zeros(
+            specialist_mask.shape[0], len(self.expert_names),
+            dtype=torch.bool, device=specialist_mask.device)
+        active[:, self.expert_names.index(self.default_expert)] = True
+        for specialist_id, name in enumerate(self.specialist_names):
+            selected = specialist_mask[:, specialist_id]
+            current = name
+            while current is not None:
+                active[:, self.expert_names.index(current)] |= selected
+                current = self.proposal_parents.get(current)
+        return active
+
     def _head_for_expert(self, name):
         if name == self.default_expert:
             return self.box_head
@@ -512,7 +545,8 @@ class PETTrack(nn.Module):
         return output
 
     def forward_head(self, cat_feature, gt_score_map=None,
-                     training_expert_ids=None, active_expert_names=None):
+                     training_expert_ids=None, active_expert_names=None,
+                     auto_activate=False, return_activation_logits=False):
         search = cat_feature[:, -self.feat_len_s * 2:]
         rgb = search[:, :self.feat_len_s]
         event = search[:, self.feat_len_s:]
@@ -520,9 +554,9 @@ class PETTrack(nn.Module):
             return self._forward_box_head(rgb + event, gt_score_map)
 
         if training_expert_ids is not None:
-            if active_expert_names is not None:
+            if active_expert_names is not None or auto_activate:
                 raise ValueError(
-                    "training_expert_ids and active_expert_names are exclusive")
+                    "training and inference expert activation are mutually exclusive")
             name = self._training_expert(
                 training_expert_ids, rgb.shape[0], rgb.device)
             if name == self.precision_refiner_name:
@@ -535,7 +569,23 @@ class PETTrack(nn.Module):
 
         context = self._expert_context(cat_feature)
         expert_outputs = {}
-        active_experts = self._resolve_active_experts(active_expert_names)
+        activation_logits = None
+        activation_mask = None
+        if auto_activate or return_activation_logits:
+            generalist = self._forward_shared_expert(
+                self.default_expert, rgb, event, context,
+                gt_score_map, expert_outputs)
+            activation_logits = self.expert_activator(
+                rgb, event, generalist["score_map"],
+                generalist["pred_boxes"])
+        if auto_activate:
+            activation_mask = self._activation_mask_with_dependencies(
+                self.expert_activator.select(activation_logits))
+            active_experts = tuple(
+                name for expert_id, name in enumerate(self.expert_names)
+                if bool(activation_mask[:, expert_id].any()))
+        else:
+            active_experts = self._resolve_active_experts(active_expert_names)
         for name in active_experts:
             if name not in self.shared_expert_names:
                 continue
@@ -543,11 +593,16 @@ class PETTrack(nn.Module):
                 name, rgb, event, context, gt_score_map, expert_outputs)
         out = dict(expert_outputs[self.default_expert])
         out["expert_outputs"] = expert_outputs
+        if activation_logits is not None:
+            out["expert_activation_logits"] = activation_logits
+        if activation_mask is not None:
+            out["expert_activation_mask"] = activation_mask
         return out
 
     def _forward_amt_core(self, zi, ze, xi, xe, encoded_templates=None,
                           training_expert_ids=None,
-                          active_expert_names=None, **kwargs):
+                          active_expert_names=None, auto_activate=False,
+                          return_activation_logits=False, **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
         else:
@@ -556,6 +611,10 @@ class PETTrack(nn.Module):
         head_kwargs = {"training_expert_ids": training_expert_ids}
         if active_expert_names is not None:
             head_kwargs["active_expert_names"] = active_expert_names
+        if auto_activate:
+            head_kwargs["auto_activate"] = True
+        if return_activation_logits:
+            head_kwargs["return_activation_logits"] = True
         out = self.forward_head(feat, **head_kwargs)
         out.update(aux)
         out["backbone_feat"] = feat
@@ -567,6 +626,8 @@ class PETTrack(nn.Module):
                       encoded_templates=None,
                       training_expert_ids=None,
                       active_expert_names=None,
+                      auto_activate=False,
+                      return_activation_logits=False,
                       **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
@@ -576,6 +637,10 @@ class PETTrack(nn.Module):
         head_kwargs = {"training_expert_ids": training_expert_ids}
         if active_expert_names is not None:
             head_kwargs["active_expert_names"] = active_expert_names
+        if auto_activate:
+            head_kwargs["auto_activate"] = True
+        if return_activation_logits:
+            head_kwargs["return_activation_logits"] = True
         out = self.forward_head(feat, **head_kwargs)
         out.update(aux)
         out["backbone_feat"] = feat
@@ -609,7 +674,8 @@ class PETTrack(nn.Module):
     def forward(self, zi, ze, xi, xe, mask_z=None, ce_template_mask=None,
                 ce_keep_rate=None, return_last_attn=False,
                 redetect_images=None, redetect_event_images=None,
-                redetect_mask=None, training_expert_ids=None):
+                redetect_mask=None, training_expert_ids=None,
+                return_activation_logits=False):
         training_expert_name = self._training_expert(
             training_expert_ids, xi.shape[0], xi.device)
         kwargs = {
@@ -639,24 +705,56 @@ class PETTrack(nn.Module):
                     self.precision_refiner_name, out, upstream)
             return out
         if self.srbt_enabled:
-            return self._forward_srbt(
+            out = self._forward_srbt(
                 zi, ze, xi, xe,
                 redetect_images=redetect_images,
                 redetect_event_images=redetect_event_images,
                 redetect_mask=redetect_mask,
                 training_expert_ids=training_expert_ids,
+                return_activation_logits=return_activation_logits,
                 **kwargs)
-        return self._forward_amt_core(
-            zi, ze, xi, xe,
-            training_expert_ids=training_expert_ids,
-            **kwargs)
+        else:
+            out = self._forward_amt_core(
+                zi, ze, xi, xe,
+                training_expert_ids=training_expert_ids,
+                return_activation_logits=return_activation_logits,
+                **kwargs)
+        if not return_activation_logits or self.small_target_expert is None:
+            return out
+        shared_outputs = out.get("expert_outputs")
+        if shared_outputs is None:
+            raise RuntimeError("dispatch forward did not return expert outputs")
+        small_output = self.small_target_expert(zi, ze, xi, xe)
+        parent_name = self.proposal_parents.get(self.precision_refiner_name)
+        if parent_name in shared_outputs:
+            small_output = self._condition_expert_output(
+                self.precision_refiner_name, small_output,
+                shared_outputs[parent_name])
+        out["expert_outputs"] = {
+            name: (
+                small_output if name == self.precision_refiner_name
+                else shared_outputs[name]
+            )
+            for name in self.expert_names
+        }
+        return out
 
     def inference(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe,
-                  small_template_features=None, active_expert_names=None):
-        active_experts = self._resolve_active_experts(active_expert_names)
+                  small_template_features=None, active_expert_names=None,
+                  auto_activate=False, return_activation_logits=False):
+        if auto_activate and active_expert_names is not None:
+            raise ValueError(
+                "explicit and automatic expert activation are mutually exclusive")
+        active_experts = (
+            None if auto_activate
+            else self._resolve_active_experts(active_expert_names)
+        )
         raw_static_zi = static_zi
         raw_static_ze = static_ze
-        precision_is_active = self.precision_refiner_name in active_experts
+        precision_is_active = (
+            auto_activate
+            or self.precision_refiner_name in active_experts
+        )
         if (precision_is_active and self.small_target_expert is not None
                 and small_template_features is None and (
                 raw_static_zi.ndim not in (4, 5)
@@ -671,12 +769,21 @@ class PETTrack(nn.Module):
             out = self._forward_srbt(
                 static_zi, static_ze, xi, xe,
                 encoded_templates=encoded_templates,
-                active_expert_names=active_experts)
+                active_expert_names=active_experts,
+                auto_activate=auto_activate,
+                return_activation_logits=return_activation_logits)
         else:
             out = self._forward_amt_core(
                 static_zi, static_ze, xi, xe,
                 encoded_templates=encoded_templates,
-                active_expert_names=active_experts)
+                active_expert_names=active_experts,
+                auto_activate=auto_activate,
+                return_activation_logits=return_activation_logits)
+        if auto_activate:
+            precision_id = self.expert_names.index(
+                self.precision_refiner_name)
+            precision_is_active = bool(
+                out["expert_activation_mask"][:, precision_id].any())
         if self.small_target_expert is None or not precision_is_active:
             return out
         shared_outputs = out.get("expert_outputs")
@@ -695,6 +802,10 @@ class PETTrack(nn.Module):
                 small_output,
                 shared_outputs[parent_name],
             )
+        active_experts = tuple(
+            name for name in self.expert_names
+            if name in shared_outputs or name == self.precision_refiner_name
+        )
         out["expert_outputs"] = {
             name: (
                 small_output
@@ -1016,6 +1127,9 @@ def _load_retained_model_checkpoint(
     if source_version is None or source_version < 26:
         migration_prefixes = (
             *migration_prefixes, "search_window_controller.")
+    if source_version is None or source_version < 27:
+        migration_prefixes = (
+            *migration_prefixes, "expert_activator.")
     extension_prefixes = ("_pet_architecture_version", *migration_prefixes)
     retained = sorted(
         key for key in target if not key.startswith(extension_prefixes))
@@ -1167,6 +1281,7 @@ def _print_stage_report(model, cfg):
         "refine": ["base", "srbt", "redetect"],
         "recovery": ["srbt", "redetect"],
         "pursuit": ["pursuit"],
+        "dispatch": ["activation"],
     }.get(expert_phase, ["invalid_configuration"])
     print("PETTrack stage report")
     print("  Train/expert_phase:", expert_phase)

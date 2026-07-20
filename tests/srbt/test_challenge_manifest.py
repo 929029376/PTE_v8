@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -440,6 +441,93 @@ def test_specialist_epoch_is_equal_training_expert_blocks():
     expert_ids = [
         sampler.training_expert_for_index(index) for index in range(96)]
     assert [expert_ids.count(item) for item in range(5)] == [0, 24, 24, 24, 24]
+
+
+def test_dispatch_sampler_balances_generalist_and_all_specialists(monkeypatch):
+    sampler_module = importlib.import_module("lib.train.data.sampler")
+    monkeypatch.setattr(
+        sampler_module, "load_manifest",
+        lambda path: {"sequences": {"sequence-a": {}}})
+
+    class Dataset:
+        def __len__(self):
+            return 1
+
+    cfg = SimpleNamespace(
+        TRAIN=SimpleNamespace(
+            EXPERT_PHASE="dispatch",
+            SPECIALIST_EXPERT_IDS=[1, 2, 3, 4],
+            SPECIALIST_EXPERT_SCHEDULE=[[1, 10, [1]]],
+        ),
+        DATA=SimpleNamespace(
+            SRBT=SimpleNamespace(ENABLE=False, ANCHOR_WEIGHTS=None),
+            CHALLENGE_SAMPLING=SimpleNamespace(
+                ENABLE=True, PRECISE=True, MANIFEST="manifest.json"),
+            PURSUIT=SimpleNamespace(
+                ENABLE=False,
+                TRANSITION_PROBABILITY=0.5,
+                REAPPEAR_PROBABILITY=0.25,
+            ),
+        ),
+    )
+    sampler = sampler_module.TrackingSampler(
+        datasets=[Dataset()], p_datasets=None, samples_per_epoch=100,
+        max_gap=10, num_search_frames=1, num_template_frames=1,
+        cfg=cfg, training=True)
+
+    assert sampler.precise_expert_sampling is True
+    assert sampler.training_expert_ids == (0, 1, 2, 3, 4)
+    assert sampler.specialist_stage_schedule == ()
+    expert_ids = [
+        sampler.training_expert_for_index(index) for index in range(100)]
+    assert [expert_ids.count(item) for item in range(5)] == [20] * 5
+
+
+def test_dispatch_validation_uses_precise_validation_manifest(monkeypatch):
+    sampler_module = importlib.import_module("lib.train.data.sampler")
+    loaded_paths = []
+    monkeypatch.setattr(
+        sampler_module, "load_manifest",
+        lambda path: (
+            loaded_paths.append(path)
+            or {"sequences": {"sequence-val": {}}}
+        ),
+    )
+
+    class Dataset:
+        def __len__(self):
+            return 1
+
+    cfg = SimpleNamespace(
+        TRAIN=SimpleNamespace(
+            EXPERT_PHASE="dispatch",
+            SPECIALIST_EXPERT_IDS=[1, 2, 3, 4],
+            SPECIALIST_EXPERT_SCHEDULE=[],
+        ),
+        DATA=SimpleNamespace(
+            SRBT=SimpleNamespace(ENABLE=False, ANCHOR_WEIGHTS=None),
+            CHALLENGE_SAMPLING=SimpleNamespace(
+                ENABLE=True,
+                PRECISE=True,
+                MANIFEST="train-manifest.json",
+                VAL_MANIFEST="val-manifest.json",
+            ),
+            PURSUIT=SimpleNamespace(
+                ENABLE=False,
+                TRANSITION_PROBABILITY=0.5,
+                REAPPEAR_PROBABILITY=0.25,
+            ),
+        ),
+    )
+
+    sampler = sampler_module.TrackingSampler(
+        datasets=[Dataset()], p_datasets=None, samples_per_epoch=100,
+        max_gap=10, num_search_frames=1, num_template_frames=1,
+        cfg=cfg, training=False)
+
+    assert sampler.precise_expert_sampling is True
+    assert sampler.training_expert_ids == (0, 1, 2, 3, 4)
+    assert loaded_paths == ["val-manifest.json"]
 
 
 def test_single_specialist_stage_samples_only_precision_expert():

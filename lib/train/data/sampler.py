@@ -92,14 +92,19 @@ class TrackingSampler(torch.utils.data.Dataset):
                 <= self.pursuit_transition_probability:
             raise ValueError(
                 "DATA.PURSUIT.REAPPEAR_PROBABILITY must be in [0, transition]")
-        self.training_expert_ids = tuple(int(expert_id) for expert_id in getattr(
+        configured_expert_ids = tuple(int(expert_id) for expert_id in getattr(
             train_cfg, "SPECIALIST_EXPERT_IDS", [1, 2, 3, 4]))
-        if (not self.training_expert_ids
-                or len(set(self.training_expert_ids)) != len(self.training_expert_ids)
+        if (not configured_expert_ids
+                or len(set(configured_expert_ids)) != len(configured_expert_ids)
                 or any(expert_id < 1 or expert_id > 4
-                       for expert_id in self.training_expert_ids)):
+                       for expert_id in configured_expert_ids)):
             raise ValueError(
                 "TRAIN.SPECIALIST_EXPERT_IDS must contain unique IDs in [1, 4]")
+        self.training_expert_ids = (
+            (0,) + configured_expert_ids
+            if self.expert_phase == "dispatch"
+            else configured_expert_ids
+        )
         specialist_schedule = []
         previous_end = 0
         for stage in getattr(
@@ -112,23 +117,29 @@ class TrackingSampler(torch.utils.data.Dataset):
             expert_ids = tuple(int(expert_id) for expert_id in stage[2])
             if (start != previous_end + 1 or end < start or not expert_ids
                     or len(set(expert_ids)) != len(expert_ids)
-                    or any(expert_id not in self.training_expert_ids
+                    or any(expert_id not in configured_expert_ids
                            for expert_id in expert_ids)):
                 raise ValueError(
                     "specialist schedule must be contiguous, non-overlapping, "
                     "and use configured expert IDs")
             specialist_schedule.append((start, end, expert_ids))
             previous_end = end
-        self.specialist_stage_schedule = tuple(specialist_schedule)
+        self.specialist_stage_schedule = (
+            tuple(specialist_schedule)
+            if self.expert_phase == "specialize" else ()
+        )
         self.precise_expert_sampling = (
-            self.training
-            and self.expert_phase == "specialize"
+            (self.training or self.expert_phase == "dispatch")
+            and self.expert_phase in {"specialize", "dispatch"}
             and bool(getattr(challenge_cfg, "ENABLE", False))
             and bool(getattr(challenge_cfg, "PRECISE", False))
         )
-        manifest_path = str(getattr(challenge_cfg, "MANIFEST", "")).strip()
+        manifest_key = "MANIFEST" if self.training else "VAL_MANIFEST"
+        manifest_path = str(getattr(
+            challenge_cfg, manifest_key, "")).strip()
         if self.precise_expert_sampling and not manifest_path:
-            raise ValueError("precise expert sampling requires a manifest path")
+            raise ValueError(
+                f"precise expert sampling requires {manifest_key}")
         self._expert_manifest = (
             load_manifest(manifest_path)["sequences"]
             if self.precise_expert_sampling else {}

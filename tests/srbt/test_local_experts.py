@@ -14,6 +14,7 @@ from tests.srbt.test_srbt_model_integration import (
 from lib.models.pet_track.pet_track import PETTrack
 from lib.train.base_functions import _optimizer_groups
 from lib.train.data.loader import ltr_collate_stack1
+from lib.train.data.felt_challenges import CHALLENGE_NAMES
 from lib.utils import TensorDict
 
 
@@ -660,6 +661,68 @@ def test_visibility_expert_does_not_use_proposal_advantage(monkeypatch):
     assert loss.item() == pytest.approx(0.0)
     assert status["Loss/expert_advantage"] == pytest.approx(0.0)
     assert status["Loss/expert_advantage_weighted"] == pytest.approx(0.0)
+
+
+def test_dispatch_targets_keep_multilabel_eligibility_but_require_utility():
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.expert_phase = "dispatch"
+    actor.activation_advantage_margin = 0.02
+    logits = torch.zeros(2, 4, requires_grad=True)
+    generalist = torch.tensor([
+        [[0.70, 0.70, 0.20, 0.20]],
+        [[0.50, 0.50, 0.20, 0.20]],
+    ])
+    exact = torch.tensor([
+        [[0.50, 0.50, 0.20, 0.20]],
+        [[0.50, 0.50, 0.20, 0.20]],
+    ])
+    pred_dict = {
+        "expert_activation_logits": logits,
+        "expert_outputs": {
+            "generalist": {"pred_boxes": generalist},
+            "motion_fm": {"pred_boxes": exact},
+            "precision_refiner": {"pred_boxes": generalist.clone()},
+            "visibility_foc_ov": {"pred_boxes": exact.clone()},
+            "discrimination_bi": {"pred_boxes": exact.clone()},
+        },
+    }
+    challenge_labels = torch.zeros(2, len(CHALLENGE_NAMES), dtype=torch.bool)
+    challenge_labels[0, CHALLENGE_NAMES.index("motion")] = True
+    challenge_labels[0, CHALLENGE_NAMES.index("small_target")] = True
+    challenge_labels[1, CHALLENGE_NAMES.index("absent")] = True
+    gt_dict = {
+        "challenge_labels": challenge_labels,
+        "search_anno": torch.tensor([[
+            [0.40, 0.40, 0.20, 0.20],
+            [0.00, 0.00, 0.00, 0.00],
+        ]]),
+        "search_absent": torch.tensor([[1, 0]]),
+    }
+
+    targets = actor._dispatch_targets(pred_dict, gt_dict)
+    loss, status = actor.compute_losses(pred_dict, gt_dict)
+    loss.backward()
+
+    assert torch.equal(targets, torch.tensor([
+        [True, False, False, False],
+        [False, False, True, False],
+    ]))
+    assert status["Activation/positive_motion_fm"] == 1
+    assert status["Activation/positive_precision_refiner"] == 0
+    assert status["Activation/positive_visibility_foc_ov"] == 1
+    assert status["Activation/positive_discrimination_bi"] == 0
+    assert status["Activation/predicted_count"] == 8
+    assert status["Activation/mean_specialists"] == pytest.approx(4.0)
+    assert status["Activation/exact_match"] == pytest.approx(0.0)
+    assert status["Activation/precision_motion_fm"] == pytest.approx(0.5)
+    assert status["Activation/recall_motion_fm"] == pytest.approx(1.0)
+    assert status["Activation/precision_visibility_foc_ov"] == pytest.approx(
+        0.5)
+    assert status["Activation/recall_visibility_foc_ov"] == pytest.approx(1.0)
+    assert status["Activation/macro_f1"] == pytest.approx(1.0 / 3.0)
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0.0
 
 
 @pytest.mark.parametrize("expert_id", [1, 2, 4])

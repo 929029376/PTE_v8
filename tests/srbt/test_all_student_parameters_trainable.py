@@ -4,6 +4,7 @@ import torch
 import pytest
 
 from lib.models.layers.expert_fusion import ProposalBoxAdapter
+from lib.models.layers.expert_ensemble import ExpertActivator
 from lib.models.layers.small_target_expert import SmallTargetExpert
 from lib.models.layers.search_window_controller import SearchWindowController
 from lib.models.pet_track.pet_track import _load_filtered_baseline_checkpoint
@@ -51,6 +52,8 @@ class TinyStudent(torch.nn.Module):
         })
         self.search_window_controller = SearchWindowController(
             expert_count=5, hidden_dim=16)
+        self.expert_activator = ExpertActivator(
+            embed_dim=2, specialist_count=4, hidden_dim=8)
 
     def forward_owner(self, value, owner):
         names = tuple(self.expert_fusion.experts)
@@ -189,6 +192,27 @@ def test_optimizer_groups_enforce_separate_expert_training_phases():
         "redetect_expert.",
     )) for name in trainable)
     assert [group["name"] for group in groups] == ["recovery"]
+
+
+def test_dispatch_trains_only_the_expert_activator():
+    model = TinyStudent()
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "dispatch"
+    cfg.TRAIN.ACTIVATOR_LR = 3e-4
+
+    groups = _optimizer_groups(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    assert trainable
+    assert all(name.startswith("expert_activator.") for name in trainable)
+    assert [group["name"] for group in groups] == ["expert_activator"]
+    assert groups[0]["lr"] == 3e-4
+    assert {id(parameter) for parameter in groups[0]["params"]} == {
+        id(parameter) for parameter in model.expert_activator.parameters()
+    }
 
 
 def test_precision_expert_specialization_trains_only_independent_branch():

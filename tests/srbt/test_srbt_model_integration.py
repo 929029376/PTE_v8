@@ -459,6 +459,88 @@ def test_sparse_inference_rejects_unknown_expert_before_backbone(monkeypatch):
         )
 
 
+def test_auto_activation_executes_only_selected_specialist(monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    calls = {name: 0 for name in model.shared_expert_names}
+    for name in model.shared_expert_names:
+        fusion = model.expert_fusion.experts[name]
+        original = fusion.forward
+        monkeypatch.setattr(
+            fusion,
+            "forward",
+            lambda *args, _name=name, _forward=original, **kwargs: (
+                calls.__setitem__(_name, calls[_name] + 1)
+                or _forward(*args, **kwargs)
+            ),
+        )
+    monkeypatch.setattr(
+        model.expert_activator,
+        "forward",
+        lambda rgb, event, score, boxes: score.new_tensor(
+            [[10.0, -10.0, -10.0, -10.0]]),
+    )
+
+    with torch.no_grad():
+        output = model.inference(
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            auto_activate=True,
+        )
+
+    assert tuple(output["expert_outputs"]) == ("generalist", "motion_fm")
+    assert torch.equal(
+        output["expert_activation_mask"],
+        torch.tensor([[True, True, False, False, False]]),
+    )
+    assert calls == {
+        "generalist": 1,
+        "motion_fm": 1,
+        "visibility_foc_ov": 0,
+        "discrimination_bi": 0,
+    }
+
+
+def test_explicit_and_automatic_activation_are_mutually_exclusive():
+    model = _model(expert_enabled=True).eval()
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        model.inference(
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            torch.randn(1, 1, 3, 16, 16),
+            active_expert_names=("motion_fm",),
+            auto_activate=True,
+        )
+
+
+def test_dispatch_forward_returns_logits_and_all_frozen_expert_candidates():
+    model = _model(expert_enabled=True)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in model.expert_activator.parameters():
+        parameter.requires_grad_(True)
+
+    output = model(*_images(batch=2), return_activation_logits=True)
+    output["expert_activation_logits"].sum().backward()
+
+    assert output["expert_activation_logits"].shape == (2, 4)
+    assert tuple(output["expert_outputs"]) == tuple(model.expert_names)
+    assert all(
+        parameter.grad is not None
+        for parameter in model.expert_activator.parameters())
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith("expert_activator."))
+
+
 def test_training_forward_runs_redetect_only_when_observations_are_requested():
     model = _model()
     probe = ProbeRedetect()

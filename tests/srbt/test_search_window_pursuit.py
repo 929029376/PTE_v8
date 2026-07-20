@@ -418,6 +418,108 @@ def test_actor_uses_previous_controller_output_for_the_next_frame_crop(monkeypat
     assert captured_anchors[2].grad_fn is None
 
 
+def test_pursuit_uses_per_row_sparse_activation_with_fixed_expert_slots():
+    class CapturingController(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, **kwargs):
+            self.calls.append({
+                name: value.detach().clone()
+                for name, value in kwargs.items()
+                if torch.is_tensor(value)
+            })
+            current_box = kwargs["current_box"]
+            return SimpleNamespace(
+                next_box=current_box,
+                inside_logit=current_box[:, 0] * 0.0,
+                quality_logit=current_box[:, 0] * 0.0,
+            )
+
+    class SparseExperts(torch.nn.Module):
+        expert_names = ["g", "m", "p", "v", "d"]
+
+        def __init__(self):
+            super().__init__()
+            self.search_window_controller = CapturingController()
+            self.inference_kwargs = []
+
+        def inference(self, **kwargs):
+            self.inference_kwargs.append(dict(kwargs))
+            batch_size = kwargs["xi"].shape[0]
+
+            def output(center, peak):
+                box = kwargs["xi"].new_tensor(
+                    [center, 0.5, 0.2, 0.2]
+                ).reshape(1, 1, 4).expand(batch_size, -1, -1)
+                score = kwargs["xi"].new_full(
+                    (batch_size, 1, 4, 4), peak)
+                return {"pred_boxes": box, "score_map": score}
+
+            return {
+                "expert_outputs": {
+                    "g": output(0.5, 0.5),
+                    "m": output(0.3, 0.9),
+                    "p": output(0.7, 0.8),
+                },
+                "expert_activation_mask": torch.tensor([
+                    [True, True, False, False, False],
+                    [True, False, True, False, False],
+                ], device=kwargs["xi"].device),
+                "presence_score": torch.ones(
+                    batch_size, device=kwargs["xi"].device),
+            }
+
+    model = SparseExperts()
+    actor = object.__new__(PETTrackActor)
+    actor.net = model
+    actor.settings = SimpleNamespace(search_area_factor={"search": 2.0})
+    actor.cfg = SimpleNamespace(
+        MODEL=SimpleNamespace(EXPERT=SimpleNamespace(
+            ACTIVATOR_TRAINED=True,
+            USE_ACTIVATION_INFERENCE=True,
+        )),
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(SIZE=8, FACTOR=2.0)),
+    )
+    frames = torch.zeros(2, 2, 3, 8, 8)
+    boxes = torch.tensor([
+        [[0.4, 0.4, 0.1, 0.1], [0.4, 0.4, 0.1, 0.1]],
+        [[0.5, 0.4, 0.1, 0.1], [0.5, 0.4, 0.1, 0.1]],
+    ])
+    data = {
+        "template_images": torch.zeros(2, 2, 3, 4, 4),
+        "template_event_images": torch.zeros(2, 2, 3, 4, 4),
+        "pursuit_search_images": frames,
+        "pursuit_search_event_images": frames,
+        "pursuit_search_anno": boxes,
+        "pursuit_search_present": torch.ones(2, 2, dtype=torch.uint8),
+    }
+
+    actor._forward_pursuit(data)
+
+    assert model.inference_kwargs[0]["auto_activate"] is True
+    call = model.search_window_controller.calls[0]
+    assert call["expert_boxes"].shape == (2, 5, 4)
+    assert torch.equal(call["expert_boxes"][0, 2:], call["expert_boxes"][0, :1].expand(3, -1))
+    assert torch.equal(call["expert_boxes"][1, 1], call["expert_boxes"][1, 0])
+    assert torch.equal(call["expert_boxes"][1, 3:], call["expert_boxes"][1, :1].expand(2, -1))
+    assert torch.equal(
+        call["response_peaks"] == 0.0,
+        torch.tensor([
+            [False, False, True, True, True],
+            [False, True, False, True, True],
+        ]),
+    )
+    assert torch.equal(
+        call["response_psr"] == 0.0,
+        torch.tensor([
+            [False, False, True, True, True],
+            [False, True, False, True, True],
+        ]),
+    )
+
+
 def test_tracker_prefers_planned_search_state_only_in_local_tracking_modes():
     tracker = object.__new__(InferenceTracker)
     tracker.state = [10.0, 10.0, 5.0, 5.0]

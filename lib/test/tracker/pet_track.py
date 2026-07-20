@@ -33,6 +33,12 @@ from lib.models.layers.search_window_controller import event_motion_centroid
 from lib.train.trainers.base_trainer import load_srbt_checkpoint_file
 
 
+DEFAULT_EXPERT_NAMES = (
+    "generalist", "motion_fm", "precision_refiner",
+    "visibility_foc_ov", "discrimination_bi",
+)
+
+
 def _load_srbt_eval_checkpoint(network, checkpoint_path):
     checkpoint = load_srbt_checkpoint_file(checkpoint_path)
     network.load_state_dict(checkpoint["net"], strict=True)
@@ -54,10 +60,13 @@ class PETTrack(BaseTracker):
             policy_mode or getattr(
                 self.cfg.TEST, "POLICY_MODE", "stateful")).lower()
         self.srbt_controller_enabled = policy_mode == "stateful"
+        expert_names = tuple(getattr(
+            network, "expert_names", DEFAULT_EXPERT_NAMES))
         self.forced_expert_id = getattr(params, "forced_expert_id", None)
         if (self.forced_expert_id is not None
-                and int(self.forced_expert_id) not in range(5)):
-            raise ValueError("forced_expert_id must be in [0, 4]")
+                and int(self.forced_expert_id) not in range(len(expert_names))):
+            raise ValueError(
+                "forced_expert_id must address a configured expert")
         if self.forced_expert_id is not None:
             self.forced_expert_id = int(self.forced_expert_id)
         self.hypothesis_tracker = build_hypothesis_tracker(self.cfg)
@@ -65,8 +74,21 @@ class PETTrack(BaseTracker):
         self._srbt_last_action = BeliefAction.TRACK
         self._redetect_hypotheses = None
         self.network = network
+        self.expert_names = expert_names
         self.device = next(self.network.parameters()).device
         self.network.eval()
+        expert_cfg = getattr(self.cfg.MODEL, "EXPERT", None)
+        use_activation = bool(getattr(
+            expert_cfg, "USE_ACTIVATION_INFERENCE", False))
+        if use_activation and not bool(getattr(
+                expert_cfg, "ACTIVATOR_TRAINED", False)):
+            raise RuntimeError(
+                "sparse expert inference requires a trained activator")
+        if use_activation and getattr(
+                self.network, "expert_activator", None) is None:
+            raise RuntimeError(
+                "sparse expert inference is enabled but the model has no activator")
+        self.auto_expert_activation = use_activation
         self.preprocessor = Preprocessor(device=self.device)
         self.state = None
         search_controller_cfg = getattr(
@@ -364,8 +386,13 @@ class PETTrack(BaseTracker):
             self._last_redetect_error = ""
 
         self.state = info['init_bbox']
+        expert_names = tuple(getattr(self, "expert_names", ()))
+        if not expert_names:
+            expert_names = tuple(getattr(
+                self.network, "expert_names", DEFAULT_EXPERT_NAMES))
+            self.expert_names = expert_names
         self._expert_diagnostics = [[
-            list(info['init_bbox']) for _ in range(5)
+            list(info['init_bbox']) for _ in expert_names
         ]]
         self.frame_id = idx
         self._record_search_diagnostic(
@@ -390,19 +417,43 @@ class PETTrack(BaseTracker):
             dynamic_zi, dynamic_ze = dynamic_templates
         self.dynamic_zi, self.dynamic_ze = dynamic_zi, dynamic_ze
 
+        inference_kwargs = {
+            "static_zi": self.static_zi,
+            "static_ze": self.static_ze,
+            "dynamic_zi": dynamic_zi,
+            "dynamic_ze": dynamic_ze,
+            "xi": search,
+            "xe": event_search,
+            "small_template_features": getattr(
+                self, "small_template_features", None),
+        }
+        expert_names = tuple(getattr(self.network, "expert_names", ()))
+        forced_expert_id = getattr(self, "forced_expert_id", None)
+        if forced_expert_id is not None and expert_names:
+            forced_name = expert_names[forced_expert_id]
+            inference_kwargs["active_expert_names"] = (
+                () if forced_expert_id == 0 else (forced_name,))
+        elif getattr(self, "auto_expert_activation", False):
+            inference_kwargs["auto_activate"] = True
         out_dict = self.network.inference(
-            static_zi=self.static_zi, static_ze=self.static_ze,
-            dynamic_zi=dynamic_zi, dynamic_ze=dynamic_ze,
-            xi=search, xe=event_search,
-            small_template_features=getattr(
-                self, "small_template_features", None))
+            **inference_kwargs)
         expert_outputs = out_dict.get("expert_outputs")
         if expert_outputs:
+            if not expert_names:
+                expert_names = tuple(expert_outputs)
+            active_names = tuple(
+                name for name in expert_names if name in expert_outputs)
+            if not active_names or active_names[0] != expert_names[0]:
+                raise RuntimeError(
+                    "expert inference must include the generalist output")
+            active_expert_ids = tuple(
+                expert_names.index(name) for name in active_names)
             mapped_boxes = []
             response_maps = []
             response_peaks = []
             response_psr = []
-            for expert_output in expert_outputs.values():
+            for name in active_names:
+                expert_output = expert_outputs[name]
                 score_map = expert_output["score_map"]
                 window = self.output_window
                 if window.shape[-2:] != score_map.shape[-2:]:
@@ -429,7 +480,6 @@ class PETTrack(BaseTracker):
             boxes = torch.as_tensor(
                 mapped_boxes, device=response_stack.device,
                 dtype=response_stack.dtype)
-            forced_expert_id = getattr(self, "forced_expert_id", None)
             if forced_expert_id is None:
                 ensemble = fuse_expert_predictions(
                     boxes=boxes,
@@ -444,24 +494,40 @@ class PETTrack(BaseTracker):
                 response = (
                     ensemble.weights[:, None, None, None] * response_stack
                 ).sum(dim=0, keepdim=True)
-                retained_expert_ids = ensemble.retained_ids
-                ensemble_weights = ensemble.weights.detach()
+                retained_expert_ids = tuple(
+                    active_expert_ids[local_id]
+                    for local_id in ensemble.retained_ids)
+                local_weights = ensemble.weights.detach()
             else:
-                candidate_state = list(mapped_boxes[forced_expert_id])
+                if forced_expert_id not in active_expert_ids:
+                    raise RuntimeError(
+                        "forced expert output is missing from inference")
+                local_id = active_expert_ids.index(forced_expert_id)
+                candidate_state = list(mapped_boxes[local_id])
                 response = response_stack[
-                    forced_expert_id:forced_expert_id + 1]
-                ensemble_weights = torch.zeros(
+                    local_id:local_id + 1]
+                local_weights = torch.zeros(
                     len(mapped_boxes),
                     device=response_stack.device,
                     dtype=response_stack.dtype,
                 )
-                ensemble_weights[forced_expert_id] = 1.0
+                local_weights[local_id] = 1.0
                 retained_expert_ids = (forced_expert_id,)
-            expert_states = [list(box) for box in mapped_boxes]
-            expert_peaks = [float(value.detach().item())
-                            for value in response_peaks]
-            expert_psr_values = [float(value.detach().item())
-                                 for value in response_psr]
+            generalist_state = list(mapped_boxes[0])
+            expert_states = [
+                list(generalist_state) for _ in expert_names]
+            expert_peaks = [0.0 for _ in expert_names]
+            expert_psr_values = [0.0 for _ in expert_names]
+            ensemble_weights = torch.zeros(
+                len(expert_names), device=response_stack.device,
+                dtype=response_stack.dtype)
+            for local_id, expert_id in enumerate(active_expert_ids):
+                expert_states[expert_id] = list(mapped_boxes[local_id])
+                expert_peaks[expert_id] = float(
+                    response_peaks[local_id].detach().item())
+                expert_psr_values[expert_id] = float(
+                    response_psr[local_id].detach().item())
+                ensemble_weights[expert_id] = local_weights[local_id]
         else:
             response = self.output_window * out_dict['score_map']
             pred_box = (
@@ -474,7 +540,10 @@ class PETTrack(BaseTracker):
             retained_expert_ids = (0,)
             ensemble_weights = torch.ones(
                 1, device=response.device, dtype=response.dtype)
-            expert_states = [list(candidate_state) for _ in range(5)]
+            expert_names = tuple(getattr(
+                self.network, "expert_names", ("generalist",)))
+            active_expert_ids = (0,)
+            expert_states = [list(candidate_state) for _ in expert_names]
             expert_peaks = []
             expert_psr_values = []
 
@@ -485,6 +554,7 @@ class PETTrack(BaseTracker):
             "presence_score": out_dict.get("presence_score"),
             "memory_frame_open": True,
             "retained_expert_ids": retained_expert_ids,
+            "active_expert_ids": active_expert_ids,
             "ensemble_weights": ensemble_weights,
             "expert_states": expert_states,
             "expert_peaks": expert_peaks,
@@ -730,11 +800,24 @@ class PETTrack(BaseTracker):
             expert_states = (
                 local_candidate.get("expert_states")
                 if local_candidate is not None else None)
+            expert_names = tuple(getattr(self, "expert_names", ()))
+            if not expert_names:
+                expert_names = tuple(getattr(
+                    getattr(self, "network", None), "expert_names", ()))
+            if not expert_names:
+                expert_names = DEFAULT_EXPERT_NAMES
             if expert_states is None:
-                expert_states = [list(self.state) for _ in range(5)]
+                expert_states = [
+                    list(self.state) for _ in expert_names]
             elif decision["exit_to_tracking"]:
                 expert_states = [list(box) for box in expert_states]
-                expert_states[3] = list(self.state)
+                try:
+                    visibility_id = expert_names.index(
+                        "visibility_foc_ov")
+                except ValueError as error:
+                    raise RuntimeError(
+                        "recovery diagnostics require visibility_foc_ov") from error
+                expert_states[visibility_id] = list(self.state)
             if not hasattr(self, "_expert_diagnostics"):
                 self._expert_diagnostics = []
             self._expert_diagnostics.append(expert_states)
