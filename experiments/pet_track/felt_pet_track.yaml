@@ -52,7 +52,7 @@ MODEL:
   PRETRAINED_BASELINE_CKPT: "pretrained_networks/AMTTrack_ep0098.pth.tar"
   PRETRAINED_SRBT_CKPT: ""
   PRETRAINED_EXPERT_CKPT: ""
-  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/search_pursuit_v30_20260720/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
+  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/sparse_dispatch_balanced_v32_20260720/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
   EXPERT:
     ENABLE: true
     DEFAULT: generalist
@@ -60,8 +60,8 @@ MODEL:
     ACTIVATOR_HIDDEN_DIM: 64
     ACTIVATION_THRESHOLD: 0.5
     MAX_ACTIVE_SPECIALISTS: 2
-    ACTIVATOR_TRAINED: false
-    USE_ACTIVATION_INFERENCE: false
+    ACTIVATOR_TRAINED: true
+    USE_ACTIVATION_INFERENCE: true
   SEARCH_CONTROLLER:
     ENABLE: true
     HIDDEN_DIM: 64

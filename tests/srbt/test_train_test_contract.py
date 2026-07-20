@@ -922,8 +922,8 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.EXPERT.ACTIVATOR_HIDDEN_DIM == 64
     assert configured.MODEL.EXPERT.ACTIVATION_THRESHOLD == pytest.approx(0.5)
     assert configured.MODEL.EXPERT.MAX_ACTIVE_SPECIALISTS == 2
-    assert configured.MODEL.EXPERT.ACTIVATOR_TRAINED is False
-    assert configured.MODEL.EXPERT.USE_ACTIVATION_INFERENCE is False
+    assert configured.MODEL.EXPERT.ACTIVATOR_TRAINED is True
+    assert configured.MODEL.EXPERT.USE_ACTIVATION_INFERENCE is True
     assert "MAX_ACTIVE" not in configured.MODEL.EXPERT
     assert "ROUTER_HIDDEN_DIM" not in configured.MODEL.EXPERT
     assert "TEMPORAL_MOMENTUM" not in configured.MODEL.EXPERT
@@ -932,7 +932,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "search_pursuit_v30_20260720/checkpoints/train/pet_track/"
+        "sparse_dispatch_balanced_v32_20260720/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
@@ -953,7 +953,7 @@ def test_canonical_dispatch_strategy_trains_only_input_driven_activation():
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "search_pursuit_v30_20260720/checkpoints/train/pet_track/"
+        "sparse_dispatch_balanced_v32_20260720/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.TRAIN.STAGE == "dispatch"
     assert configured.TRAIN.EXPERT_PHASE == "dispatch"

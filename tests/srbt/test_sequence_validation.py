@@ -1624,8 +1624,8 @@ def test_dispatch_experiment_defers_sequence_validation_until_activator_best():
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
     assert experiment["TRAIN"]["BEST_LOADER"] == "val"
     assert experiment["TRAIN"]["BEST_METRIC"] == "Activation/macro_f1"
-    assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is False
-    assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is False
+    assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
+    assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is True
 
 
 def test_sequence_val_best_disables_incompatible_batch_val_loader():
