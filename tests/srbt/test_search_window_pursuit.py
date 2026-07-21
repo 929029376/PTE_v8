@@ -1022,6 +1022,67 @@ def test_motion_displacement_loss_trains_consecutive_specialist_boxes(
     assert bool(motion_offset.grad.abs() > 0.0)
 
 
+def test_discrimination_specialist_ranks_target_above_hardest_distractor(
+        monkeypatch):
+    score_logits = torch.nn.Parameter(torch.tensor([[[[
+        -3.0, -3.0, -3.0, -3.0,
+        -3.0, -1.0, -3.0, -3.0,
+        -3.0, -3.0, -3.0, 2.0,
+        -3.0, -3.0, -3.0, -3.0,
+    ]]]]).reshape(1, 1, 4, 4))
+
+    def fake_base_loss(_self, output, _gt_dict, return_status=True):
+        loss = output["pred_boxes"].sum() * 0.0
+        return loss, {"Loss/total": float(loss.detach()), "IoU": 0.5}
+
+    monkeypatch.setattr(PETTrackActor.__mro__[1], "compute_losses", fake_base_loss)
+    actor = object.__new__(PETTrackActor)
+    actor.settings = SimpleNamespace(search_area_factor={"search": 2.0})
+    actor.cfg = SimpleNamespace(
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(FACTOR=2.0)),
+        TRAIN=SimpleNamespace(
+            PURSUIT_CENTER_WEIGHT=1.0,
+            PURSUIT_SCALE_WEIGHT=0.5,
+            PURSUIT_CONTAINMENT_WEIGHT=2.0,
+            PURSUIT_INSIDE_WEIGHT=0.5,
+            PURSUIT_QUALITY_WEIGHT=0.25,
+            DISCRIMINATION_RANKING_WEIGHT=2.0,
+            DISCRIMINATION_RANKING_MARGIN=0.2,
+        ),
+    )
+    controller_step = SimpleNamespace(
+        next_box=torch.tensor([[0.2, 0.2, 0.1, 0.1]]),
+        inside_logit=torch.zeros(1),
+        quality_logit=torch.zeros(1),
+    )
+    target = torch.tensor([[0.125, 0.125, 0.25, 0.25]])
+    predictions = {
+        "pursuit_predictions": [controller_step],
+        "pursuit_targets": [target],
+        "pursuit_current_inside": [torch.tensor([True])],
+        "pursuit_current_quality": [torch.tensor([0.5])],
+        "pursuit_present_next": [torch.tensor([True])],
+        "pursuit_specialist_id": 4,
+        "pursuit_specialist_outputs": [{
+            "pred_boxes": torch.full((1, 1, 4), 0.25),
+            "score_map": score_logits.sigmoid(),
+        }],
+        "pursuit_specialist_targets": [target],
+        "pursuit_specialist_present": [torch.tensor([True])],
+    }
+
+    loss, status = actor._compute_pursuit_losses(predictions)
+    loss.backward()
+
+    assert status["DiscriminationTrain/frame_count"] == 1
+    assert status["Loss/discrimination_ranking"] > 0.0
+    assert status["Loss/discrimination_ranking_weighted"] == pytest.approx(
+        2.0 * status["Loss/discrimination_ranking"])
+    assert score_logits.grad is not None
+    assert score_logits.grad[0, 0, 1, 1] < 0
+    assert score_logits.grad[0, 0, 2, 3] > 0
+
+
 def test_synthetic_training_improves_next_center_and_crop_inclusion():
     torch.manual_seed(7)
     controller = SearchWindowController(expert_count=5, hidden_dim=16)

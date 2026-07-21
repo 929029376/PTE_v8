@@ -961,7 +961,7 @@ def test_canonical_causal_discrimination_strategy_trains_only_owner_four():
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
     assert configured.DATA.PURSUIT.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
-    assert configured.DATA.PURSUIT.WINDOW_LENGTH == 8
+    assert configured.DATA.PURSUIT.WINDOW_LENGTH == 4
     assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
     assert configured.DATA.PURSUIT.TRANSITION_PROBABILITY == pytest.approx(0.0)
     assert configured.DATA.PURSUIT.REAPPEAR_PROBABILITY == pytest.approx(0.0)
@@ -977,6 +977,8 @@ def test_canonical_causal_discrimination_strategy_trains_only_owner_four():
     assert configured.TRAIN.LR == 0.00001
     assert configured.TRAIN.PURSUIT_LR == pytest.approx(0.0001)
     assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(1.0)
+    assert configured.TRAIN.DISCRIMINATION_RANKING_WEIGHT == pytest.approx(2.0)
+    assert configured.TRAIN.DISCRIMINATION_RANKING_MARGIN == pytest.approx(0.2)
     assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
     assert configured.TRAIN.ACTIVATOR_ADVANTAGE_MARGIN == pytest.approx(0.02)
     assert configured.TRAIN.ACTIVATOR_POS_WEIGHT == [4.0, 5.0, 1.5, 2.5]
@@ -1098,13 +1100,14 @@ def test_recovery_stage_report_names_all_active_dart_losses(capsys):
     assert "identity" in report
 
 
-def test_supervisor_uses_causal_discrimination_v42_run_directory():
+def test_supervisor_uses_discrimination_ranking_v43_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "causal_discrimination_v42_20260721" in supervisor
+    assert "discrimination_ranking_v43_20260722" in supervisor
+    assert "causal_discrimination_v42_20260721" not in supervisor
     assert "--config felt_pet_track" in supervisor
     assert "CONFIG_NAME=\"felt_pet_track\"" in supervisor
     assert "dart_duration_v40b_20260721/logs && exec" not in supervisor
@@ -1134,7 +1137,7 @@ def test_supervisor_uses_causal_discrimination_v42_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "causal_discrimination_v42_20260721/logs && exec") == 2
+        "discrimination_ranking_v43_20260722/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

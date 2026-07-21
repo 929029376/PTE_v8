@@ -32,6 +32,7 @@ from lib.models.layers.search_window_controller import (
 REQUIRED_PRESENCE_PREDICTIONS = frozenset({"logits", "score"})
 VISIBILITY_EXPERT_ID = 3
 MOTION_EXPERT_ID = 1
+DISCRIMINATION_EXPERT_ID = 4
 ADVANTAGE_EXPERT_IDS = frozenset({1, 2, 4})
 
 
@@ -479,6 +480,63 @@ class PETTrackActor(PETTrackBaseActor):
         second_area = second[:, 2] * second[:, 3]
         return intersection / (
             first_area + second_area - intersection).clamp_min(1e-8)
+
+    @staticmethod
+    def _discrimination_ranking_loss(
+            score_map, target_boxes, present, margin):
+        if score_map.ndim != 4 or score_map.shape[1] != 1:
+            raise ValueError(
+                "discrimination score_map must have shape [B, 1, H, W]")
+        target_boxes = torch.as_tensor(
+            target_boxes, device=score_map.device, dtype=score_map.dtype)
+        present = torch.as_tensor(
+            present, device=score_map.device, dtype=torch.bool).reshape(-1)
+        if target_boxes.shape != (score_map.shape[0], 4) \
+                or present.numel() != score_map.shape[0]:
+            raise ValueError(
+                "discrimination targets must match the score-map batch")
+
+        height, width = score_map.shape[-2:]
+        centers = target_boxes[:, :2] + 0.5 * target_boxes[:, 2:]
+        center_x = (centers[:, 0] * width).round().long()
+        center_y = (centers[:, 1] * height).round().long()
+        radius_x = torch.ceil(
+            0.5 * target_boxes[:, 2] * width).long().clamp_min(1)
+        radius_y = torch.ceil(
+            0.5 * target_boxes[:, 3] * height).long().clamp_min(1)
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(height, device=score_map.device),
+            torch.arange(width, device=score_map.device),
+            indexing="ij",
+        )
+        target_region = (
+            (grid_x[None] - center_x[:, None, None]).abs()
+            <= radius_x[:, None, None]
+        ) & (
+            (grid_y[None] - center_y[:, None, None]).abs()
+            <= radius_y[:, None, None]
+        )
+        valid = present \
+            & (center_x >= 0) & (center_x < width) \
+            & (center_y >= 0) & (center_y < height) \
+            & (~target_region).flatten(1).any(dim=1)
+        zero = score_map.float().sum() * 0.0
+        if not bool(valid.any()):
+            return zero, zero.detach(), zero.detach(), 0, zero.detach()
+
+        scores = score_map[:, 0].float()
+        target_scores = scores.masked_fill(~target_region, float("-inf"))
+        distractor_scores = scores.masked_fill(target_region, float("-inf"))
+        positive = target_scores.flatten(1).max(dim=1).values[valid]
+        hardest_negative = distractor_scores.flatten(1).max(dim=1).values[valid]
+        violations = F.relu(float(margin) - positive + hardest_negative)
+        return (
+            violations.mean(),
+            positive.mean().detach(),
+            hardest_negative.mean().detach(),
+            int(valid.sum()),
+            (violations > 0).float().mean().detach(),
+        )
 
     def _forward_pursuit(self, data):
         """Unroll controller or one specialist over prediction-driven crops."""
@@ -1230,6 +1288,54 @@ class PETTrackActor(PETTrackBaseActor):
             loss = torch.stack(specialist_losses).sum() / specialist_weight
         else:
             loss = controller_loss
+        discrimination_loss = loss * 0.0
+        discrimination_positive = loss.detach() * 0.0
+        discrimination_negative = loss.detach() * 0.0
+        discrimination_violation_rate = loss.detach() * 0.0
+        discrimination_frame_count = 0
+        if specialist_id == DISCRIMINATION_EXPERT_ID:
+            ranking_losses = []
+            ranking_weights = []
+            positive_sums = []
+            negative_sums = []
+            violation_sums = []
+            margin = float(getattr(
+                train_cfg, "DISCRIMINATION_RANKING_MARGIN", 0.2))
+            for index, output in enumerate(specialist_outputs):
+                if "score_map" not in output:
+                    raise RuntimeError(
+                        "discrimination pursuit requires specialist score maps")
+                step_loss, positive, negative, count, violation_rate = (
+                    self._discrimination_ranking_loss(
+                        output["score_map"],
+                        predictions["pursuit_specialist_targets"][index],
+                        predictions["pursuit_specialist_present"][index],
+                        margin,
+                    )
+                )
+                if count == 0:
+                    continue
+                weight = output["score_map"].new_tensor(float(count))
+                ranking_losses.append(step_loss * weight)
+                ranking_weights.append(weight)
+                positive_sums.append(positive * weight)
+                negative_sums.append(negative * weight)
+                violation_sums.append(violation_rate * weight)
+                discrimination_frame_count += count
+            if ranking_losses:
+                ranking_weight = torch.stack(ranking_weights).sum()
+                discrimination_loss = (
+                    torch.stack(ranking_losses).sum() / ranking_weight)
+                discrimination_positive = (
+                    torch.stack(positive_sums).sum() / ranking_weight)
+                discrimination_negative = (
+                    torch.stack(negative_sums).sum() / ranking_weight)
+                discrimination_violation_rate = (
+                    torch.stack(violation_sums).sum() / ranking_weight)
+                weight = float(getattr(
+                    train_cfg, "DISCRIMINATION_RANKING_WEIGHT", 1.0))
+                loss = loss + weight * discrimination_loss
+
         motion_loss = loss * 0.0
         motion_pair_count = 0
         if specialist_id == MOTION_EXPERT_ID:
@@ -1285,6 +1391,20 @@ class PETTrackActor(PETTrackBaseActor):
         status["Loss/motion_displacement_weighted"] = float(
             (motion_weight * motion_loss).detach())
         status["MotionTrain/pair_count"] = motion_pair_count
+        discrimination_weight = float(getattr(
+            train_cfg, "DISCRIMINATION_RANKING_WEIGHT", 1.0))
+        status["Loss/discrimination_ranking"] = float(
+            discrimination_loss.detach())
+        status["Loss/discrimination_ranking_weighted"] = float(
+            (discrimination_weight * discrimination_loss).detach())
+        status["DiscriminationTrain/frame_count"] = (
+            discrimination_frame_count)
+        status["DiscriminationTrain/target_peak"] = float(
+            discrimination_positive)
+        status["DiscriminationTrain/hardest_distractor_peak"] = float(
+            discrimination_negative)
+        status["DiscriminationTrain/violation_rate"] = float(
+            discrimination_violation_rate)
         if specialist_statuses:
             total_weight = sum(
                 float(weight.detach()) for _, weight in specialist_statuses)
