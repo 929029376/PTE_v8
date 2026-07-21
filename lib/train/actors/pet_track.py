@@ -133,10 +133,20 @@ class PETTrackActor(PETTrackBaseActor):
 
     # ------------------------------------------------------------------ #
     def train(self, mode=True):
-        if self.expert_phase not in {"dispatch", "recovery"}:
+        sparse_phases = {"specialize", "refine", "pursuit"}
+        if self.expert_phase not in sparse_phases | {"dispatch", "recovery"}:
             return super().train(mode)
         self.net.eval()
         model = self.net.module if hasattr(self.net, "module") else self.net
+        if self.expert_phase in sparse_phases:
+            if mode:
+                for module in model.modules():
+                    parameters = tuple(module.parameters())
+                    if (parameters
+                            and all(parameter.requires_grad
+                                    for parameter in parameters)):
+                        module.train(True)
+            return
         if self.expert_phase == "dispatch":
             model.expert_activator.train(mode)
             return

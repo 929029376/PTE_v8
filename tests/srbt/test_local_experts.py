@@ -846,6 +846,40 @@ def test_dispatch_training_keeps_frozen_modules_in_eval_mode():
     assert actor.net.expert_activator.training is False
 
 
+def test_specialist_training_keeps_frozen_parent_batchnorm_in_eval_mode():
+    class SpecialistModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen_parent = torch.nn.Sequential(
+                torch.nn.Linear(2, 2),
+                torch.nn.BatchNorm1d(2),
+            )
+            self.small_target_expert = torch.nn.Sequential(
+                torch.nn.Linear(2, 2),
+                torch.nn.BatchNorm1d(2),
+                torch.nn.Dropout(0.1),
+            )
+            for parameter in self.frozen_parent.parameters():
+                parameter.requires_grad_(False)
+
+    actor = object.__new__(PETTrackActor)
+    actor.net = SpecialistModel()
+    actor.expert_phase = "specialize"
+
+    actor.train(True)
+
+    assert actor.net.training is False
+    assert actor.net.frozen_parent.training is False
+    assert actor.net.frozen_parent[1].training is False
+    assert actor.net.small_target_expert.training is True
+    assert actor.net.small_target_expert[1].training is True
+    assert actor.net.small_target_expert[2].training is True
+
+    actor.train(False)
+    assert actor.net.training is False
+    assert actor.net.small_target_expert.training is False
+
+
 def test_recovery_training_keeps_tracker_eval_and_only_recovery_heads_train():
     class RecoveryModel(torch.nn.Module):
         def __init__(self):
