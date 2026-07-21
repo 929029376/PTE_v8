@@ -52,7 +52,7 @@ MODEL:
   PRETRAINED_BASELINE_CKPT: "pretrained_networks/AMTTrack_ep0098.pth.tar"
   PRETRAINED_SRBT_CKPT: ""
   PRETRAINED_EXPERT_CKPT: ""
-  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/causal_event_motion_v34_20260721/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
+  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/causal_event_motion_exclusive_v35_20260721/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
   EXPERT:
     ENABLE: true
     DEFAULT: generalist
