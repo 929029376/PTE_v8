@@ -4,7 +4,12 @@ from pathlib import Path
 
 import _init_paths  # noqa: F401
 
-from lib.train.data.challenge_manifest import build_sequence_record, write_manifest
+from lib.train.data.challenge_manifest import (
+    DEFAULT_LOW_LIGHT_CONTEXT_MEDIAN,
+    DEFAULT_LOW_LIGHT_SEARCH_FACTOR,
+    build_sequence_record,
+    write_manifest,
+)
 from lib.train.data.felt_challenges import (
     CHALLENGE_NAMES,
     DEFAULT_AMBIGUITY_THRESHOLD,
@@ -91,6 +96,12 @@ def parse_args():
         default=DEFAULT_AMBIGUITY_THRESHOLD)
     parser.add_argument("--recovery-window", type=int,
                         default=DEFAULT_RECOVERY_WINDOW)
+    parser.add_argument(
+        "--low-light-context-median", type=float,
+        default=DEFAULT_LOW_LIGHT_CONTEXT_MEDIAN)
+    parser.add_argument(
+        "--low-light-search-factor", type=float,
+        default=DEFAULT_LOW_LIGHT_SEARCH_FACTOR)
     return parser.parse_args()
 
 
@@ -101,6 +112,8 @@ def main():
         "motion_norm": args.motion_norm,
         "ambiguity_threshold": args.ambiguity_threshold,
         "recovery_window": args.recovery_window,
+        "low_light_context_median": args.low_light_context_median,
+        "low_light_search_factor": args.low_light_search_factor,
     }
     dataset = Felt(
         root=str(Path(args.data_root).expanduser()),

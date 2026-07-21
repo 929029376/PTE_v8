@@ -13,8 +13,8 @@ DATA:
   CHALLENGE_SAMPLING:
     ENABLE: true
     PRECISE: true
-    MANIFEST: /root/fnvme/PTE_v8_manifests/felt_train_challenges_v2.json
-    VAL_MANIFEST: /root/fnvme/PTE_v8_manifests/felt_val_challenges_v2.json
+    MANIFEST: /root/fnvme/PTE_v8_manifests/felt_train_challenges_v3.json
+    VAL_MANIFEST: /root/fnvme/PTE_v8_manifests/felt_val_challenges_v3.json
   PURSUIT:
     ENABLE: true
     WINDOW_LENGTH: 8

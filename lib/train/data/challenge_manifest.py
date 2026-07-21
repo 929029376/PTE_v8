@@ -16,9 +16,8 @@ from lib.train.data.felt_challenges import (
     classify_felt_challenges,
 )
 
-DEFAULT_LOW_LIGHT_APS_MEAN = 8.2656
-DEFAULT_LOW_LIGHT_TARGET_MEAN = 6.8185
-DEFAULT_LOW_LIGHT_CONTRAST = 4.22215
+DEFAULT_LOW_LIGHT_CONTEXT_MEDIAN = 8.2656
+DEFAULT_LOW_LIGHT_SEARCH_FACTOR = 4.0
 
 
 def _grayscale_frames(frames, name):
@@ -45,6 +44,22 @@ def _box_slice(box, height, width):
     y1 = max(0, min(height, int(round(y))))
     x2 = max(x1, min(width, int(round(x + w))))
     y2 = max(y1, min(height, int(round(y + h))))
+    return None if x2 <= x1 or y2 <= y1 else (slice(y1, y2), slice(x1, x2))
+
+
+def _search_context_slice(box, height, width, search_factor):
+    if float(search_factor) <= 0:
+        raise ValueError("low-light search factor must be positive")
+    x, y, w, h = torch.as_tensor(box, dtype=torch.float32).tolist()
+    crop_size = math.ceil(math.sqrt(w * h) * float(search_factor))
+    if crop_size < 1:
+        return None
+    x1 = round(x + 0.5 * w - 0.5 * crop_size)
+    y1 = round(y + 0.5 * h - 0.5 * crop_size)
+    x2 = min(width, x1 + crop_size)
+    y2 = min(height, y1 + crop_size)
+    x1 = max(0, x1)
+    y1 = max(0, y1)
     return None if x2 <= x1 or y2 <= y1 else (slice(y1, y2), slice(x1, x2))
 
 
@@ -154,9 +169,8 @@ def build_sequence_record(dataset, seq_id, thresholds=None):
         "motion_norm": DEFAULT_MOTION_NORM,
         "ambiguity_threshold": DEFAULT_AMBIGUITY_THRESHOLD,
         "recovery_window": DEFAULT_RECOVERY_WINDOW,
-        "low_light_aps_mean": DEFAULT_LOW_LIGHT_APS_MEAN,
-        "low_light_target_mean": DEFAULT_LOW_LIGHT_TARGET_MEAN,
-        "low_light_contrast": DEFAULT_LOW_LIGHT_CONTRAST,
+        "low_light_context_median": DEFAULT_LOW_LIGHT_CONTEXT_MEDIAN,
+        "low_light_search_factor": DEFAULT_LOW_LIGHT_SEARCH_FACTOR,
         **(thresholds or {}),
     }
     info = dataset.get_sequence_info(seq_id)
@@ -186,19 +200,17 @@ def build_sequence_record(dataset, seq_id, thresholds=None):
             and boxes[frame_id, 3] > 0
         )
         if valid:
-            target_slice = _box_slice(
-                boxes[frame_id], current_aps.shape[-2], current_aps.shape[-1])
-            target_mean = (
-                current_aps[target_slice].mean()
-                if target_slice is not None else current_aps.new_tensor(float("inf"))
+            context_slice = _search_context_slice(
+                boxes[frame_id], current_aps.shape[-2], current_aps.shape[-1],
+                thresholds["low_light_search_factor"])
+            context_median = (
+                current_aps[context_slice].median()
+                if context_slice is not None
+                else current_aps.new_tensor(float("inf"))
             )
-            frame_mean = current_aps.mean()
             low_light[frame_id] = bool(
-                frame_mean <= thresholds["low_light_aps_mean"]
-                and target_mean <= thresholds["low_light_target_mean"]
-                and torch.abs(target_mean - frame_mean)
-                <= thresholds["low_light_contrast"]
-            )
+                context_median
+                <= thresholds["low_light_context_median"])
             if template_frame is None:
                 template_frame = current_aps.clone()
                 template_box = boxes[frame_id].clone()

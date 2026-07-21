@@ -354,6 +354,47 @@ def test_sequence_record_persists_overlapping_challenge_attributes():
     }
 
 
+def test_dark_search_context_with_bright_target_is_not_exclusive_motion():
+    manifest_module = importlib.import_module(
+        "lib.train.data.challenge_manifest")
+    challenge_module = importlib.import_module(
+        "lib.train.data.felt_challenges")
+
+    class Dataset:
+        def get_sequence_info(self, seq_id):
+            return {
+                "bbox": torch.tensor([
+                    [8.0, 8.0, 2.0, 2.0],
+                    [12.0, 8.0, 2.0, 2.0],
+                ]),
+                "absent": torch.ones(2, dtype=torch.uint8),
+            }
+
+        def get_frames(self, seq_id, frame_ids, anno):
+            frame_id = frame_ids[0]
+            image = torch.full((32, 32, 3), 100.0)
+            x = 8 if frame_id == 0 else 12
+            image[5:13, x - 3:x + 5] = 0.0
+            image[8:10, x:x + 2] = 100.0
+            event = torch.zeros_like(image)
+            event[8:10, x:x + 2] = 1.0
+            return [image], [event], {}, {}
+
+    record = manifest_module.build_sequence_record(Dataset(), 0)
+    attributes = record["attributes"]
+
+    assert attributes["motion"] == [False, True]
+    assert attributes["low_light"] == [True, True]
+    exclusive = challenge_module.exclusive_specialist_supervision_mask(
+        attributes)
+    assert exclusive[1, challenge_module.MOTION].item() is False
+    assert exclusive[1, challenge_module.DISCRIMINATION].item() is False
+
+    with pytest.raises(ValueError, match="search factor must be positive"):
+        manifest_module.build_sequence_record(
+            Dataset(), 0, {"low_light_search_factor": 0.0})
+
+
 def test_manifest_builder_cli_documents_required_paths():
     project_root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
@@ -369,6 +410,8 @@ def test_manifest_builder_cli_documents_required_paths():
     assert "--split" in result.stdout
     assert "--output" in result.stdout
     assert "--workers" in result.stdout
+    assert "--low-light-context-median" in result.stdout
+    assert "--low-light-search-factor" in result.stdout
 
 
 def test_manifest_builder_parallel_workers_preserve_all_sequences(tmp_path):
