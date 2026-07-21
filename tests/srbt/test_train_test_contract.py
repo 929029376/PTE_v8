@@ -1062,6 +1062,26 @@ def test_dart_reliability_config_is_isolated_recovery_training():
     assert configured.TRAIN.DART_LOSS.GEOMETRY_WEIGHT > 0
 
 
+def test_dart_duration_config_trains_only_decoder_from_v39_latest():
+    from copy import deepcopy
+    from lib.config.pet_track.config import cfg, update_config_from_file
+
+    configured = deepcopy(cfg)
+    update_config_from_file(
+        "experiments/pet_track/felt_pet_track_dart_duration.yaml",
+        configured,
+    )
+
+    assert configured.TRAIN.EXPERT_PHASE == "recovery"
+    assert configured.TRAIN.DART_DECODER_ONLY is True
+    assert configured.TRAIN.EPOCH == 12
+    assert configured.TRAIN.BEST_METRIC == "Loss/dart_decoder"
+    assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
+    assert "dart_reliability_v39_20260721" in configured.MODEL.INIT_CHECKPOINT
+    assert configured.MODEL.INIT_CHECKPOINT.endswith(
+        "PETTrack_latest.pth.tar")
+
+
 def test_recovery_stage_report_names_all_active_dart_losses(capsys):
     from lib.models.pet_track.pet_track import _print_stage_report
 
@@ -1074,15 +1094,16 @@ def test_recovery_stage_report_names_all_active_dart_losses(capsys):
     assert "identity" in report
 
 
-def test_supervisor_uses_dart_reliability_v39_run_directory():
+def test_supervisor_uses_dart_duration_v40_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "dart_reliability_v39_20260721" in supervisor
-    assert "--config felt_pet_track_dart_reliability" in supervisor
-    assert "CONFIG_NAME=\"felt_pet_track_dart_reliability\"" in supervisor
+    assert "dart_duration_v40_20260721" in supervisor
+    assert "--config felt_pet_track_dart_duration" in supervisor
+    assert "CONFIG_NAME=\"felt_pet_track_dart_duration\"" in supervisor
+    assert "dart_reliability_v39_20260721" not in supervisor
     assert "causal_event_motion_context_v38_20260721" not in supervisor
     assert "sparse_dispatch_balanced_v32_20260720" not in supervisor
     assert "sparse_dispatch_v31_20260720" not in supervisor
@@ -1107,7 +1128,7 @@ def test_supervisor_uses_dart_reliability_v39_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "dart_reliability_v39_20260721/logs && exec") == 2
+        "dart_duration_v40_20260721/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

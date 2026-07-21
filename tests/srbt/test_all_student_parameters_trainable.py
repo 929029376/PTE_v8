@@ -220,6 +220,34 @@ def test_dispatch_trains_only_the_expert_activator():
     }
 
 
+def test_recovery_decoder_only_owns_exactly_duration_decoder_parameters():
+    model = TinyStudent()
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "recovery"
+    cfg.TRAIN.DART_DECODER_ONLY = True
+
+    groups = _optimizer_groups(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    expected = {
+        name for name, _ in model.duration_evidence_decoder.named_parameters(
+            prefix="duration_evidence_decoder")
+    }
+    assert trainable == expected
+    expected_parameters = list(model.duration_evidence_decoder.parameters())
+    assert sum(parameter.numel() for parameter in model.parameters()
+               if parameter.requires_grad) == sum(
+                   parameter.numel() for parameter in expected_parameters)
+    assert len(expected_parameters) == 4
+    assert [group["name"] for group in groups] == ["recovery"]
+    assert {id(parameter) for parameter in groups[0]["params"]} == {
+        id(parameter) for parameter in expected_parameters
+    }
+
+
 def test_precision_expert_specialization_trains_only_independent_branch():
     model = TinyStudent()
     cfg = _cfg()

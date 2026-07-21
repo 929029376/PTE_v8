@@ -276,6 +276,8 @@ def _optimizer_groups(net, cfg):
             )):
                 parameter.requires_grad_(True)
     elif expert_phase == "recovery":
+        dart_decoder_only = bool(getattr(
+            cfg.TRAIN, "DART_DECODER_ONLY", False))
         recovery_modules = (
             getattr(model, "visibility_gate", None),
             getattr(model, "localization_validity_gate", None),
@@ -289,7 +291,11 @@ def _optimizer_groups(net, cfg):
                 "RGB identity verifier, and redetection expert")
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        for module in recovery_modules:
+        modules_to_train = (
+            (getattr(model, "duration_evidence_decoder"),)
+            if dart_decoder_only else recovery_modules
+        )
+        for module in modules_to_train:
             for parameter in module.parameters():
                 parameter.requires_grad_(True)
     elif expert_phase == "pursuit":
