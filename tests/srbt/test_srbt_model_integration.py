@@ -181,6 +181,21 @@ def test_shared_model_forward_returns_four_shared_expert_outputs():
     assert len(output["expert_outputs"]) == 4
 
 
+def test_each_expert_candidate_has_candidate_conditioned_reliability():
+    model = _model(expert_enabled=True)
+    output = model(*_images(batch=1))
+
+    observability = output["presence_score"]
+    for expert_output in output["expert_outputs"].values():
+        reliability = expert_output["reliability_predictions"]
+        assert torch.equal(
+            reliability["observability_score"], observability)
+        assert torch.allclose(
+            reliability["acceptance_score"],
+            observability * reliability["localization_validity_score"],
+        )
+
+
 def test_inference_presence_gate_uses_visibility_expert_response():
     class CaptureGate(torch.nn.Module):
         def forward(self, pooled_feature, response_stats):
@@ -313,7 +328,14 @@ def test_inference_runs_shared_and_small_paths_once_and_returns_five_candidates(
         "score_map"].shape[-2:] == (4, 4)
     for name in model.shared_expert_names:
         for key, value in shared_only["expert_outputs"][name].items():
-            assert torch.equal(output["expert_outputs"][name][key], value)
+            if key == "reliability_predictions":
+                for reliability_key, reliability_value in value.items():
+                    assert torch.equal(
+                        output["expert_outputs"][name][key][reliability_key],
+                        reliability_value,
+                    )
+            else:
+                assert torch.equal(output["expert_outputs"][name][key], value)
     for key, value in shared_only.items():
         if key == "expert_outputs":
             continue

@@ -305,6 +305,12 @@ class PETTrack(BaseTracker):
             weights = weights.detach().cpu().tolist()
         presence_score = self._diagnostic_scalar(
             candidate.get("presence_score"))
+        observability_score = self._diagnostic_scalar(
+            candidate.get("observability_score"))
+        localization_validity_score = self._diagnostic_scalar(
+            candidate.get("localization_validity_score"))
+        acceptance_score = self._diagnostic_scalar(
+            candidate.get("acceptance_score"))
         controller = getattr(self, "visibility_controller", None)
         self._search_diagnostics.append({
             "frame_id": int(self.frame_id if frame_id is None else frame_id),
@@ -318,6 +324,9 @@ class PETTrack(BaseTracker):
             "previous_action": str(previous_action),
             "action": str(action),
             "presence_score": presence_score,
+            "observability_score": observability_score,
+            "localization_validity_score": localization_validity_score,
+            "acceptance_score": acceptance_score,
             "controller_output_score": self._diagnostic_scalar(
                 controller_output_score),
             "theta_present": self._diagnostic_scalar(
@@ -486,6 +495,9 @@ class PETTrack(BaseTracker):
             response_maps = []
             response_peaks = []
             response_psr = []
+            localization_validity = []
+            acceptance_scores = []
+            observability_scores = []
             for name in active_names:
                 expert_output = expert_outputs[name]
                 score_map = expert_output["score_map"]
@@ -510,18 +522,39 @@ class PETTrack(BaseTracker):
                     self.map_box_back(
                         pred_box, resize_factor, reference_state),
                     height, width, margin=10))
+                reliability = expert_output.get("reliability_predictions")
+                if reliability is None and name == expert_names[0]:
+                    reliability = out_dict.get("reliability_predictions")
+                if reliability is None:
+                    localization_validity.append(None)
+                    acceptance_scores.append(None)
+                    observability_scores.append(None)
+                else:
+                    localization_validity.append(
+                        reliability["localization_validity_score"][0])
+                    acceptance_scores.append(
+                        reliability["acceptance_score"][0])
+                    observability_scores.append(
+                        reliability["observability_score"][0])
             response_stack = torch.cat(response_maps, dim=0)
             boxes = torch.as_tensor(
                 mapped_boxes, device=response_stack.device,
                 dtype=response_stack.dtype)
             if forced_expert_id is None:
+                candidate_validity = (
+                    torch.stack(localization_validity)
+                    if all(value is not None for value in localization_validity)
+                    else None
+                )
                 ensemble = fuse_expert_predictions(
                     boxes=boxes,
                     response_peaks=torch.stack(response_peaks),
                     response_psr=torch.stack(response_psr),
+                    localization_validity=candidate_validity,
                     last_box=(self.state if reference_state is None
                               else reference_state),
                 )
+                selected_local_id = ensemble.retained_ids[0]
                 candidate_state = clip_box(
                     ensemble.box.detach().cpu().tolist(),
                     height, width, margin=10)
@@ -546,6 +579,7 @@ class PETTrack(BaseTracker):
                     dtype=response_stack.dtype,
                 )
                 local_weights[local_id] = 1.0
+                selected_local_id = local_id
                 retained_expert_ids = (forced_expert_id,)
             generalist_state = list(mapped_boxes[0])
             expert_states = [
@@ -562,6 +596,9 @@ class PETTrack(BaseTracker):
                 expert_psr_values[expert_id] = float(
                     response_psr[local_id].detach().item())
                 ensemble_weights[expert_id] = local_weights[local_id]
+            selected_observability = observability_scores[selected_local_id]
+            selected_localization = localization_validity[selected_local_id]
+            selected_acceptance = acceptance_scores[selected_local_id]
         else:
             response = self.output_window * out_dict['score_map']
             pred_box = (
@@ -580,12 +617,25 @@ class PETTrack(BaseTracker):
             expert_states = [list(candidate_state) for _ in expert_names]
             expert_peaks = []
             expert_psr_values = []
+            reliability = out_dict.get("reliability_predictions")
+            selected_observability = (
+                None if reliability is None
+                else reliability["observability_score"][0])
+            selected_localization = (
+                None if reliability is None
+                else reliability["localization_validity_score"][0])
+            selected_acceptance = (
+                None if reliability is None
+                else reliability["acceptance_score"][0])
 
         return {
             "state": candidate_state,
             "score_peak": float(response.max().item()),
             "response": response,
             "presence_score": out_dict.get("presence_score"),
+            "observability_score": selected_observability,
+            "localization_validity_score": selected_localization,
+            "acceptance_score": selected_acceptance,
             "memory_frame_open": True,
             "retained_expert_ids": retained_expert_ids,
             "active_expert_ids": active_expert_ids,
@@ -605,13 +655,15 @@ class PETTrack(BaseTracker):
     def _step_srbt_controller(self, local_candidate,
                               identity_score=None,
                               localization_score=None,
-                              presence_score=None):
+                              acceptance_score=None):
         if local_candidate is None:
             return None
-        presence_score = (
-            local_candidate.get("presence_score")
-            if presence_score is None else presence_score)
-        if presence_score is None:
+        acceptance_score = (
+            local_candidate.get("acceptance_score")
+            if acceptance_score is None else acceptance_score)
+        if acceptance_score is None:
+            acceptance_score = local_candidate.get("presence_score")
+        if acceptance_score is None:
             return None
         if not getattr(self, "srbt_controller_enabled", True):
             return ControllerAction(
@@ -619,12 +671,12 @@ class PETTrack(BaseTracker):
                 allow_recent_write=False,
                 allow_long_write=False,
                 output_absent=False,
-                output_score=float(presence_score),
+                output_score=float(acceptance_score),
             )
         if identity_score is None and localization_score is None:
-            return self.visibility_controller.step(presence_score)
+            return self.visibility_controller.step(acceptance_score)
         return self.visibility_controller.step(
-            presence_score,
+            acceptance_score,
             identity_score,
             localization_score,
         )
@@ -679,11 +731,19 @@ class PETTrack(BaseTracker):
         if accepted is None or accepted.numel() == 0 or not bool(accepted[0].any()):
             return None
         accepted_ids = accepted[0].nonzero(as_tuple=False).flatten()
-        combined = recovery["combined_scores"][0].index_select(0, accepted_ids)
-        best_id = accepted_ids[int(combined.argmax().item())]
-        identity = float(recovery["identity_scores"][0, best_id].item())
-        localization = float(recovery["localization_scores"][0, best_id].item())
-        return identity, localization
+        localization = recovery[
+            "localization_validity_scores"][0].index_select(0, accepted_ids)
+        best_id = accepted_ids[int(localization.argmax().item())]
+        return {
+            "identity_score": float(
+                recovery["identity_scores"][0, best_id].item()),
+            "observability_score": float(
+                recovery["observability_scores"][0, best_id].item()),
+            "localization_validity_score": float(
+                recovery["localization_validity_scores"][0, best_id].item()),
+            "acceptance_score": float(
+                recovery["acceptance_scores"][0, best_id].item()),
+        }
 
     def _run_recovery_cycle(self, image, event_image, H, W):
         self._pending_redetect_box = None
@@ -733,12 +793,12 @@ class PETTrack(BaseTracker):
                 if confirmation is None:
                     srbt_control = self._step_srbt_controller(local_candidate)
                 else:
-                    identity, localization = confirmation
                     srbt_control = self._step_srbt_controller(
                         local_candidate,
-                        identity_score=identity,
-                        localization_score=localization,
-                        presence_score=localization,
+                        identity_score=confirmation["identity_score"],
+                        localization_score=confirmation[
+                            "localization_validity_score"],
+                        acceptance_score=confirmation["acceptance_score"],
                     )
             else:
                 srbt_control = self._step_srbt_controller(local_candidate)
@@ -747,12 +807,13 @@ class PETTrack(BaseTracker):
                     recovery = self._run_recovery_cycle(image, event_image, H, W)
                     confirmation = self._best_recovery_confirmation(recovery)
                     if confirmation is not None:
-                        identity, localization = confirmation
                         srbt_control = self._step_srbt_controller(
                             local_candidate,
-                            identity_score=identity,
-                            localization_score=localization,
-                            presence_score=localization,
+                            identity_score=confirmation["identity_score"],
+                            localization_score=confirmation[
+                                "localization_validity_score"],
+                            acceptance_score=confirmation[
+                                "acceptance_score"],
                         )
 
             if srbt_control is None:
@@ -821,6 +882,9 @@ class PETTrack(BaseTracker):
                 "action": action,
                 "event_centers": [],
                 "identity_scores": [],
+                "observability_scores": [],
+                "localization_validity_scores": [],
+                "acceptance_scores": [],
             }
             if action in ("absent", "verify") and recovery is not None:
                 diagnostic["event_centers"] = list(
@@ -829,6 +893,12 @@ class PETTrack(BaseTracker):
                     recovery["identity_scores"][0]
                     .detach().cpu().tolist()
                 )
+                for key in (
+                        "observability_scores",
+                        "localization_validity_scores",
+                        "acceptance_scores"):
+                    diagnostic[key] = (
+                        recovery[key][0].detach().cpu().tolist())
             if not hasattr(self, "_recovery_diagnostics"):
                 self._recovery_diagnostics = []
             self._recovery_diagnostics.append(diagnostic)
@@ -1049,7 +1119,7 @@ class PETTrack(BaseTracker):
             (identity_scores, localization_scores), dim=-1)
         observed = {
             "boxes": global_boxes,
-            "field_scores": recovery["combined_scores"][0],
+            "field_scores": recovery["acceptance_scores"][0],
             "identity": identities,
             "active_mask": accepted,
         }

@@ -148,6 +148,7 @@ def _temporal_consistency(boxes, last_box, eps=1e-6):
 
 def fuse_expert_predictions(
         boxes, response_peaks, response_psr, last_box,
+        localization_validity=None,
         cluster_iou=0.50, reject_consensus=0.15,
         specialist_margin=1.05, minimum_quality=0.10):
     """Select one expert box, falling back to the exact generalist box."""
@@ -173,6 +174,20 @@ def fuse_expert_predictions(
         * consensus.pow(0.25)
         * temporal.pow(0.15)
     )
+    if localization_validity is not None:
+        validity = torch.as_tensor(
+            localization_validity,
+            device=boxes.device,
+            dtype=boxes.dtype,
+        ).reshape(-1)
+        if validity.shape != (expert_count,):
+            raise ValueError(
+                "localization_validity must have shape (E,)")
+        if not torch.isfinite(validity).all() or torch.any(
+                (validity < 0.0) | (validity > 1.0)):
+            raise ValueError(
+                "localization_validity must be finite and in [0, 1]")
+        quality = validity
 
     eligible = torch.ones(
         expert_count, dtype=torch.bool, device=boxes.device)

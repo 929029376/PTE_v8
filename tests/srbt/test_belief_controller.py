@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from lib.models.layers.srbt_controller import (
@@ -182,7 +183,7 @@ def test_builder_reads_visibility_controller_thresholds():
     assert controller.long_stable_frames == 7
 
 
-def test_tracker_passes_only_local_presence_to_controller():
+def test_tracker_uses_candidate_acceptance_for_commit_control():
     class _Recorder:
         def __init__(self):
             self.args = None
@@ -200,9 +201,31 @@ def test_tracker_passes_only_local_presence_to_controller():
 
     result = PETTrack._step_srbt_controller(tracker, {
         "presence_score": 0.82,
+        "observability_score": 0.82,
+        "localization_validity_score": 0.5,
+        "acceptance_score": 0.41,
     })
     assert result == "controlled"
-    assert tracker.visibility_controller.args == (0.82,)
+    assert tracker.visibility_controller.args == (0.41,)
+
+
+def test_recovery_confirmation_ranks_by_localization_and_preserves_factors():
+    recovery = {
+        "accepted": torch.tensor([[True, True]]),
+        "identity_scores": torch.tensor([[0.95, 0.80]]),
+        "observability_scores": torch.tensor([[0.90, 0.85]]),
+        "localization_validity_scores": torch.tensor([[0.55, 0.90]]),
+        "acceptance_scores": torch.tensor([[0.495, 0.765]]),
+    }
+
+    confirmation = PETTrack._best_recovery_confirmation(recovery)
+
+    assert confirmation == pytest.approx({
+        "identity_score": 0.8,
+        "observability_score": 0.85,
+        "localization_validity_score": 0.9,
+        "acceptance_score": 0.765,
+    })
 
 
 def test_tracker_bypasses_untrained_srbt_gate_when_disabled():
@@ -368,7 +391,12 @@ def test_track_commits_final_refined_motion_event_once(monkeypatch):
     tracker._search_state_for_frame = lambda: list(tracker.state)
     tracker._run_local_candidate = lambda *_args, **_kwargs: initial_candidate
     tracker._run_recovery_cycle = lambda *_args: {}
-    tracker._best_recovery_confirmation = lambda _recovery: (0.9, 0.9)
+    tracker._best_recovery_confirmation = lambda _recovery: {
+        "identity_score": 0.9,
+        "observability_score": 0.9,
+        "localization_validity_score": 0.9,
+        "acceptance_score": 0.81,
+    }
     tracker._step_srbt_controller = lambda *_args, **_kwargs: SimpleNamespace(
         action=Action.TRACK,
         output_score=0.9,

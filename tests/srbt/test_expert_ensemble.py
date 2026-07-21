@@ -89,6 +89,25 @@ def test_clearly_superior_specialist_is_selected_without_box_averaging():
     assert torch.equal(result.weights, torch.tensor([0., 1., 0., 0., 0.]))
 
 
+def test_localization_validity_ranks_candidates_before_response_quality():
+    boxes = torch.tensor([
+        [10.0, 10.0, 20.0, 20.0],
+        [11.0, 10.0, 20.0, 20.0],
+    ])
+
+    result = fuse_expert_predictions(
+        boxes=boxes,
+        response_peaks=torch.tensor([0.99, 0.60]),
+        response_psr=torch.tensor([0.99, 0.60]),
+        localization_validity=torch.tensor([0.10, 0.90]),
+        last_box=boxes[0],
+        specialist_margin=1.0,
+    )
+
+    assert result.retained_ids == (1,)
+    assert torch.equal(result.box, boxes[1])
+
+
 def test_zero_quality_falls_back_to_generalist():
     boxes = torch.tensor([
         [0.0, 0.0, 5.0, 5.0],

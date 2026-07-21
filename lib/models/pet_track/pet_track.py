@@ -343,16 +343,11 @@ class PETTrack(nn.Module):
         recovery_cfg = getattr(self.cfg.MODEL, "REDETECT", None)
         identity_threshold = float(getattr(
             recovery_cfg, "IDENTITY_THRESHOLD", 0.75))
-        localization_threshold = float(getattr(
-            recovery_cfg, "LOCALIZATION_THRESHOLD", 0.50))
+        acceptance_threshold = float(getattr(
+            recovery_cfg, "ACCEPTANCE_THRESHOLD", 0.50))
         accepted = (
             (identity_scores >= identity_threshold)
-            & (localization_scores >= localization_threshold)
-        )
-        combined_scores = (
-            0.55 * identity_scores
-            + 0.40 * localization_scores
-            + 0.05 * event_normalized
+            & (acceptance_scores >= acceptance_threshold)
         )
         return {
             "boxes": boxes,
@@ -362,9 +357,30 @@ class PETTrack(nn.Module):
             "localization_validity_scores": localization_scores,
             "acceptance_scores": acceptance_scores,
             "event_scores": event_scores,
-            "combined_scores": combined_scores,
             "accepted": accepted,
         }
+
+    def _candidate_reliability(self, score_map, pred_boxes, observability):
+        localization_logits = self.localization_validity_gate(
+            score_map, pred_boxes[:, 0])
+        localization_score = localization_logits.softmax(dim=-1)[:, 1]
+        return {
+            "observability_score": observability,
+            "localization_validity_score": localization_score,
+            "localization_validity_logits": localization_logits,
+            "acceptance_score": factorize_reliability(
+                observability, localization_score),
+        }
+
+    def _attach_expert_reliability(self, expert_outputs, observability):
+        for expert_output in expert_outputs.values():
+            expert_output["reliability_predictions"] = (
+                self._candidate_reliability(
+                    expert_output["score_map"],
+                    expert_output["pred_boxes"],
+                    observability,
+                )
+            )
 
     def _forward_redetect_training(self, zi, ze, redetect_images,
                                    redetect_event_images, redetect_mask):
@@ -746,12 +762,14 @@ class PETTrack(nn.Module):
         ), dim=-1)
         presence_logits = self.visibility_gate(feat.mean(dim=1), response_stats)
         presence_score = presence_logits.softmax(dim=-1)[:, 1]
-        localization_validity_logits = self.localization_validity_gate(
-            presence_output["score_map"], out["pred_boxes"][:, 0])
-        localization_validity_score = localization_validity_logits.softmax(
-            dim=-1)[:, 1]
-        acceptance_score = factorize_reliability(
-            presence_score, localization_validity_score)
+        expert_outputs = out.get("expert_outputs", {})
+        self._attach_expert_reliability(expert_outputs, presence_score)
+        reliability = (
+            expert_outputs[self.default_expert]["reliability_predictions"]
+            if self.default_expert in expert_outputs
+            else self._candidate_reliability(
+                out["score_map"], out["pred_boxes"], presence_score)
+        )
         out.update({
             "target_bbox": out["pred_boxes"][:, 0],
             "absent": 1.0 - presence_score >= 0.6,
@@ -762,12 +780,7 @@ class PETTrack(nn.Module):
                 "logits": presence_logits,
                 "score": presence_score,
             },
-            "reliability_predictions": {
-                "observability_score": presence_score,
-                "localization_validity_score": localization_validity_score,
-                "localization_validity_logits": localization_validity_logits,
-                "acceptance_score": acceptance_score,
-            },
+            "reliability_predictions": reliability,
         })
         redetect_predictions = self._forward_redetect_training(
             zi, ze, redetect_images, redetect_event_images, redetect_mask)
@@ -918,6 +931,11 @@ class PETTrack(nn.Module):
                 small_output,
                 upstream_output,
             )
+        small_output["reliability_predictions"] = self._candidate_reliability(
+            small_output["score_map"],
+            small_output["pred_boxes"],
+            out["presence_score"],
+        )
         active_experts = tuple(
             name for name in self.expert_names
             if name in shared_outputs or name == self.precision_refiner_name

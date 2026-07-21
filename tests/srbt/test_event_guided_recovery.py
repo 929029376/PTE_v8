@@ -175,7 +175,44 @@ def test_recovery_batches_candidates_and_requires_rgb_and_localization():
         output["localization_validity_scores"], output["localization_scores"])
     assert torch.allclose(
         output["acceptance_scores"], torch.tensor([[0.016, 0.95]]))
-    assert output["accepted"].tolist() == [[True, False]]
+    assert output["accepted"].tolist() == [[False, False]]
+    assert "combined_scores" not in output
+
+
+def test_recovery_acceptance_requires_identity_and_factorized_acceptance():
+    class IdentityProbe(torch.nn.Module):
+        def forward(self, _template, _candidates):
+            return torch.tensor([[0.9, 0.9]])
+
+    model = object.__new__(PETTrackModel)
+    torch.nn.Module.__init__(model)
+    model.rgb_identity_verifier = IdentityProbe()
+    model.cfg = SimpleNamespace(MODEL=SimpleNamespace(REDETECT=SimpleNamespace(
+        IDENTITY_THRESHOLD=0.75,
+        ACCEPTANCE_THRESHOLD=0.5,
+    )))
+    model.rgb_identity_tokens = lambda image, template: torch.zeros(
+        image.shape[0], 4, 8)
+    model.redetect_from_observations = lambda *args, **kwargs: {
+        "bbox": torch.tensor([
+            [0.5, 0.5, 0.2, 0.2],
+            [0.4, 0.4, 0.3, 0.3],
+        ]),
+        "conf": torch.tensor([0.9, 0.6]),
+    }
+
+    output = model.recover_from_candidates(
+        torch.zeros(1, 3, 8, 8),
+        torch.zeros(1, 3, 8, 8),
+        torch.zeros(1, 2, 3, 16, 16),
+        torch.zeros(1, 2, 3, 16, 16),
+        torch.tensor([[0.2, 1.0]]),
+        torch.rand(1, 2, 16, 16),
+    )
+
+    assert torch.allclose(
+        output["acceptance_scores"], torch.tensor([[0.18, 0.6]]))
+    assert output["accepted"].tolist() == [[False, True]]
 
 
 def test_recovery_field_uses_candidate_localization_gate_without_backbone_gradients():
@@ -326,7 +363,7 @@ def test_tracker_maps_and_persists_recovery_hypotheses_globally():
         "boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2]]]),
         "identity_scores": torch.tensor([[0.9]]),
         "localization_scores": torch.tensor([[0.8]]),
-        "combined_scores": torch.tensor([[0.85]]),
+        "acceptance_scores": torch.tensor([[0.72]]),
         "accepted": torch.tensor([[True]]),
         "_anchors": [[55.0, 55.0, 10.0, 10.0]],
         "_resize_factors": [1.0],
@@ -336,7 +373,7 @@ def test_tracker_maps_and_persists_recovery_hypotheses_globally():
         tracker, recovery, 100, 100)
 
     assert box == pytest.approx([50.0, 50.0, 20.0, 20.0])
-    assert confidence == pytest.approx(0.85)
+    assert confidence == pytest.approx(0.72)
     observed = tracker.hypothesis_tracker.observed
     assert observed["boxes"][0].tolist() == pytest.approx(
         [0.6, 0.6, 0.2, 0.2])
@@ -562,7 +599,9 @@ def test_two_current_recovery_confirmations_resume_tracking(monkeypatch):
     tracker._run_event_recovery = lambda *_args, **_kwargs: {
         "identity_scores": torch.tensor([[0.9]]),
         "localization_scores": torch.tensor([[0.9]]),
-        "combined_scores": torch.tensor([[0.9]]),
+        "observability_scores": torch.tensor([[0.9]]),
+        "localization_validity_scores": torch.tensor([[0.9]]),
+        "acceptance_scores": torch.tensor([[0.81]]),
         "accepted": torch.tensor([[True]]),
         "_proposal_centers": [[12.0, 12.0]],
     }

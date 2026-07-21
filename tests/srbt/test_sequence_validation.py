@@ -537,6 +537,10 @@ def test_search_diagnostics_are_frame_aligned_and_detached():
         local_candidate={
             "score_peak": 0.7,
             "presence_score": torch.tensor([0.42], requires_grad=True),
+            "observability_score": torch.tensor([0.84], requires_grad=True),
+            "localization_validity_score": torch.tensor(
+                [0.5], requires_grad=True),
+            "acceptance_score": torch.tensor([0.42], requires_grad=True),
             "expert_peaks": [0.1, 0.2, 0.3, 0.4, 0.5],
             "expert_psr": [1.0, 2.0, 3.0, 4.0, 5.0],
             "retained_expert_ids": (2, 4),
@@ -574,6 +578,9 @@ def test_search_diagnostics_are_frame_aligned_and_detached():
     assert trace[1]["ensemble_weights"] == pytest.approx(
         [0.0, 0.0, 0.6, 0.0, 0.4])
     assert trace[1]["presence_score"] == pytest.approx(0.42)
+    assert trace[1]["observability_score"] == pytest.approx(0.84)
+    assert trace[1]["localization_validity_score"] == pytest.approx(0.5)
+    assert trace[1]["acceptance_score"] == pytest.approx(0.42)
     assert trace[1]["previous_action"] == "suspect"
     assert trace[1]["controller_output_score"] == pytest.approx(0.0)
     assert trace[1]["theta_present"] == pytest.approx(0.7)
