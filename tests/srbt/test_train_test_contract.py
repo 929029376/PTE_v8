@@ -938,6 +938,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
     assert configured.MODEL.REDETECT.EVENT_DENSITY_KERNEL_SIZE == 25
+    assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is False
 
 
 def test_canonical_precision_strategy_trains_only_owner_two():

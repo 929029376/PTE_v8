@@ -480,6 +480,7 @@ def test_inference_tracker_keeps_cross_frame_hypothesis_state_and_maps_best_box(
 
 def test_failed_redetect_cycle_discards_stale_hypotheses(monkeypatch):
     tracker = object.__new__(PETTrack)
+    tracker.event_recovery_enabled = True
     tracker.hypothesis_tracker = HypothesisTracker(k_max=5)
     tracker.frame_id = 0
     tracker.state = [1.0, 1.0, 2.0, 2.0]

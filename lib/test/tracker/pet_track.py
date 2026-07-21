@@ -151,6 +151,9 @@ class PETTrack(BaseTracker):
         self.full_rgb_fallback_interval = int(getattr(
             redetect_cfg, "FULL_RGB_FALLBACK_INTERVAL", 10
         )) if redetect_cfg is not None else 10
+        self.event_recovery_enabled = bool(getattr(
+            redetect_cfg, "EVENT_PROPOSAL_INFERENCE", False
+        )) if redetect_cfg is not None else False
         if self.full_rgb_fallback_interval < 1:
             raise ValueError("FULL_RGB_FALLBACK_INTERVAL must be positive")
         self.event_proposal_extractor = EventProposalExtractor(
@@ -761,7 +764,10 @@ class PETTrack(BaseTracker):
     def _run_recovery_cycle(self, image, event_image, H, W):
         self._pending_redetect_box = None
         self._last_redetect_conf = 0.0
-        recovery = self._run_event_recovery(image, event_image, H, W)
+        recovery = (
+            self._run_event_recovery(image, event_image, H, W)
+            if self.event_recovery_enabled else None
+        )
         box, conf = (None, 0.0)
         if recovery is not None:
             box, conf = self._update_event_recovery_hypotheses(recovery, H, W)

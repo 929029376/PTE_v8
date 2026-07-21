@@ -420,6 +420,7 @@ def test_no_event_proposal_ages_existing_recovery_hypotheses():
 
 def test_recovery_cycle_clips_zero_area_candidate_before_pending_search():
     tracker = object.__new__(PETTrackTracker)
+    tracker.event_recovery_enabled = True
     tracker.frame_id = 1
     tracker.full_rgb_fallback_interval = 10
     tracker._pending_redetect_box = None
@@ -443,6 +444,29 @@ def test_recovery_cycle_clips_zero_area_candidate_before_pending_search():
     assert tracker._pending_redetect_box == pytest.approx(
         [90.0, 70.0, 10.0, 10.0])
     assert tracker._last_redetect_conf == pytest.approx(0.9)
+
+
+def test_disabled_event_recovery_skips_candidate_inference():
+    tracker = object.__new__(PETTrackTracker)
+    tracker.event_recovery_enabled = False
+    tracker.frame_id = 1
+    tracker.full_rgb_fallback_interval = 10
+    tracker._redetect_hypotheses = None
+    tracker._run_event_recovery = lambda *_args: pytest.fail(
+        "disabled Event recovery must not run candidate inference")
+    tracker._decay_recovery_hypotheses = lambda: None
+
+    output = PETTrackTracker._run_recovery_cycle(
+        tracker,
+        torch.zeros(80, 100, 3),
+        torch.zeros(80, 100, 3),
+        80,
+        100,
+    )
+
+    assert output is None
+    assert tracker._pending_redetect_box is None
+    assert tracker._last_redetect_conf == pytest.approx(0.0)
 
 
 def test_pending_recovery_box_is_refined_with_current_dynamic_templates(
@@ -585,6 +609,7 @@ def test_two_current_recovery_confirmations_resume_tracking(monkeypatch):
         ),
     )
     tracker = object.__new__(PETTrackTracker)
+    tracker.event_recovery_enabled = True
     tracker.frame_id = 0
     tracker.state = [1.0, 1.0, 4.0, 4.0]
     tracker._pending_redetect_box = None
