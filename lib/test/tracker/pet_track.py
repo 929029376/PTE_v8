@@ -871,17 +871,21 @@ class PETTrack(BaseTracker):
             pred_score = 0.0
             is_absent = False
             response = None
+            output_state = list(self.state)
 
             if action in ("track", "local_unresolved"):
                 if local_candidate is None:
                     raise RuntimeError(
                         "tracking action requires a current local candidate")
-                self.state = self._resolve_tracking_state(
+                candidate_state = self._resolve_tracking_state(
                     local_candidate["state"], H, W,
                     srbt_recovered=(
                         srbt_control is not None
                         and decision["exit_to_tracking"]),
                 )
+                output_state = candidate_state
+                if action == "track":
+                    self.state = candidate_state
                 pred_score = (
                     float(srbt_control.output_score)
                     if srbt_control is not None
@@ -1006,7 +1010,7 @@ class PETTrack(BaseTracker):
                           color=(0, 0, 255), thickness=2)
             cv2.imwrite(os.path.join(self.save_dir, "%04d.jpg" % self.frame_id), image_BGR)
 
-        return {"target_bbox": self.state,
+        return {"target_bbox": output_state,
                 "prediction_image": prediction_image,
                 "prediction_event_image": prediction_event_image,
                 "response": response if action in (

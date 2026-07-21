@@ -307,7 +307,10 @@ class DurationStructuredDecoder:
 
         observable = observability >= self.theta_observable
         localized = localization >= self.theta_localized
-        if observable and localized:
+        accepted = observable and localized
+        if accepted and (
+                predicted_action is None
+                or predicted_action is Action.TRACK):
             self._transition(Action.TRACK)
             self._unresolved_duration = 0
             self._stable_visible += 1
@@ -321,13 +324,22 @@ class DurationStructuredDecoder:
 
         self._stable_visible = 0
         self._unresolved_duration += 1
+        if predicted_action is not None:
+            global_allowed = (
+                not observable
+                and self._unresolved_duration >= self.global_duration)
+            force_global = (
+                not observable
+                and self._unresolved_duration >= 2 * self.global_duration)
+            if ((predicted_action is Action.GLOBAL_UNRESOLVED
+                    and global_allowed) or force_global):
+                self._transition(Action.GLOBAL_UNRESOLVED)
+                return self._result(Action.GLOBAL_UNRESOLVED)
+            self._transition(Action.LOCAL_UNRESOLVED)
+            return self._result(Action.LOCAL_UNRESOLVED, score=acceptance)
+
         if (not observable
                 and self._unresolved_duration >= self.global_duration):
-            if (predicted_action is Action.LOCAL_UNRESOLVED
-                    and self._unresolved_duration < 2 * self.global_duration):
-                self._transition(Action.LOCAL_UNRESOLVED)
-                return self._result(
-                    Action.LOCAL_UNRESOLVED, score=acceptance)
             self._transition(Action.GLOBAL_UNRESOLVED)
             return self._result(Action.GLOBAL_UNRESOLVED)
         if self._unresolved_duration >= self.local_duration:

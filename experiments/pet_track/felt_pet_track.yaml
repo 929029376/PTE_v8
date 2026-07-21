@@ -67,7 +67,7 @@ MODEL:
     HIDDEN_DIM: 64
     MAX_CENTER_STEP: 1.0
     TRAINED: true
-    USE_INFERENCE: false
+    USE_INFERENCE: true
   SRBT:
     ENABLE: true
     GATE:

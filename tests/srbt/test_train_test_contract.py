@@ -936,7 +936,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
-    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
+    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
 
 
 def test_canonical_causal_motion_strategy_trains_only_motion_specialist():

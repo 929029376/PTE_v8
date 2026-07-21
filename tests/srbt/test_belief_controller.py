@@ -142,6 +142,23 @@ def test_duration_decoder_separates_localization_failure_from_unobservability():
     assert global_unresolved.output_absent
 
 
+def test_learned_duration_decoder_can_reject_an_observable_local_candidate():
+    class _PreferLocal(torch.nn.Module):
+        def forward(self, *_args):
+            return torch.tensor([[0.0, 8.0, -8.0, -8.0]])
+
+    decoder = DurationStructuredDecoder(
+        local_duration=2,
+        global_duration=4,
+        predictor=_PreferLocal(),
+    )
+
+    decision = decoder.step(observability=0.95, localization=0.95)
+
+    assert decision.action is Action.LOCAL_UNRESOLVED
+    assert not decision.allow_recent_write
+
+
 def test_duration_decoder_requires_verified_recovery_before_commitment():
     decoder = DurationStructuredDecoder(
         local_duration=1, global_duration=2, verify_duration=2)
@@ -443,6 +460,29 @@ def test_track_commits_final_refined_motion_event_once(monkeypatch):
     assert committed[0] is refined_event
     assert result["target_bbox"] == refined_candidate["state"]
     assert tracker.thor_wrapper.resume_count == 1
+
+    trusted_state = [20.0, 20.0, 8.0, 8.0]
+    tracker.state = list(trusted_state)
+    tracker._srbt_last_action = Action.LOCAL_UNRESOLVED
+    sample_calls = iter((
+        (torch.zeros_like(initial_event), initial_event, 1.0, None),
+        (torch.zeros_like(template_event), template_event, 1.0, None),
+    ))
+    tracker._step_srbt_controller = lambda *_args, **_kwargs: SimpleNamespace(
+        action=Action.LOCAL_UNRESOLVED,
+        output_score=0.4,
+        allow_recent_write=False,
+        allow_long_write=False,
+    )
+
+    unresolved = PETTrack.track(
+        tracker,
+        torch.zeros(40, 40, 3).numpy(),
+        torch.zeros(40, 40, 3).numpy(),
+    )
+
+    assert unresolved["target_bbox"] == initial_candidate["state"]
+    assert tracker.state == trusted_state
 
 
 def test_tracker_uses_all_experts_without_hidden_selector_history():
