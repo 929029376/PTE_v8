@@ -845,6 +845,179 @@ def test_dispatch_training_keeps_frozen_modules_in_eval_mode():
     assert actor.net.expert_activator.training is False
 
 
+def test_recovery_training_keeps_tracker_eval_and_only_recovery_heads_train():
+    class RecoveryModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Sequential(
+                torch.nn.Linear(2, 2),
+                torch.nn.BatchNorm1d(2),
+            )
+            self.visibility_gate = torch.nn.Linear(2, 2)
+            self.localization_validity_gate = torch.nn.Linear(2, 2)
+            self.rgb_identity_verifier = torch.nn.Linear(2, 2)
+            self.redetect_expert = torch.nn.Linear(2, 2)
+
+    actor = object.__new__(PETTrackActor)
+    actor.net = RecoveryModel()
+    actor.expert_phase = "recovery"
+
+    actor.train(True)
+
+    assert actor.net.training is False
+    assert actor.net.backbone.training is False
+    assert actor.net.visibility_gate.training is True
+    assert actor.net.localization_validity_gate.training is True
+    assert actor.net.rgb_identity_verifier.training is True
+    assert actor.net.redetect_expert.training is True
+
+
+def test_coverage_intervention_masks_only_present_target_pixels():
+    rgb = torch.arange(2 * 1 * 1 * 4 * 4, dtype=torch.float32).reshape(
+        2, 1, 1, 4, 4)
+    event = torch.ones_like(rgb)
+    boxes = torch.tensor([
+        [0.25, 0.25, 0.50, 0.50],
+        [0.25, 0.25, 0.50, 0.50],
+    ])
+
+    covered_rgb, covered_event = PETTrackActor._cover_target_observation(
+        rgb, event, boxes, torch.tensor([True, False]))
+
+    expected_fill = rgb[0, -1].mean(dim=(-2, -1), keepdim=True)
+    torch.testing.assert_close(
+        covered_rgb[0, -1, :, 1:3, 1:3],
+        expected_fill.expand_as(covered_rgb[0, -1, :, 1:3, 1:3]),
+    )
+    assert torch.equal(covered_event[0, -1, :, 1:3, 1:3],
+                       torch.zeros(1, 2, 2))
+    assert torch.equal(covered_rgb[0, -1, :, 0, :], rgb[0, -1, :, 0, :])
+    assert torch.equal(covered_rgb[1], rgb[1])
+    assert torch.equal(covered_event[1], event[1])
+    assert torch.equal(rgb, torch.arange(32, dtype=torch.float32).reshape(
+        2, 1, 1, 4, 4))
+
+
+def test_geometry_intervention_keeps_size_and_moves_candidate_half_frame():
+    boxes_xywh = torch.tensor([
+        [0.10, 0.20, 0.20, 0.30],
+        [0.60, 0.50, 0.10, 0.20],
+    ])
+
+    positive, negative = PETTrackActor._geometry_candidate_pair(boxes_xywh)
+
+    torch.testing.assert_close(positive[:, 2:], negative[:, 2:])
+    center_delta = torch.remainder(
+        negative[:, :2] - positive[:, :2], 1.0)
+    torch.testing.assert_close(center_delta, torch.full_like(center_delta, 0.5))
+
+
+def test_dart_intervention_loss_separates_observability_and_localization():
+    actor = object.__new__(PETTrackActor)
+    actor.dart_coverage_weight = 2.0
+    actor.dart_geometry_weight = 3.0
+    actor.dart_ranking_weight = 0.5
+    actor.dart_ranking_margin = 0.2
+    clean_logits = torch.tensor([[0.0, 2.0], [1.0, 0.0]],
+                                requires_grad=True)
+    coverage_logits = torch.tensor([[0.0, 1.0], [1.0, 0.0]],
+                                   requires_grad=True)
+    positive_logits = torch.tensor([[1.0, 0.0], [0.0, 1.0]],
+                                   requires_grad=True)
+    negative_logits = torch.tensor([[0.0, 1.0], [1.0, 0.0]],
+                                   requires_grad=True)
+    predictions = {
+        "clean_observability_logits": clean_logits,
+        "coverage_observability_logits": coverage_logits,
+        "positive_localization_logits": positive_logits,
+        "negative_localization_logits": negative_logits,
+    }
+
+    loss, status = actor._compute_reliability_intervention_loss(
+        predictions, torch.tensor([True, False]))
+    loss.backward()
+
+    assert clean_logits.grad[0].abs().sum() > 0
+    assert clean_logits.grad[1].abs().sum() == 0
+    assert coverage_logits.grad[0].abs().sum() > 0
+    assert coverage_logits.grad[1].abs().sum() == 0
+    assert positive_logits.grad[0].abs().sum() > 0
+    assert positive_logits.grad[1].abs().sum() == 0
+    assert negative_logits.grad[0].abs().sum() > 0
+    assert negative_logits.grad[1].abs().sum() == 0
+    assert status["Loss/dart_coverage"] > 0
+    assert status["Loss/dart_geometry"] > 0
+    assert status["DART/observability_gap"] > 0
+    assert status["DART/localization_gap"] < 0
+
+
+def test_recovery_forward_builds_paired_reliability_interventions():
+    class CandidateGate(torch.nn.Module):
+        def forward(self, score_map, candidate_boxes):
+            score = candidate_boxes[:, 0].clamp(1e-4, 1.0 - 1e-4)
+            return torch.stack((1.0 - score, score), dim=-1).log()
+
+    class RecoveryNet(torch.nn.Module):
+        expert_names = list(EXPERT_NAMES)
+
+        def __init__(self):
+            super().__init__()
+            self.localization_validity_gate = CandidateGate()
+            self.visibility_gate = torch.nn.Linear(1, 2)
+            self.rgb_identity_verifier = torch.nn.Linear(1, 2)
+            self.redetect_expert = torch.nn.Linear(1, 2)
+            self.calls = []
+
+        def forward(self, **kwargs):
+            self.calls.append(kwargs)
+            batch = kwargs["xi"].shape[0]
+            covered = kwargs["xe"][:, -1].abs().sum(dim=(1, 2, 3)) == 0
+            logits = torch.stack((covered.float(), (~covered).float()), dim=-1)
+            score_map = kwargs["xi"].new_ones(batch, 1, 4, 4)
+            return {
+                "pred_boxes": kwargs["xi"].new_tensor(
+                    [[[0.5, 0.5, 0.2, 0.2]]]).expand(batch, -1, -1),
+                "score_map": score_map,
+                "presence_predictions": {
+                    "logits": logits,
+                    "score": logits.softmax(dim=-1)[:, 1],
+                },
+            }
+
+    actor = object.__new__(PETTrackActor)
+    actor.net = RecoveryNet()
+    actor.cfg = edict({"MODEL": {"BACKBONE": {"CE_LOC": []}}})
+    actor.settings = SimpleNamespace(num_template=1)
+    actor.expert_enabled = True
+    actor.expert_phase = "recovery"
+    data = {
+        "template_images": torch.ones(1, 2, 3, 8, 8),
+        "template_event_images": torch.ones(1, 2, 3, 8, 8),
+        "search_images": torch.ones(1, 2, 3, 8, 8),
+        "search_event_images": torch.ones(1, 2, 3, 8, 8),
+        "template_anno": torch.zeros(1, 2, 4),
+        "search_anno": torch.tensor([[
+            [0.25, 0.25, 0.50, 0.50],
+            [0.25, 0.25, 0.50, 0.50],
+        ]]),
+        "search_absent": torch.ones(1, 2),
+    }
+
+    output = actor.forward_pass(data)
+    interventions = output["reliability_interventions"]
+
+    assert len(actor.net.calls) == 2
+    assert set(interventions) == {
+        "clean_observability_logits",
+        "coverage_observability_logits",
+        "positive_localization_logits",
+        "negative_localization_logits",
+    }
+    assert actor.net.calls[1]["redetect_images"] is None
+    assert actor.net.calls[1]["redetect_event_images"] is None
+    assert actor.net.calls[1]["redetect_mask"] is None
+
+
 def test_dispatch_loss_uses_configured_positive_class_weights(monkeypatch):
     actor = object.__new__(PETTrackActor)
     actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
@@ -915,6 +1088,10 @@ def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
     actor.presence_focal_gamma = 2.0
     actor.presence_present_threshold = 0.70
     actor.presence_recover_threshold = 0.75
+    actor.dart_coverage_weight = 1.0
+    actor.dart_geometry_weight = 1.0
+    actor.dart_ranking_weight = 0.5
+    actor.dart_ranking_margin = 0.2
 
     base_boxes = torch.ones(2, 1, 4, requires_grad=True)
     presence_logits = torch.tensor(
@@ -930,6 +1107,12 @@ def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
             "score": presence_logits.softmax(dim=-1)[:, 1],
         },
         "redetect_predictions": {"signal": redetect_signal},
+        "reliability_interventions": {
+            "clean_observability_logits": presence_logits,
+            "coverage_observability_logits": presence_logits + 0.1,
+            "positive_localization_logits": presence_logits + 0.2,
+            "negative_localization_logits": presence_logits - 0.2,
+        },
     }
     gt_dict = {
         "search_anno": torch.zeros(1, 2, 4),

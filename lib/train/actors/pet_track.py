@@ -57,6 +57,15 @@ class PETTrackActor(PETTrackBaseActor):
             recovery_loss_cfg, "RANKING_WEIGHT", 0.5))
         self.identity_ranking_margin = float(getattr(
             recovery_loss_cfg, "RANKING_MARGIN", 0.2))
+        dart_loss_cfg = getattr(cfg.TRAIN, "DART_LOSS", None)
+        self.dart_coverage_weight = float(getattr(
+            dart_loss_cfg, "COVERAGE_WEIGHT", 1.0))
+        self.dart_geometry_weight = float(getattr(
+            dart_loss_cfg, "GEOMETRY_WEIGHT", 1.0))
+        self.dart_ranking_weight = float(getattr(
+            dart_loss_cfg, "RANKING_WEIGHT", 0.5))
+        self.dart_ranking_margin = float(getattr(
+            dart_loss_cfg, "RANKING_MARGIN", 0.2))
         self.expert_advantage_weight = float(getattr(
             cfg.TRAIN, "EXPERT_ADVANTAGE_WEIGHT", 1.0))
         self.expert_advantage_margin = float(getattr(
@@ -105,7 +114,7 @@ class PETTrackActor(PETTrackBaseActor):
             {"pursuit"}
             if self.expert_phase == "pursuit"
             else
-            {"presence", "redetect", "identity"}
+            {"presence", "reliability", "redetect", "identity"}
             if self.expert_phase == "recovery"
             else ({"base", "expert_advantage", "srbt", "redetect"}
                   if self.srbt_enabled
@@ -114,11 +123,17 @@ class PETTrackActor(PETTrackBaseActor):
 
     # ------------------------------------------------------------------ #
     def train(self, mode=True):
-        if self.expert_phase != "dispatch":
+        if self.expert_phase not in {"dispatch", "recovery"}:
             return super().train(mode)
         self.net.eval()
         model = self.net.module if hasattr(self.net, "module") else self.net
-        model.expert_activator.train(mode)
+        if self.expert_phase == "dispatch":
+            model.expert_activator.train(mode)
+            return
+        for name in (
+                "visibility_gate", "localization_validity_gate",
+                "rgb_identity_verifier", "redetect_expert"):
+            getattr(model, name).train(mode)
 
     # ------------------------------------------------------------------ #
     def _validated_training_expert_ids(self, data, batch_size, device):
@@ -173,6 +188,98 @@ class PETTrackActor(PETTrackBaseActor):
             raise ValueError(
                 "observations must have shape (B,H,C,W,W) or (H,B,C,W,W)")
         return value.contiguous()
+
+    @staticmethod
+    def _cover_target_observation(rgb, event, boxes_xywh, present):
+        if rgb.ndim != 5 or event.shape != rgb.shape:
+            raise ValueError("RGB and event observations must share shape (B,T,C,H,W)")
+        batch_size, _, _, height, width = rgb.shape
+        boxes = torch.as_tensor(
+            boxes_xywh, device=rgb.device, dtype=rgb.dtype).reshape(-1, 4)
+        present = torch.as_tensor(
+            present, device=rgb.device, dtype=torch.bool).reshape(-1)
+        if boxes.shape[0] != batch_size or present.numel() != batch_size:
+            raise ValueError("coverage intervention requires one box and flag per row")
+
+        y = (torch.arange(height, device=rgb.device, dtype=rgb.dtype) + 0.5) / height
+        x = (torch.arange(width, device=rgb.device, dtype=rgb.dtype) + 0.5) / width
+        x1 = boxes[:, 0, None, None]
+        y1 = boxes[:, 1, None, None]
+        x2 = (boxes[:, 0] + boxes[:, 2])[:, None, None]
+        y2 = (boxes[:, 1] + boxes[:, 3])[:, None, None]
+        target_mask = (
+            (x[None, None, :] >= x1)
+            & (x[None, None, :] < x2)
+            & (y[None, :, None] >= y1)
+            & (y[None, :, None] < y2)
+            & present[:, None, None]
+        )[:, None]
+
+        covered_rgb = rgb.clone()
+        covered_event = event.clone()
+        current_rgb = covered_rgb[:, -1]
+        current_event = covered_event[:, -1]
+        fill = current_rgb.mean(dim=(-2, -1), keepdim=True)
+        covered_rgb[:, -1] = torch.where(target_mask, fill, current_rgb)
+        covered_event[:, -1] = torch.where(
+            target_mask, torch.zeros_like(current_event), current_event)
+        return covered_rgb, covered_event
+
+    @staticmethod
+    def _geometry_candidate_pair(boxes_xywh):
+        positive = boxes_xywh.clone()
+        positive[:, :2] = (
+            boxes_xywh[:, :2] + 0.5 * boxes_xywh[:, 2:])
+        negative = positive.clone()
+        negative[:, :2] = torch.remainder(positive[:, :2] + 0.5, 1.0)
+        return positive, negative
+
+    @staticmethod
+    def _reliability_score_map(output):
+        return output.get("expert_outputs", {}).get(
+            "visibility_foc_ov", output)["score_map"]
+
+    def _forward_reliability_interventions(
+            self, output, forward_kwargs, data):
+        batch_size = forward_kwargs["xi"].shape[0]
+        device = forward_kwargs["xi"].device
+        present = self._present_search_mask(data, device, batch_size)
+        if present is None:
+            raise RuntimeError(
+                "reliability intervention training requires official presence")
+        boxes = torch.as_tensor(
+            data["search_anno"], device=device,
+            dtype=forward_kwargs["xi"].dtype)
+        if boxes.ndim == 3:
+            boxes = boxes[-1]
+        if boxes.shape != (batch_size, 4):
+            raise ValueError("search_anno must provide one current box per row")
+
+        covered_rgb, covered_event = self._cover_target_observation(
+            forward_kwargs["xi"], forward_kwargs["xe"], boxes, present)
+        covered_kwargs = dict(forward_kwargs)
+        covered_kwargs.update({
+            "xi": covered_rgb,
+            "xe": covered_event,
+            "redetect_images": None,
+            "redetect_event_images": None,
+            "redetect_mask": None,
+        })
+        covered_output = self.net(**covered_kwargs)
+
+        model = self.net.module if hasattr(self.net, "module") else self.net
+        positive_boxes, negative_boxes = self._geometry_candidate_pair(boxes)
+        score_map = self._reliability_score_map(output)
+        return {
+            "clean_observability_logits": output[
+                "presence_predictions"]["logits"],
+            "coverage_observability_logits": covered_output[
+                "presence_predictions"]["logits"],
+            "positive_localization_logits": model.localization_validity_gate(
+                score_map, positive_boxes),
+            "negative_localization_logits": model.localization_validity_gate(
+                score_map, negative_boxes),
+        }
 
     def forward_pass(self, data):
         """Forward pass for baseline localization plus causal SRBT outputs."""
@@ -243,6 +350,10 @@ class PETTrackActor(PETTrackBaseActor):
         if expert_phase == "dispatch":
             forward_kwargs["return_activation_logits"] = True
         out_dict = self.net(**forward_kwargs)
+        if expert_phase == "recovery":
+            out_dict["reliability_interventions"] = (
+                self._forward_reliability_interventions(
+                    out_dict, forward_kwargs, data))
 
         return out_dict
 
@@ -716,6 +827,24 @@ class PETTrackActor(PETTrackBaseActor):
             status["Loss/presence"] = 0.0
             status["Loss/presence_threshold"] = 0.0
 
+        dart_loss = base_loss * 0.0
+        if self.expert_enabled and self.expert_phase == "recovery":
+            interventions = pred_dict.get("reliability_interventions")
+            if interventions is None:
+                raise RuntimeError(
+                    "recovery training requires paired reliability interventions")
+            present = self._present_search_mask(
+                gt_dict, pred_dict["pred_boxes"].device,
+                pred_dict["pred_boxes"].shape[0])
+            if present is None:
+                raise RuntimeError(
+                    "reliability intervention training requires official presence")
+            dart_loss, dart_status = (
+                self._compute_reliability_intervention_loss(
+                    interventions, present))
+            loss = loss + dart_loss
+            status.update(dart_status)
+
         advantage_loss, advantage_status = (
             self._compute_expert_advantage_loss(
                 pred_dict, gt_dict, training_expert_ids)
@@ -754,6 +883,7 @@ class PETTrackActor(PETTrackBaseActor):
         status.setdefault(
             "Loss/presence_threshold", presence_threshold_loss.item())
         status.setdefault("Loss/redetect", redetect_loss.item())
+        status.setdefault("Loss/DART", dart_loss.item())
         status["Expert/phase_id"] = {
             "specialize": 0, "refine": 1, "recovery": 2, "pursuit": 3,
             "dispatch": 4,
@@ -761,6 +891,84 @@ class PETTrackActor(PETTrackBaseActor):
         status.setdefault("Redetect/count", 0)
         status["Loss/total"] = loss.item()
         return loss, status
+
+    def _compute_reliability_intervention_loss(self, predictions, present):
+        required = {
+            "clean_observability_logits",
+            "coverage_observability_logits",
+            "positive_localization_logits",
+            "negative_localization_logits",
+        }
+        missing = sorted(required - set(predictions))
+        if missing:
+            raise RuntimeError(
+                "paired reliability interventions are missing: "
+                + ", ".join(missing))
+        clean_logits = predictions["clean_observability_logits"].float()
+        covered_logits = predictions["coverage_observability_logits"].float()
+        positive_logits = predictions["positive_localization_logits"].float()
+        negative_logits = predictions["negative_localization_logits"].float()
+        tensors = (clean_logits, covered_logits, positive_logits, negative_logits)
+        if any(tensor.ndim != 2 or tensor.shape[1] != 2 for tensor in tensors):
+            raise ValueError("reliability intervention logits must have shape (B,2)")
+        if any(tensor.shape != clean_logits.shape for tensor in tensors[1:]):
+            raise ValueError("reliability intervention logits must share shape")
+        present = torch.as_tensor(
+            present, device=clean_logits.device, dtype=torch.bool).reshape(-1)
+        if present.numel() != clean_logits.shape[0]:
+            raise ValueError("reliability intervention mask must match batch size")
+        if not bool(present.any()):
+            zero = sum(tensor.sum() for tensor in tensors) * 0.0
+            return zero, {
+                "Loss/DART": 0.0,
+                "Loss/dart_coverage": 0.0,
+                "Loss/dart_geometry": 0.0,
+                "DART/observability_gap": 0.0,
+                "DART/localization_gap": 0.0,
+            }
+
+        clean = clean_logits[present]
+        covered = covered_logits[present]
+        positive = positive_logits[present]
+        negative = negative_logits[present]
+        ones = torch.ones(clean.shape[0], device=clean.device, dtype=torch.long)
+        zeros = torch.zeros_like(ones)
+        clean_probability = clean.softmax(dim=-1)[:, 1]
+        covered_probability = covered.softmax(dim=-1)[:, 1]
+        positive_probability = positive.softmax(dim=-1)[:, 1]
+        negative_probability = negative.softmax(dim=-1)[:, 1]
+
+        coverage_classification = 0.5 * (
+            F.cross_entropy(clean, ones)
+            + F.cross_entropy(covered, zeros))
+        coverage_ranking = F.relu(
+            self.dart_ranking_margin
+            - clean_probability + covered_probability).mean()
+        coverage_loss = (
+            coverage_classification
+            + self.dart_ranking_weight * coverage_ranking)
+
+        geometry_classification = 0.5 * (
+            F.cross_entropy(positive, ones)
+            + F.cross_entropy(negative, zeros))
+        geometry_ranking = F.relu(
+            self.dart_ranking_margin
+            - positive_probability + negative_probability).mean()
+        geometry_loss = (
+            geometry_classification
+            + self.dart_ranking_weight * geometry_ranking)
+        total = (
+            self.dart_coverage_weight * coverage_loss
+            + self.dart_geometry_weight * geometry_loss)
+        return total, {
+            "Loss/DART": total.item(),
+            "Loss/dart_coverage": coverage_loss.item(),
+            "Loss/dart_geometry": geometry_loss.item(),
+            "DART/observability_gap": (
+                clean_probability - covered_probability).mean().item(),
+            "DART/localization_gap": (
+                positive_probability - negative_probability).mean().item(),
+        }
 
     def _dispatch_targets(self, pred_dict, gt_dict):
         logits = pred_dict.get("expert_activation_logits")

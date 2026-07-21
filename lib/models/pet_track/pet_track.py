@@ -13,7 +13,11 @@ from lib.models.layers.head import build_box_head
 from lib.models.layers.atu import build_atu
 from lib.models.layers.redetection import build_redetection_expert
 from lib.models.layers.event_recovery import RGBIdentityVerifier
-from lib.models.layers.srbt_controller import VisibilityGate
+from lib.models.layers.srbt_controller import (
+    LocalizationValidityGate,
+    VisibilityGate,
+    factorize_reliability,
+)
 from lib.models.layers.expert_fusion import (
     ExpertFusionBank, ProposalBoxAdapter, build_expert_fusions,
 )
@@ -24,11 +28,12 @@ from lib.utils.box_ops import box_xyxy_to_cxcywh
 
 
 class PETTrack(nn.Module):
-    ARCHITECTURE_VERSION = 28
+    ARCHITECTURE_VERSION = 29
     _PET_STATE_PREFIXES = (
         "visibility_gate.", "rgb_identity_verifier.", "redetect_expert.",
         "small_target_expert.", "proposal_adapters.",
-        "search_window_controller.", "expert_activator.")
+        "search_window_controller.", "expert_activator.",
+        "localization_validity_gate.")
 
     def __init__(self, transformer, memory, box_head, cfg,
                  aux_loss=False, head_type="CORNER"):
@@ -161,6 +166,11 @@ class PETTrack(nn.Module):
                 response_dim=int(getattr(gate_cfg, "RESPONSE_DIM", 3)),
                 hidden_dim=int(getattr(gate_cfg, "HIDDEN_DIM", 64)),
             )
+            if self.srbt_enabled else None
+        )
+        self.localization_validity_gate = (
+            LocalizationValidityGate(hidden_dim=int(getattr(
+                gate_cfg, "LOCALIZATION_HIDDEN_DIM", 32)))
             if self.srbt_enabled else None
         )
         search_controller_cfg = getattr(
@@ -316,8 +326,20 @@ class PETTrack(nn.Module):
             use_template_conditioning=True,
         )
         boxes = redetection["bbox"].reshape(batch, candidate_count, 4)
-        localization_scores = redetection["conf"].reshape(
-            batch, candidate_count).clamp(0.0, 1.0)
+        localization_gate = getattr(
+            self, "localization_validity_gate", None)
+        if localization_gate is not None and "field" in redetection:
+            localization_logits = localization_gate(
+                redetection["field"], redetection["bbox"])
+            localization_scores = localization_logits.softmax(
+                dim=-1)[:, 1].reshape(batch, candidate_count)
+        else:
+            localization_scores = redetection["conf"].reshape(
+                batch, candidate_count).clamp(0.0, 1.0)
+        event_normalized = event_scores / event_scores.amax(
+            dim=1, keepdim=True).clamp_min(1e-8)
+        acceptance_scores = factorize_reliability(
+            event_normalized, localization_scores)
         recovery_cfg = getattr(self.cfg.MODEL, "REDETECT", None)
         identity_threshold = float(getattr(
             recovery_cfg, "IDENTITY_THRESHOLD", 0.75))
@@ -327,8 +349,6 @@ class PETTrack(nn.Module):
             (identity_scores >= identity_threshold)
             & (localization_scores >= localization_threshold)
         )
-        event_normalized = event_scores / event_scores.amax(
-            dim=1, keepdim=True).clamp_min(1e-8)
         combined_scores = (
             0.55 * identity_scores
             + 0.40 * localization_scores
@@ -338,6 +358,9 @@ class PETTrack(nn.Module):
             "boxes": boxes,
             "identity_scores": identity_scores,
             "localization_scores": localization_scores,
+            "observability_scores": event_normalized,
+            "localization_validity_scores": localization_scores,
+            "acceptance_scores": acceptance_scores,
             "event_scores": event_scores,
             "combined_scores": combined_scores,
             "accepted": accepted,
@@ -723,6 +746,12 @@ class PETTrack(nn.Module):
         ), dim=-1)
         presence_logits = self.visibility_gate(feat.mean(dim=1), response_stats)
         presence_score = presence_logits.softmax(dim=-1)[:, 1]
+        localization_validity_logits = self.localization_validity_gate(
+            presence_output["score_map"], out["pred_boxes"][:, 0])
+        localization_validity_score = localization_validity_logits.softmax(
+            dim=-1)[:, 1]
+        acceptance_score = factorize_reliability(
+            presence_score, localization_validity_score)
         out.update({
             "target_bbox": out["pred_boxes"][:, 0],
             "absent": 1.0 - presence_score >= 0.6,
@@ -732,6 +761,12 @@ class PETTrack(nn.Module):
             "presence_predictions": {
                 "logits": presence_logits,
                 "score": presence_score,
+            },
+            "reliability_predictions": {
+                "observability_score": presence_score,
+                "localization_validity_score": localization_validity_score,
+                "localization_validity_logits": localization_validity_logits,
+                "acceptance_score": acceptance_score,
             },
         })
         redetect_predictions = self._forward_redetect_training(
@@ -1216,6 +1251,9 @@ def _load_retained_model_checkpoint(
             *migration_prefixes,
             "expert_fusion.experts.motion_fm.temporal_",
         )
+    if source_version is None or source_version < 29:
+        migration_prefixes = (
+            *migration_prefixes, "localization_validity_gate.")
     extension_prefixes = ("_pet_architecture_version", *migration_prefixes)
     retained = sorted(
         key for key in target if not key.startswith(extension_prefixes))

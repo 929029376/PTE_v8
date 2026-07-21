@@ -133,6 +133,20 @@ def test_normal_forward_uses_only_lightweight_presence_gate():
     assert set(output["presence_predictions"]) == {"logits", "score"}
     assert torch.equal(
         output["presence_score"], output["presence_predictions"]["score"])
+    reliability = output["reliability_predictions"]
+    assert set(reliability) == {
+        "observability_score",
+        "localization_validity_logits",
+        "localization_validity_score",
+        "acceptance_score",
+    }
+    assert torch.equal(
+        reliability["observability_score"], output["presence_score"])
+    assert torch.allclose(
+        reliability["acceptance_score"],
+        reliability["observability_score"]
+        * reliability["localization_validity_score"],
+    )
     assert "srbt_posterior" not in output
     assert "hypotheses" not in output
     assert "srbt_teacher" not in output

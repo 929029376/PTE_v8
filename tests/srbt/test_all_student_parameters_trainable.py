@@ -25,6 +25,7 @@ class TinyStudent(torch.nn.Module):
         self.redetect_expert = torch.nn.Linear(2, 2)
         self.rgb_identity_verifier = torch.nn.Linear(2, 2)
         self.visibility_gate = torch.nn.Linear(2, 2)
+        self.localization_validity_gate = torch.nn.Linear(2, 2)
         self.small_target_expert = torch.nn.Linear(2, 2)
         self.default_expert = "generalist"
         self.expert_fusion = torch.nn.Module()
@@ -188,6 +189,7 @@ def test_optimizer_groups_enforce_separate_expert_training_phases():
     assert trainable
     assert all(name.startswith((
         "visibility_gate.",
+        "localization_validity_gate.",
         "rgb_identity_verifier.",
         "redetect_expert.",
     )) for name in trainable)

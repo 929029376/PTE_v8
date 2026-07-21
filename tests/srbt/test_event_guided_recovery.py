@@ -12,6 +12,7 @@ from lib.models.pet_track.pet_track import PETTrack as PETTrackModel
 from lib.models.layers.srbt_controller import (
     Action,
     ControllerAction,
+    LocalizationValidityGate,
     VisibilityController,
 )
 from lib.test.tracker.pet_track import PETTrack as PETTrackTracker
@@ -168,7 +169,63 @@ def test_recovery_batches_candidates_and_requires_rgb_and_localization():
         output["identity_scores"], torch.tensor([[0.9, 0.2]]))
     assert torch.allclose(
         output["localization_scores"], torch.tensor([[0.8, 0.95]]))
+    assert torch.allclose(
+        output["observability_scores"], torch.tensor([[0.02, 1.0]]))
+    assert torch.equal(
+        output["localization_validity_scores"], output["localization_scores"])
+    assert torch.allclose(
+        output["acceptance_scores"], torch.tensor([[0.016, 0.95]]))
     assert output["accepted"].tolist() == [[True, False]]
+
+
+def test_recovery_field_uses_candidate_localization_gate_without_backbone_gradients():
+    class IdentityProbe(torch.nn.Module):
+        def forward(self, _template, _candidates):
+            return torch.tensor([[0.9, 0.8]])
+
+    model = object.__new__(PETTrackModel)
+    torch.nn.Module.__init__(model)
+    model.rgb_identity_verifier = IdentityProbe()
+    model.localization_validity_gate = LocalizationValidityGate(hidden_dim=8)
+    model.cfg = SimpleNamespace(MODEL=SimpleNamespace(REDETECT=SimpleNamespace(
+        IDENTITY_THRESHOLD=0.75,
+        LOCALIZATION_THRESHOLD=0.5,
+    )))
+    model.rgb_identity_tokens = lambda image, template: torch.zeros(
+        image.shape[0], 4, 8)
+    field = torch.rand(2, 1, 4, 4, requires_grad=True)
+    boxes = torch.tensor([
+        [0.5, 0.5, 0.2, 0.2],
+        [0.4, 0.4, 0.3, 0.3],
+    ], requires_grad=True)
+    model.redetect_from_observations = lambda *args, **kwargs: {
+        "bbox": boxes,
+        "field": field,
+        "conf": torch.zeros(2),
+    }
+
+    output = model.recover_from_candidates(
+        torch.zeros(1, 3, 8, 8),
+        torch.zeros(1, 3, 8, 8),
+        torch.zeros(1, 2, 3, 16, 16),
+        torch.zeros(1, 2, 3, 16, 16),
+        torch.tensor([[1.0, 0.5]]),
+        torch.rand(1, 2, 16, 16),
+    )
+
+    assert output["localization_validity_scores"].shape == (1, 2)
+    assert torch.allclose(
+        output["acceptance_scores"],
+        output["observability_scores"]
+        * output["localization_validity_scores"],
+    )
+    output["acceptance_scores"].sum().backward()
+    assert field.grad is None
+    assert boxes.grad is None
+    assert all(
+        parameter.grad is not None
+        for parameter in model.localization_validity_gate.parameters()
+    )
 
 
 def test_tracker_crops_full_frame_event_proposals_as_one_batch(monkeypatch):

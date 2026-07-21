@@ -4,6 +4,24 @@ from enum import Enum
 
 import torch
 from torch import nn
+from torch.nn import functional as F
+
+
+def factorize_reliability(observability, localization_validity):
+    """Compose candidate acceptance by the probability chain rule."""
+    if not torch.is_tensor(observability) or not torch.is_tensor(
+            localization_validity):
+        raise TypeError("reliability factors must be tensors")
+    if observability.shape != localization_validity.shape:
+        raise ValueError("reliability factors must have identical shapes")
+    for name, value in (
+            ("observability", observability),
+            ("localization_validity", localization_validity)):
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} must be finite")
+        if torch.any((value < 0.0) | (value > 1.0)):
+            raise ValueError(f"{name} must be in [0, 1]")
+    return observability * localization_validity
 
 
 class Action(str, Enum):
@@ -53,6 +71,46 @@ class VisibilityGate(nn.Module):
         inputs = torch.cat(
             (pooled_feature.detach(), response_stats.detach()), dim=-1)
         return self.network(inputs)
+
+
+class LocalizationValidityGate(nn.Module):
+    """Judge whether a candidate box is valid under one fixed observation."""
+
+    def __init__(self, hidden_dim=32):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(8, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), 2),
+        )
+
+    def forward(self, score_map, candidate_boxes):
+        if score_map.ndim == 3:
+            score_map = score_map.unsqueeze(1)
+        if score_map.ndim != 4 or score_map.shape[1] != 1:
+            raise ValueError("score_map must have shape (B,1,H,W)")
+        if candidate_boxes.shape != (score_map.shape[0], 4):
+            raise ValueError("candidate_boxes must have shape (B,4)")
+        if not torch.isfinite(score_map).all():
+            raise ValueError("score_map must be finite")
+        if not torch.isfinite(candidate_boxes).all():
+            raise ValueError("candidate_boxes must be finite")
+
+        detached_map = score_map.detach()
+        detached_boxes = candidate_boxes.detach()
+        grid = detached_boxes[:, :2].mul(2.0).sub(1.0)[:, None, None]
+        sampled = F.grid_sample(
+            detached_map, grid, mode="bilinear",
+            padding_mode="zeros", align_corners=False,
+        ).flatten(1)
+        flat = detached_map.flatten(1)
+        response_stats = torch.stack((
+            flat.max(dim=-1).values,
+            flat.mean(dim=-1),
+            flat.std(dim=-1, unbiased=False),
+        ), dim=-1)
+        features = torch.cat((sampled, response_stats, detached_boxes), dim=-1)
+        return self.network(features)
 
 
 class VisibilityController:

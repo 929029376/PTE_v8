@@ -4,11 +4,52 @@ import torch
 
 from lib.models.layers.srbt_controller import (
     Action,
+    LocalizationValidityGate,
     VisibilityController,
     VisibilityGate,
     build_visibility_controller,
+    factorize_reliability,
 )
 from lib.test.tracker.pet_track import PETTrack
+
+
+def test_reliability_factorization_is_chain_rule_product_and_keeps_gradients():
+    observability = torch.tensor([0.8, 0.25], requires_grad=True)
+    localization = torch.tensor([0.5, 0.4], requires_grad=True)
+
+    acceptance = factorize_reliability(observability, localization)
+
+    assert torch.allclose(acceptance, torch.tensor([0.4, 0.1]))
+    acceptance.sum().backward()
+    assert torch.allclose(observability.grad, localization.detach())
+    assert torch.allclose(localization.grad, observability.detach())
+
+
+def test_localization_validity_is_candidate_conditioned_and_detaches_tracker_outputs():
+    gate = LocalizationValidityGate(hidden_dim=1)
+    with torch.no_grad():
+        gate.network[0].weight.zero_()
+        gate.network[0].bias.zero_()
+        gate.network[0].weight[0, 0] = 5.0
+        gate.network[2].weight.zero_()
+        gate.network[2].bias.zero_()
+        gate.network[2].weight[1, 0] = 5.0
+    score_map = torch.zeros(2, 1, 4, 4, requires_grad=True)
+    score_map.data[:, :, 3, 3] = 1.0
+    candidates = torch.tensor([
+        [0.875, 0.875, 0.1, 0.1],
+        [0.125, 0.125, 0.1, 0.1],
+    ], requires_grad=True)
+
+    logits = gate(score_map, candidates)
+    validity = logits.softmax(dim=-1)[:, 1]
+    validity.sum().backward()
+
+    assert logits.shape == (2, 2)
+    assert validity[0] > validity[1]
+    assert score_map.grad is None
+    assert candidates.grad is None
+    assert all(parameter.grad is not None for parameter in gate.parameters())
 
 
 def _posterior(present=0.8, absent=0.05, entropy=0.2,
