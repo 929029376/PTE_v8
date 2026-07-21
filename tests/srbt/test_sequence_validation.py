@@ -1623,6 +1623,9 @@ def test_precision_specialist_experiment_defers_full_sequence_validation():
     assert experiment["TRAIN"]["MIN_EPOCH"] == 10
     assert experiment["TRAIN"]["EPOCH"] == 60
     assert experiment["TRAIN"]["REFINE_MAX_EPOCH"] == 12
+    assert experiment["TRAIN"]["LOAD_LATEST"] is True
+    assert experiment["TRAIN"]["VAL_START_EPOCH"] == 61
+    assert experiment["TRAIN"]["VAL_SCHEDULE"] == []
     assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == []
     assert experiment["TRAIN"][
         "SEQUENCE_VAL_TRAIN_IOU_THRESHOLD"] == pytest.approx(0.0)
@@ -1637,7 +1640,7 @@ def test_precision_specialist_experiment_defers_full_sequence_validation():
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_REAPPEAR_SUCCESS"] == 0.0
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
-    assert experiment["TRAIN"]["BEST_LOADER"] == "val"
+    assert experiment["TRAIN"]["BEST_LOADER"] == "train"
     assert experiment["TRAIN"]["BEST_METRIC"] == "Expert/train_iou_2"
     assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
     assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is False

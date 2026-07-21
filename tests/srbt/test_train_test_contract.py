@@ -951,7 +951,7 @@ def test_canonical_precision_strategy_trains_only_owner_two():
     assert configured.TRAIN.BATCH_SIZE == 32
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
-    assert configured.TRAIN.LOAD_LATEST is False
+    assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
         "causal_event_motion_context_v38_20260721/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
@@ -999,8 +999,8 @@ def test_canonical_precision_strategy_trains_only_owner_two():
     assert configured.TRAIN.REBASE_SCHEDULER_ON_RESUME is True
     assert configured.TRAIN.REFINE_TAIL_LR == 0.000001
     assert configured.TRAIN.REFINE_MEMORY_LR == 0.0000005
-    assert configured.TRAIN.VAL_START_EPOCH == 4
-    assert configured.TRAIN.VAL_SCHEDULE == [[4, 60, 2]]
+    assert configured.TRAIN.VAL_START_EPOCH == 61
+    assert configured.TRAIN.VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert configured.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_TRAIN_IOU_THRESHOLD == pytest.approx(
@@ -1028,7 +1028,7 @@ def test_canonical_precision_strategy_trains_only_owner_two():
     assert configured.TRAIN.SAVE_EPOCHS == []
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is True
-    assert configured.TRAIN.BEST_LOADER == "val"
+    assert configured.TRAIN.BEST_LOADER == "train"
     assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_2"
     assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
