@@ -376,16 +376,32 @@ class PETTrackActor(PETTrackBaseActor):
             raise RuntimeError(
                 "pursuit sparse activation requires a trained expert activator")
         was_training = model.training
+        motion_center_jitter = 0.0
+        motion_center_jitter_multiplier = float(getattr(
+            self.settings, "motion_center_jitter_multiplier", 1.0))
+        if specialist_id == 1 and was_training \
+                and motion_center_jitter_multiplier > 1.0:
+            motion_center_jitter = float(getattr(
+                self.settings, "center_jitter_factor", {}).get(
+                    "search", 0.0)) * motion_center_jitter_multiplier
         model.eval()
         controller.train(was_training and specialist_id is None)
         try:
             for frame_index in range(frames.shape[1] - 1):
-                crop_anchors.append(planned_anchor)
+                crop_anchor = planned_anchor
+                if motion_center_jitter > 0.0:
+                    max_offset = (
+                        planned_anchor[:, 2:].prod(dim=1, keepdim=True).sqrt()
+                        * motion_center_jitter)
+                    crop_anchor = planned_anchor.clone()
+                    crop_anchor[:, :2] += max_offset * (
+                        torch.rand_like(crop_anchor[:, :2]) - 0.5)
+                crop_anchors.append(crop_anchor)
                 search, crop_region = dynamic_search_crop(
-                    frames[:, frame_index], planned_anchor,
+                    frames[:, frame_index], crop_anchor,
                     search_factor, search_size)
                 event_search, _ = dynamic_search_crop(
-                    event_frames[:, frame_index], planned_anchor,
+                    event_frames[:, frame_index], crop_anchor,
                     search_factor, search_size)
                 history_valid = previous_event_search is not None
                 motion_context = {
@@ -507,7 +523,7 @@ class PETTrackActor(PETTrackBaseActor):
                     event_confidence=event_confidence.detach(),
                 )
                 current_inside = crop_target_inside(
-                    annotations[:, frame_index], planned_anchor,
+                    annotations[:, frame_index], crop_anchor,
                     search_factor) & present[:, frame_index]
                 current_quality = self._aligned_iou_xywh(
                     observation, annotations[:, frame_index])

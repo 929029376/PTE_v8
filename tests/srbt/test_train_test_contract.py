@@ -932,7 +932,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "causal_motion_v33_20260721/checkpoints/train/pet_track/"
+        "causal_event_motion_v34_20260721/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
@@ -951,9 +951,9 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     assert configured.TRAIN.BATCH_SIZE == 12
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
-    assert configured.TRAIN.LOAD_LATEST is True
+    assert configured.TRAIN.LOAD_LATEST is False
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "causal_motion_v33_20260721/checkpoints/train/pet_track/"
+        "causal_event_motion_v34_20260721/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.TRAIN.STAGE == "pursuit"
     assert configured.TRAIN.EXPERT_PHASE == "pursuit"
@@ -996,8 +996,8 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     assert configured.TRAIN.REBASE_SCHEDULER_ON_RESUME is True
     assert configured.TRAIN.REFINE_TAIL_LR == 0.000001
     assert configured.TRAIN.REFINE_MEMORY_LR == 0.0000005
-    assert configured.TRAIN.VAL_START_EPOCH == 2
-    assert configured.TRAIN.VAL_SCHEDULE == [[2, 30, 2]]
+    assert configured.TRAIN.VAL_START_EPOCH == 4
+    assert configured.TRAIN.VAL_SCHEDULE == [[4, 30, 2]]
     assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert configured.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_TRAIN_IOU_THRESHOLD == pytest.approx(
@@ -1032,13 +1032,13 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     assert configured.TRAIN.GENERALIST_MAX_DROP == 0.005
 
 
-def test_supervisor_uses_causal_event_motion_v34_run_directory():
+def test_supervisor_uses_causal_event_motion_exclusive_v35_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "causal_event_motion_v34_20260721" in supervisor
+    assert "causal_event_motion_exclusive_v35_20260721" in supervisor
     assert "sparse_dispatch_balanced_v32_20260720" not in supervisor
     assert "sparse_dispatch_v31_20260720" not in supervisor
     assert "multilabel_specialists_v29_20260720" not in supervisor
@@ -1062,7 +1062,7 @@ def test_supervisor_uses_causal_event_motion_v34_run_directory():
     assert "--nproc_per_node 2" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "causal_event_motion_v34_20260721/logs && exec") == 2
+        "causal_event_motion_exclusive_v35_20260721/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

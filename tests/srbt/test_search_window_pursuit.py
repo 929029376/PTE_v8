@@ -471,9 +471,16 @@ def test_actor_uses_previous_controller_output_for_the_next_frame_crop(monkeypat
         pet_track_actor_module, "dynamic_search_crop", capture_crop)
     actor = object.__new__(PETTrackActor)
     actor.net = FrozenExperts()
-    actor.settings = SimpleNamespace(search_area_factor={"search": 4.0})
-    actor.cfg = SimpleNamespace(DATA=SimpleNamespace(
-        SEARCH=SimpleNamespace(SIZE=8, FACTOR=4.0)))
+    actor.expert_enabled = True
+    actor.settings = SimpleNamespace(
+        search_area_factor={"search": 4.0},
+        center_jitter_factor={"search": 1.5},
+        motion_center_jitter_multiplier=1.0,
+    )
+    actor.cfg = SimpleNamespace(
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(SIZE=8, FACTOR=4.0)),
+        TRAIN=SimpleNamespace(SPECIALIST_EXPERT_IDS=[1]),
+    )
     frames = torch.zeros(3, 1, 3, 8, 8)
     boxes = torch.tensor([
         [[0.40, 0.40, 0.10, 0.10]],
@@ -487,7 +494,12 @@ def test_actor_uses_previous_controller_output_for_the_next_frame_crop(monkeypat
         "pursuit_search_event_images": frames,
         "pursuit_search_anno": boxes,
         "pursuit_search_present": torch.ones(3, 1, dtype=torch.uint8),
+        "training_expert_id": torch.tensor([1]),
     }
+    challenges = torch.zeros(
+        1, 3, len(pet_track_actor_module.CHALLENGE_NAMES), dtype=torch.bool)
+    challenges[:, :, pet_track_actor_module.CHALLENGE_NAMES.index("motion")] = True
+    data["pursuit_challenge_labels"] = challenges
 
     output = actor._forward_pursuit(data)
 
@@ -498,6 +510,25 @@ def test_actor_uses_previous_controller_output_for_the_next_frame_crop(monkeypat
         captured_anchors[2], output["pursuit_predictions"][0].next_box)
     assert torch.equal(captured_anchors[2], captured_anchors[3])
     assert captured_anchors[2].grad_fn is None
+
+    captured_anchors.clear()
+    actor.settings.motion_center_jitter_multiplier = 2.5
+    monkeypatch.setattr(torch, "rand_like", torch.ones_like)
+
+    output = actor._forward_pursuit(data)
+
+    expected = boxes[0].clone()
+    expected[:, :2] += 0.5 * 1.5 * 2.5 * boxes[0, :, 2:].prod(dim=1).sqrt()[:, None]
+    assert torch.allclose(captured_anchors[0], expected)
+    assert torch.equal(captured_anchors[0], captured_anchors[1])
+    assert torch.equal(output["pursuit_crop_anchors"][0], captured_anchors[0])
+
+    captured_anchors.clear()
+    actor.net.eval()
+
+    actor._forward_pursuit(data)
+
+    assert torch.equal(captured_anchors[0], boxes[0])
 
 
 def test_pursuit_uses_per_row_sparse_activation_with_fixed_expert_slots():
