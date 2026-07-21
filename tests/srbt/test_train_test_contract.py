@@ -936,7 +936,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
-    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
+    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
 
 
 def test_canonical_precision_strategy_trains_only_owner_two():
@@ -960,7 +960,7 @@ def test_canonical_precision_strategy_trains_only_owner_two():
     assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [2]
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
     assert configured.DATA.PURSUIT.ENABLE is False
-    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
+    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
     assert configured.DATA.PURSUIT.WINDOW_LENGTH == 4
     assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
     assert configured.DATA.PURSUIT.TRANSITION_PROBABILITY == pytest.approx(0.0)
