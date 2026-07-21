@@ -517,9 +517,16 @@ def test_actor_uses_previous_controller_output_for_the_next_frame_crop(monkeypat
 
     output = actor._forward_pursuit(data)
 
-    expected = boxes[0].clone()
-    expected[:, :2] += 0.5 * 1.5 * 2.5 * boxes[0, :, 2:].prod(dim=1).sqrt()[:, None]
+    raw_expected = boxes[0].clone()
+    raw_expected[:, :2] += (
+        0.5 * 1.5 * 2.5
+        * boxes[0, :, 2:].prod(dim=1).sqrt()[:, None]
+    )
+    assert not bool(crop_target_inside(boxes[0], raw_expected, 4.0).all())
+    expected = torch.tensor([[0.50, 0.50, 0.10, 0.10]])
     assert torch.allclose(captured_anchors[0], expected)
+    assert bool(crop_target_inside(
+        boxes[0], captured_anchors[0], 4.0).all())
     assert torch.equal(captured_anchors[0], captured_anchors[1])
     assert torch.equal(output["pursuit_crop_anchors"][0], captured_anchors[0])
 

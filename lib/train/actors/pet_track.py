@@ -396,6 +396,32 @@ class PETTrackActor(PETTrackBaseActor):
                     crop_anchor = planned_anchor.clone()
                     crop_anchor[:, :2] += max_offset * (
                         torch.rand_like(crop_anchor[:, :2]) - 0.5)
+                    target = annotations[:, frame_index]
+                    side = (
+                        planned_anchor[:, 2:].prod(dim=1).sqrt()
+                        * search_factor)
+                    slack = (
+                        side[:, None] - target[:, 2:]).clamp_min(0.0)
+                    margin = torch.minimum(
+                        side[:, None] / search_size, 0.25 * slack)
+                    min_center = (
+                        target[:, :2] + target[:, 2:] + margin
+                        - 0.5 * side[:, None])
+                    max_center = (
+                        target[:, :2] - margin
+                        + 0.5 * side[:, None])
+                    desired_center = (
+                        crop_anchor[:, :2] + 0.5 * crop_anchor[:, 2:])
+                    bounded_center = torch.maximum(
+                        torch.minimum(desired_center, max_center), min_center)
+                    nominal_inside = crop_target_inside(
+                        target, planned_anchor, search_factor
+                    ) & present[:, frame_index]
+                    crop_anchor[:, :2] = torch.where(
+                        nominal_inside[:, None],
+                        bounded_center - 0.5 * crop_anchor[:, 2:],
+                        planned_anchor[:, :2],
+                    )
                 crop_anchors.append(crop_anchor)
                 search, crop_region = dynamic_search_crop(
                     frames[:, frame_index], crop_anchor,
