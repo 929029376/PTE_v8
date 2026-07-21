@@ -1102,8 +1102,8 @@ def test_supervisor_uses_dart_reliability_v39_run_directory():
     assert "baseline_safe_small_v2_20260716" not in supervisor
     assert "route_free_specialize_20260716" not in supervisor
     assert "expert_route_20260715" not in supervisor
-    assert "--nproc_per_node 1" in supervisor
-    assert "--nproc_per_node 2" not in supervisor
+    assert "--mode single" in supervisor
+    assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
         "dart_reliability_v39_20260721/logs && exec") == 2
