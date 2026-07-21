@@ -45,11 +45,12 @@ class EventProposalExtractor(nn.Module):
     """Extract deterministic full-frame proposals from Event activity."""
 
     def __init__(self, top_k=5, nms_radius=2, min_robust_score=3.0,
-                 eps=1e-6):
+                 density_kernel_size=1, eps=1e-6):
         super().__init__()
         self.top_k = int(top_k)
         self.nms_radius = int(nms_radius)
         self.min_robust_score = float(min_robust_score)
+        self.density_kernel_size = int(density_kernel_size)
         self.eps = float(eps)
         if self.top_k < 1:
             raise ValueError("top_k must be positive")
@@ -58,6 +59,9 @@ class EventProposalExtractor(nn.Module):
         if (not math.isfinite(self.min_robust_score)
                 or self.min_robust_score < 0.0):
             raise ValueError("min_robust_score must be finite and nonnegative")
+        if (self.density_kernel_size < 1
+                or self.density_kernel_size % 2 == 0):
+            raise ValueError("density_kernel_size must be positive and odd")
         if not math.isfinite(self.eps) or self.eps <= 0.0:
             raise ValueError("eps must be finite and positive")
 
@@ -73,11 +77,29 @@ class EventProposalExtractor(nn.Module):
             raise ValueError(f"{name} must be finite")
 
     def _robust_activity(self, event_frame, background):
-        activity = event_frame.abs().mean(dim=1, keepdim=True)
         if background is not None:
-            activity = (
-                activity - background.abs().mean(dim=1, keepdim=True)
-            ).clamp_min(0.0)
+            activity = (event_frame - background).abs().mean(
+                dim=1, keepdim=True)
+        else:
+            neutral = event_frame.flatten(2).median(
+                dim=-1, keepdim=True).values.unsqueeze(-1)
+            centered = (event_frame - neutral).abs().mean(
+                dim=1, keepdim=True)
+            if event_frame.shape[1] > 1:
+                color_range = (
+                    event_frame.max(dim=1, keepdim=True).values
+                    - event_frame.min(dim=1, keepdim=True).values
+                )
+                activity = torch.maximum(centered, color_range)
+            else:
+                activity = centered
+        if self.density_kernel_size > 1:
+            radius = self.density_kernel_size // 2
+            activity = F.avg_pool2d(
+                F.pad(activity, (radius,) * 4, mode="replicate"),
+                kernel_size=self.density_kernel_size,
+                stride=1,
+            )
         flat = activity.flatten(2)
         median = flat.median(dim=-1, keepdim=True).values
         deviation = (flat - median).abs()

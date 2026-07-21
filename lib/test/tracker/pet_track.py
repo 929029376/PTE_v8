@@ -158,6 +158,8 @@ class PETTrack(BaseTracker):
             nms_radius=int(getattr(redetect_cfg, "EVENT_NMS_RADIUS", 12)),
             min_robust_score=float(getattr(
                 redetect_cfg, "EVENT_MIN_ROBUST_SCORE", 3.0)),
+            density_kernel_size=int(getattr(
+                redetect_cfg, "EVENT_DENSITY_KERNEL_SIZE", 25)),
         ).to(self.device)
 
     def _reset_srbt_sequence_state(self):

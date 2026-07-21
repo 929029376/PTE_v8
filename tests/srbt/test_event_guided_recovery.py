@@ -33,6 +33,25 @@ def test_zero_event_frame_returns_finite_invalid_proposals():
     assert not output["valid"].any()
 
 
+def test_white_background_colored_events_are_ranked_by_local_density():
+    event = torch.full((1, 3, 33, 33), 255.0)
+    event[0, :, 4, 4] = torch.tensor([255.0, 0.0, 0.0])
+    event[0, :, 22:27, 23:28] = torch.tensor([0.0, 0.0, 255.0])[:, None, None]
+    extractor = EventProposalExtractor(
+        top_k=2,
+        nms_radius=3,
+        min_robust_score=1.0,
+        density_kernel_size=7,
+    )
+
+    output = extractor(event)
+
+    assert output["valid"].any()
+    x, y = output["centers"][0, 0].tolist()
+    assert 23 / 32 <= x <= 27 / 32
+    assert 22 / 32 <= y <= 26 / 32
+
+
 def test_top_k_is_score_ordered_and_uses_original_image_coordinates():
     event = torch.zeros(1, 2, 5, 9)
     event[:, :, 1, 2] = 5.0

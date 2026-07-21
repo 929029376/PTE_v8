@@ -932,11 +932,12 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "causal_event_motion_context_v38_20260721/checkpoints/train/pet_track/"
+        "precision_recovery_merged_v45_20260722/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
+    assert configured.MODEL.REDETECT.EVENT_DENSITY_KERNEL_SIZE == 25
 
 
 def test_canonical_precision_strategy_trains_only_owner_two():
@@ -953,7 +954,7 @@ def test_canonical_precision_strategy_trains_only_owner_two():
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "causal_event_motion_context_v38_20260721/checkpoints/train/pet_track/"
+        "precision_recovery_merged_v45_20260722/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.TRAIN.STAGE == "specialize"
     assert configured.TRAIN.EXPERT_PHASE == "specialize"
