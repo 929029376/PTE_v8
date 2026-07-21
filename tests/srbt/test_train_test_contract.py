@@ -932,8 +932,8 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "search_pursuit_v30_20260720/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_latest.pth.tar")
+        "causal_motion_v33_20260721/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -953,8 +953,8 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "search_pursuit_v30_20260720/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_latest.pth.tar")
+        "causal_motion_v33_20260721/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.TRAIN.STAGE == "pursuit"
     assert configured.TRAIN.EXPERT_PHASE == "pursuit"
     assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1]
@@ -975,6 +975,7 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     assert configured.TRAIN.REFINE_MAX_EPOCH == 12
     assert configured.TRAIN.LR == 0.00001
     assert configured.TRAIN.PURSUIT_LR == pytest.approx(0.0001)
+    assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(1.0)
     assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
     assert configured.TRAIN.ACTIVATOR_ADVANTAGE_MARGIN == pytest.approx(0.02)
     assert configured.TRAIN.ACTIVATOR_POS_WEIGHT == [4.0, 5.0, 1.5, 2.5]

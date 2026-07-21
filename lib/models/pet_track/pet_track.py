@@ -24,7 +24,7 @@ from lib.utils.box_ops import box_xyxy_to_cxcywh
 
 
 class PETTrack(nn.Module):
-    ARCHITECTURE_VERSION = 27
+    ARCHITECTURE_VERSION = 28
     _PET_STATE_PREFIXES = (
         "visibility_gate.", "rgb_identity_verifier.", "redetect_expert.",
         "small_target_expert.", "proposal_adapters.",
@@ -395,9 +395,15 @@ class PETTrack(nn.Module):
             prediction["batch_indices"] = indices
         return prediction
 
-    def _fuse_expert_search(self, name, rgb, event, context):
+    def _fuse_expert_search(
+            self, name, rgb, event, context, motion_context=None):
+        fusion_context = (
+            motion_context
+            if name == self.motion_expert_name and motion_context is not None
+            else context
+        )
         return self.expert_fusion.forward_expert(
-            name, rgb, event, context=context)
+            name, rgb, event, context=fusion_context)
 
     def _expert_context(self, cat_feature):
         return {
@@ -545,7 +551,8 @@ class PETTrack(nn.Module):
 
     def _forward_shared_expert(self, name, rgb, event, context,
                                gt_score_map, cache,
-                               detach_dependencies=False):
+                               detach_dependencies=False,
+                               motion_context=None):
         if name in cache:
             return cache[name]
         parent = self.proposal_parents.get(name)
@@ -565,16 +572,19 @@ class PETTrack(nn.Module):
                     with torch.no_grad():
                         self._forward_shared_expert(
                             parent, rgb, event, context, gt_score_map, cache,
-                            detach_dependencies=True)
+                            detach_dependencies=True,
+                            motion_context=motion_context)
                 finally:
                     for module, training in zip(
                             dependency_modules, training_states):
                         module.train(training)
             else:
                 self._forward_shared_expert(
-                    parent, rgb, event, context, gt_score_map, cache)
+                    parent, rgb, event, context, gt_score_map, cache,
+                    motion_context=motion_context)
         fused = self._fuse_expert_search(
-            name, rgb, event, context=context)
+            name, rgb, event, context=context,
+            motion_context=motion_context)
         output = self._forward_box_head(
             fused, gt_score_map, expert_name=name)
         if parent in cache:
@@ -585,7 +595,8 @@ class PETTrack(nn.Module):
 
     def forward_head(self, cat_feature, gt_score_map=None,
                      training_expert_ids=None, active_expert_names=None,
-                     auto_activate=False, return_activation_logits=False):
+                     auto_activate=False, return_activation_logits=False,
+                     motion_context=None):
         search = cat_feature[:, -self.feat_len_s * 2:]
         rgb = search[:, :self.feat_len_s]
         event = search[:, self.feat_len_s:]
@@ -603,7 +614,8 @@ class PETTrack(nn.Module):
                     "precision expert must bypass the shared forward head")
             out = self._forward_shared_expert(
                 name, rgb, event, self._expert_context(cat_feature),
-                gt_score_map, {}, detach_dependencies=True)
+                gt_score_map, {}, detach_dependencies=True,
+                motion_context=motion_context)
             return out
 
         context = self._expert_context(cat_feature)
@@ -613,7 +625,8 @@ class PETTrack(nn.Module):
         if auto_activate or return_activation_logits:
             generalist = self._forward_shared_expert(
                 self.default_expert, rgb, event, context,
-                gt_score_map, expert_outputs)
+                gt_score_map, expert_outputs,
+                motion_context=motion_context)
             activation_logits = self.expert_activator(
                 rgb, event, generalist["score_map"],
                 generalist["pred_boxes"])
@@ -630,12 +643,14 @@ class PETTrack(nn.Module):
                 continue
             if auto_activate:
                 fused = self._fuse_expert_search(
-                    name, rgb, event, context=context)
+                    name, rgb, event, context=context,
+                    motion_context=motion_context)
                 expert_outputs[name] = self._forward_box_head(
                     fused, gt_score_map, expert_name=name)
             else:
                 self._forward_shared_expert(
-                    name, rgb, event, context, gt_score_map, expert_outputs)
+                    name, rgb, event, context, gt_score_map, expert_outputs,
+                    motion_context=motion_context)
         if auto_activate:
             self._condition_auto_activated_shared_outputs(
                 expert_outputs, activation_mask)
@@ -650,7 +665,8 @@ class PETTrack(nn.Module):
     def _forward_amt_core(self, zi, ze, xi, xe, encoded_templates=None,
                           training_expert_ids=None,
                           active_expert_names=None, auto_activate=False,
-                          return_activation_logits=False, **kwargs):
+                          return_activation_logits=False,
+                          motion_context=None, **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
         else:
@@ -663,6 +679,8 @@ class PETTrack(nn.Module):
             head_kwargs["auto_activate"] = True
         if return_activation_logits:
             head_kwargs["return_activation_logits"] = True
+        if motion_context is not None:
+            head_kwargs["motion_context"] = motion_context
         out = self.forward_head(feat, **head_kwargs)
         out.update(aux)
         out["backbone_feat"] = feat
@@ -676,6 +694,7 @@ class PETTrack(nn.Module):
                       active_expert_names=None,
                       auto_activate=False,
                       return_activation_logits=False,
+                      motion_context=None,
                       **kwargs):
         if encoded_templates is None:
             feat, aux = self._run_backbone(zi, ze, xi, xe, **kwargs)
@@ -689,6 +708,8 @@ class PETTrack(nn.Module):
             head_kwargs["auto_activate"] = True
         if return_activation_logits:
             head_kwargs["return_activation_logits"] = True
+        if motion_context is not None:
+            head_kwargs["motion_context"] = motion_context
         out = self.forward_head(feat, **head_kwargs)
         out.update(aux)
         out["backbone_feat"] = feat
@@ -789,7 +810,8 @@ class PETTrack(nn.Module):
 
     def inference(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe,
                   small_template_features=None, active_expert_names=None,
-                  auto_activate=False, return_activation_logits=False):
+                  auto_activate=False, return_activation_logits=False,
+                  motion_context=None):
         if auto_activate and active_expert_names is not None:
             raise ValueError(
                 "explicit and automatic expert activation are mutually exclusive")
@@ -819,14 +841,16 @@ class PETTrack(nn.Module):
                 encoded_templates=encoded_templates,
                 active_expert_names=active_experts,
                 auto_activate=auto_activate,
-                return_activation_logits=return_activation_logits)
+                return_activation_logits=return_activation_logits,
+                motion_context=motion_context)
         else:
             out = self._forward_amt_core(
                 static_zi, static_ze, xi, xe,
                 encoded_templates=encoded_templates,
                 active_expert_names=active_experts,
                 auto_activate=auto_activate,
-                return_activation_logits=return_activation_logits)
+                return_activation_logits=return_activation_logits,
+                motion_context=motion_context)
         if auto_activate:
             precision_id = self.expert_names.index(
                 self.precision_refiner_name)
@@ -1187,6 +1211,11 @@ def _load_retained_model_checkpoint(
     if source_version is None or source_version < 27:
         migration_prefixes = (
             *migration_prefixes, "expert_activator.")
+    if source_version is None or source_version < 28:
+        migration_prefixes = (
+            *migration_prefixes,
+            "expert_fusion.experts.motion_fm.temporal_",
+        )
     extension_prefixes = ("_pet_architecture_version", *migration_prefixes)
     retained = sorted(
         key for key in target if not key.startswith(extension_prefixes))

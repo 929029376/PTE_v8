@@ -44,6 +44,13 @@ def _inherited_state(model, *, module_prefix=False):
     return state
 
 
+def _motion_temporal_keys(model):
+    return sorted(
+        key for key in model.state_dict()
+        if key.startswith("expert_fusion.experts.motion_fm.temporal_")
+    )
+
+
 def test_loads_complete_inherited_state_and_reports_extensions(tmp_path):
     model = _TinyTracker()
     extension_before = {
@@ -147,6 +154,42 @@ def test_v26_checkpoint_retains_all_weights_and_initializes_only_activator(tmp_p
         for key, value in activator_before.items()
     )
     assert report["initialized_extension_keys"] == sorted(activator_before)
+
+
+def test_v27_checkpoint_retains_old_weights_and_initializes_motion_history(
+        tmp_path):
+    from tests.srbt.test_srbt_model_integration import _model
+
+    model = _model(expert_enabled=True)
+    assert model.ARCHITECTURE_VERSION == 28
+    temporal_keys = _motion_temporal_keys(model)
+    assert temporal_keys
+    temporal_before = {
+        key: model.state_dict()[key].clone() for key in temporal_keys
+    }
+    source = {
+        key: torch.full_like(value, 0.625)
+        for key, value in model.state_dict().items()
+        if key not in temporal_before and key != "_pet_architecture_version"
+    }
+    source["_pet_architecture_version"] = torch.tensor(27)
+    checkpoint = tmp_path / "v27-motion-history.pth.tar"
+    torch.save({"net": source}, checkpoint)
+
+    report = _load_retained_model_checkpoint(
+        model, checkpoint, label="v27 motion-history migration")
+
+    loaded = model.state_dict()
+    assert all(
+        torch.equal(loaded[key], value)
+        for key, value in source.items()
+        if key != "_pet_architecture_version"
+    )
+    assert all(
+        torch.equal(loaded[key], value)
+        for key, value in temporal_before.items()
+    )
+    assert report["initialized_extension_keys"] == temporal_keys
 
 
 def test_baseline_loader_clones_loaded_box_head_into_every_specialist(tmp_path):
@@ -359,7 +402,7 @@ def test_retained_v13_checkpoint_initializes_v23_small_extensions(tmp_path):
     from tests.srbt.test_srbt_model_integration import _model
 
     model = _model(expert_enabled=True)
-    assert model.ARCHITECTURE_VERSION == 27
+    assert model.ARCHITECTURE_VERSION == 28
     source = {
         key: value.clone() for key, value in model.state_dict().items()
     }
@@ -491,7 +534,7 @@ def test_retained_v18_checkpoint_initializes_only_v23_box_refiner(tmp_path):
 
     proposal_keys = sorted(
         key for key in source if key.startswith("proposal_adapters."))
-    assert model.ARCHITECTURE_VERSION == 27
+    assert model.ARCHITECTURE_VERSION == 28
     assert report["initialized_extension_keys"] == sorted(
         box_refiner_keys + proposal_keys)
     assert torch.equal(model.state_dict()[inherited_key], source[inherited_key])
@@ -503,7 +546,7 @@ def test_retained_v22_checkpoint_reinitializes_v23_box_refiner(tmp_path):
     from tests.srbt.test_srbt_model_integration import _model
 
     model = _model(expert_enabled=True)
-    assert model.ARCHITECTURE_VERSION == 27
+    assert model.ARCHITECTURE_VERSION == 28
     source = {
         key: value.clone() for key, value in model.state_dict().items()
     }
@@ -538,7 +581,7 @@ def test_retained_v23_checkpoint_rejects_missing_box_refiner_tensor(tmp_path):
     from tests.srbt.test_srbt_model_integration import _model
 
     model = _model(expert_enabled=True)
-    assert model.ARCHITECTURE_VERSION == 27
+    assert model.ARCHITECTURE_VERSION == 28
     source = {
         key: value.clone() for key, value in model.state_dict().items()
         if not key.startswith("proposal_adapters.")
@@ -560,7 +603,7 @@ def test_retained_v23_checkpoint_initializes_v24_proposal_adapters(tmp_path):
     from tests.srbt.test_srbt_model_integration import _model
 
     model = _model(expert_enabled=True)
-    assert model.ARCHITECTURE_VERSION == 27
+    assert model.ARCHITECTURE_VERSION == 28
     source = {
         key: value.clone() for key, value in model.state_dict().items()
         if not key.startswith("proposal_adapters.")
@@ -587,7 +630,7 @@ def test_retained_v24_checkpoint_migrates_precision_refiner_adapter(tmp_path):
     from tests.srbt.test_srbt_model_integration import _model
 
     model = _model(expert_enabled=True)
-    assert model.ARCHITECTURE_VERSION == 27
+    assert model.ARCHITECTURE_VERSION == 28
     source = {
         key: value.clone() for key, value in model.state_dict().items()
     }

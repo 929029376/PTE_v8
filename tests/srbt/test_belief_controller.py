@@ -222,6 +222,139 @@ def test_new_sequence_resets_runtime_recovery_state():
     assert not hasattr(tracker, "_expert_probabilities")
 
 
+def test_tracker_motion_context_is_causal_and_resets_between_sequences():
+    tracker = object.__new__(PETTrack)
+    tracker.state = [10.0, 20.0, 4.0, 8.0]
+    PETTrack._reset_srbt_sequence_state(tracker)
+    first_event = torch.ones(1, 3, 16, 16, requires_grad=True)
+
+    first = PETTrack._build_motion_context(
+        tracker,
+        first_event,
+        reference_state=[10.0, 20.0, 4.0, 8.0],
+    )
+
+    assert not bool(first["history_valid"].any())
+    assert first["current_event"] is first_event
+    assert first["previous_event"] is first_event
+    assert torch.equal(first["box_delta"], torch.zeros(1, 4))
+
+    PETTrack._commit_motion_event_search(tracker, first_event)
+    first_event.detach().zero_()
+    second_event = torch.full((1, 3, 16, 16), 2.0)
+    second = PETTrack._build_motion_context(
+        tracker,
+        second_event,
+        reference_state=[14.0, 22.0, 4.0, 8.0],
+    )
+
+    assert bool(second["history_valid"].all())
+    assert second["current_event"] is second_event
+    assert torch.equal(second["previous_event"], torch.ones_like(second_event))
+    assert second["box_delta"][0].tolist() == [1.0, 0.25, 0.0, 0.0]
+    assert not second["previous_event"].requires_grad
+
+    PETTrack._reset_srbt_sequence_state(tracker)
+    assert tracker._motion_previous_event_search is None
+
+
+def test_track_commits_final_refined_motion_event_once(monkeypatch):
+    class _Preprocessor:
+        @staticmethod
+        def process(image, _mask):
+            return SimpleNamespace(tensors=image)
+
+    class _Thor:
+        def __init__(self):
+            self.resume_count = 0
+
+        def resume(self):
+            self.resume_count += 1
+
+        @staticmethod
+        def commit(*_args, **_kwargs):
+            raise AssertionError("closed memory frame must not commit")
+
+    tracker = object.__new__(PETTrack)
+    tracker.frame_id = 0
+    tracker.state = [10.0, 10.0, 8.0, 8.0]
+    tracker.params = SimpleNamespace(
+        search_factor=4.0,
+        search_size=32,
+        template_factor=2.0,
+        template_size=16,
+    )
+    tracker.preprocessor = _Preprocessor()
+    tracker.thor_wrapper = _Thor()
+    tracker._srbt_last_action = Action.ABSENT
+    tracker._pending_redetect_box = [12.0, 12.0, 8.0, 8.0]
+    tracker._last_redetect_error = ""
+    tracker._recovery_diagnostics = []
+    tracker._expert_diagnostics = []
+    tracker._search_diagnostics = []
+    tracker.expert_names = (
+        "generalist", "motion_fm", "precision_refiner",
+        "visibility_foc_ov", "discrimination_bi",
+    )
+    tracker.debug = False
+    tracker.use_visdom = False
+
+    initial_event = torch.ones(1, 3, 32, 32)
+    refined_event = torch.full((1, 3, 32, 32), 2.0)
+    template_event = torch.full((1, 3, 16, 16), 3.0)
+    sample_calls = iter((
+        (torch.zeros_like(initial_event), initial_event, 1.0, None),
+        (torch.zeros_like(template_event), template_event, 1.0, None),
+    ))
+    monkeypatch.setattr(
+        "lib.test.tracker.pet_track.sample_target",
+        lambda **_kwargs: next(sample_calls),
+    )
+
+    def candidate(event_tensor, state):
+        return {
+            "state": list(state),
+            "score_peak": 0.8,
+            "response": torch.ones(1, 1, 2, 2),
+            "presence_score": torch.tensor([0.8]),
+            "memory_frame_open": False,
+            "expert_states": [list(state) for _ in tracker.expert_names],
+            "motion_event_search": event_tensor,
+        }
+
+    initial_candidate = candidate(initial_event, [11.0, 11.0, 8.0, 8.0])
+    refined_candidate = candidate(refined_event, [13.0, 13.0, 8.0, 8.0])
+    tracker._search_state_for_frame = lambda: list(tracker.state)
+    tracker._run_local_candidate = lambda *_args, **_kwargs: initial_candidate
+    tracker._run_recovery_cycle = lambda *_args: {}
+    tracker._best_recovery_confirmation = lambda _recovery: (0.9, 0.9)
+    tracker._step_srbt_controller = lambda *_args, **_kwargs: SimpleNamespace(
+        action=Action.TRACK,
+        output_score=0.9,
+        allow_recent_write=False,
+        allow_long_write=False,
+    )
+    tracker._refine_pending_recovery = lambda *_args: refined_candidate
+    tracker._resolve_tracking_state = (
+        lambda local_state, *_args, **_kwargs: list(local_state))
+    tracker._plan_next_search_state = lambda *_args: None
+    tracker._record_search_diagnostic = lambda *_args, **_kwargs: None
+    tracker._recovery_diagnostic_value = lambda *_args, **_kwargs: 0.0
+    committed = []
+    tracker._commit_motion_event_search = committed.append
+
+    result = PETTrack.track(
+        tracker,
+        torch.zeros(40, 40, 3).numpy(),
+        torch.zeros(40, 40, 3).numpy(),
+    )
+
+    assert len(committed) == 1
+    assert committed[0] is refined_event
+    assert result["target_bbox"] == refined_candidate["state"]
+    assert tracker.thor_wrapper.resume_count == 1
+
+
 def test_tracker_uses_all_experts_without_hidden_selector_history():
     class Thor:
         def begin_frame(self):

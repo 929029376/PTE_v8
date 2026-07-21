@@ -1,4 +1,7 @@
+import math
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -36,14 +39,91 @@ class MotionFusion(nn.Module):
         self.event_gain = nn.Parameter(torch.zeros(1))
         self.diff_adapter = _ResidualAdapter(embed_dim)
         self.event_adapter = _ResidualAdapter(embed_dim)
+        temporal_dim = max(min(embed_dim // 32, 32), 8)
+        self.temporal_stem = nn.Sequential(
+            nn.Conv2d(2, temporal_dim, 3, padding=1, bias=False),
+            nn.GroupNorm(1, temporal_dim),
+            nn.GELU(),
+            nn.Conv2d(
+                temporal_dim, temporal_dim, 3, stride=2, padding=1,
+                groups=temporal_dim, bias=False),
+            nn.GroupNorm(1, temporal_dim),
+            nn.GELU(),
+            nn.Conv2d(temporal_dim, embed_dim, 1, bias=False),
+        )
+        self.temporal_box = nn.Sequential(
+            nn.Linear(4, temporal_dim),
+            nn.GELU(),
+            nn.Linear(temporal_dim, embed_dim),
+        )
+        self.temporal_norm = nn.LayerNorm(embed_dim)
+        self.temporal_scale = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _event_energy(event_image):
+        flattened = event_image.flatten(2)
+        median = flattened.median(dim=-1).values[..., None, None]
+        energy = (event_image - median).abs().mean(dim=1, keepdim=True)
+        scale = energy.flatten(2).mean(dim=-1, keepdim=True)[..., None]
+        return energy / scale.clamp_min(1e-6)
+
+    def _temporal_residual(self, tokens, context):
+        required = (
+            "current_event", "previous_event", "history_valid", "box_delta")
+        if not isinstance(context, dict) or any(
+                key not in context for key in required):
+            return None
+        current = torch.as_tensor(
+            context["current_event"], device=tokens.device,
+            dtype=tokens.dtype)
+        previous = torch.as_tensor(
+            context["previous_event"], device=tokens.device,
+            dtype=tokens.dtype)
+        if current.ndim != 4 or previous.shape != current.shape:
+            raise ValueError(
+                "causal motion events must have matching [B, C, H, W] shapes")
+        if current.shape[0] != tokens.shape[0]:
+            raise ValueError("causal motion event batch must match token batch")
+        history_valid = torch.as_tensor(
+            context["history_valid"], device=tokens.device,
+            dtype=torch.bool).reshape(-1)
+        if history_valid.numel() != tokens.shape[0]:
+            raise ValueError("history_valid must provide one flag per batch row")
+        if not bool(history_valid.any()):
+            return None
+        box_delta = torch.as_tensor(
+            context["box_delta"], device=tokens.device,
+            dtype=tokens.dtype)
+        if box_delta.shape != (tokens.shape[0], 4):
+            raise ValueError("box_delta must have shape [B, 4]")
+
+        current_energy = self._event_energy(current)
+        previous_energy = self._event_energy(previous)
+        motion_image = torch.cat((
+            current_energy,
+            current_energy - previous_energy,
+        ), dim=1)
+        temporal = self.temporal_stem(motion_image)
+        token_count = tokens.shape[1]
+        side = math.isqrt(token_count)
+        output_size = (side, side) if side * side == token_count else (1, token_count)
+        temporal = F.adaptive_avg_pool2d(temporal, output_size)
+        temporal = temporal.flatten(2).transpose(1, 2)
+        temporal = self.temporal_norm(
+            temporal + self.temporal_box(box_delta).unsqueeze(1))
+        return temporal * history_valid[:, None, None].to(tokens.dtype)
 
     def forward(self, rgb_tokens, event_tokens, context=None):
         fused = rgb_tokens * (1.0 + self.rgb_gain) + event_tokens * (1.0 + self.event_gain)
-        return (
+        output = (
             fused
             + self.diff_adapter(event_tokens - rgb_tokens)
             + self.event_adapter(event_tokens)
         )
+        temporal = self._temporal_residual(output, context)
+        if temporal is None:
+            return output
+        return output + torch.tanh(self.temporal_scale) * temporal
 
 
 class TemplateBridgeFusion(nn.Module):

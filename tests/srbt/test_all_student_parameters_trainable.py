@@ -329,6 +329,44 @@ def test_pursuit_single_specialist_trains_only_declared_motion_path():
         "causal_specialist_motion"]
 
 
+def test_real_motion_pursuit_optimizer_includes_temporal_branch_only():
+    from tests.srbt.test_srbt_model_integration import _model
+
+    model = _model(expert_enabled=True)
+    model.search_window_controller = SearchWindowController(
+        expert_count=len(model.expert_names), hidden_dim=16)
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "pursuit"
+    cfg.TRAIN.SPECIALIST_EXPERT_IDS = [1]
+
+    groups = _optimizer_groups(model, cfg)
+    named = dict(model.named_parameters())
+    temporal_names = sorted(
+        name for name in named
+        if name.startswith(
+            "expert_fusion.experts.motion_fm.temporal_")
+    )
+    optimized = {
+        id(parameter)
+        for group in groups
+        for parameter in group["params"]
+    }
+
+    assert temporal_names
+    assert all(named[name].requires_grad for name in temporal_names)
+    assert all(id(named[name]) in optimized for name in temporal_names)
+    assert all(
+        not parameter.requires_grad
+        for name, parameter in named.items()
+        if not name.startswith((
+            "expert_fusion.experts.motion_fm.",
+            "expert_fusion.residual_scale_logits.motion_fm",
+            "expert_heads.motion_fm.",
+            "proposal_adapters.motion_fm.",
+        ))
+    )
+
+
 def test_baseline_path_is_bitwise_immutable_after_precision_expert_step(tmp_path):
     torch.manual_seed(29)
     model = TinyStudent()

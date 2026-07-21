@@ -372,16 +372,21 @@ def test_inference_reuses_cached_independent_template_features(monkeypatch):
 def test_sparse_inference_runs_only_motion_and_required_generalist(monkeypatch):
     model = _model(expert_enabled=True).eval()
     calls = {name: 0 for name in model.shared_expert_names}
+    contexts = {}
+
+    def counted_forward(name, forward):
+        def call(*args, **kwargs):
+            calls[name] += 1
+            contexts[name] = kwargs.get("context")
+            return forward(*args, **kwargs)
+        return call
+
     for name in model.shared_expert_names:
         fusion = model.expert_fusion.experts[name]
-        original = fusion.forward
         monkeypatch.setattr(
             fusion,
             "forward",
-            lambda *args, _name=name, _forward=original, **kwargs: (
-                calls.__setitem__(_name, calls[_name] + 1)
-                or _forward(*args, **kwargs)
-            ),
+            counted_forward(name, fusion.forward),
         )
     small_calls = {"count": 0}
     monkeypatch.setattr(
@@ -391,6 +396,12 @@ def test_sparse_inference_runs_only_motion_and_required_generalist(monkeypatch):
             "count", small_calls["count"] + 1),
     )
 
+    motion_context = {
+        "current_event": torch.randn(1, 3, 16, 16),
+        "previous_event": torch.randn(1, 3, 16, 16),
+        "history_valid": torch.tensor([True]),
+        "box_delta": torch.zeros(1, 4),
+    }
     with torch.no_grad():
         output = model.inference(
             torch.randn(1, 3, 16, 16),
@@ -400,6 +411,7 @@ def test_sparse_inference_runs_only_motion_and_required_generalist(monkeypatch):
             torch.randn(1, 1, 3, 16, 16),
             torch.randn(1, 1, 3, 16, 16),
             active_expert_names=("motion_fm",),
+            motion_context=motion_context,
         )
 
     assert tuple(output["expert_outputs"]) == ("generalist", "motion_fm")
@@ -410,6 +422,9 @@ def test_sparse_inference_runs_only_motion_and_required_generalist(monkeypatch):
         "discrimination_bi": 0,
     }
     assert small_calls == {"count": 0}
+    assert contexts["motion_fm"] is motion_context
+    assert contexts["generalist"] is not motion_context
+    assert "template_tokens" in contexts["generalist"]
 
 
 def test_sparse_generalist_inference_accepts_encoded_static_templates(

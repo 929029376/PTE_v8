@@ -22,12 +22,14 @@ from lib.models.layers.search_window_controller import (
     crop_target_inside,
     dynamic_search_crop,
     event_motion_centroid,
+    relative_box_motion,
     search_window_pursuit_loss,
 )
 
 
 REQUIRED_PRESENCE_PREDICTIONS = frozenset({"logits", "score"})
 VISIBILITY_EXPERT_ID = 3
+MOTION_EXPERT_ID = 1
 ADVANTAGE_EXPERT_IDS = frozenset({1, 2, 4})
 
 
@@ -348,6 +350,7 @@ class PETTrackActor(PETTrackBaseActor):
         search_size = int(self.cfg.DATA.SEARCH.SIZE)
         planned_anchor = annotations[:, 0].detach()
         previous_observation = planned_anchor
+        previous_event_search = None
         predictions = []
         targets = []
         current_inside_values = []
@@ -357,6 +360,8 @@ class PETTrackActor(PETTrackBaseActor):
         specialist_outputs = []
         specialist_targets = []
         specialist_present = []
+        specialist_image_boxes = []
+        specialist_image_targets = []
         expert_cfg = getattr(
             getattr(self.cfg, "MODEL", None), "EXPERT", None)
         use_activation = bool(getattr(
@@ -380,11 +385,25 @@ class PETTrackActor(PETTrackBaseActor):
                 event_search, _ = dynamic_search_crop(
                     event_frames[:, frame_index], planned_anchor,
                     search_factor, search_size)
+                history_valid = previous_event_search is not None
+                motion_context = {
+                    "current_event": event_search,
+                    "previous_event": (
+                        event_search
+                        if previous_event_search is None
+                        else previous_event_search),
+                    "history_valid": torch.full(
+                        (search.shape[0],), history_valid,
+                        device=search.device, dtype=torch.bool),
+                    "box_delta": relative_box_motion(
+                        planned_anchor, previous_observation),
+                }
                 with torch.set_grad_enabled(specialist_id is not None):
                     inference_kwargs = dict(
                         static_zi=zi[:, 0], static_ze=ze[:, 0],
                         dynamic_zi=zi[:, 1:], dynamic_ze=ze[:, 1:],
-                        xi=search, xe=event_search)
+                        xi=search, xe=event_search,
+                        motion_context=motion_context)
                     if specialist_id is not None:
                         inference_kwargs["active_expert_names"] = (
                             specialist_name,)
@@ -509,6 +528,9 @@ class PETTrackActor(PETTrackBaseActor):
                         & specialist_eligible[:, frame_index])
                     specialist_outputs.append(
                         expert_outputs[specialist_name])
+                    specialist_image_boxes.append(observation)
+                    specialist_image_targets.append(
+                        annotations[:, frame_index])
                 predictions.append(prediction)
                 targets.append(annotations[:, frame_index + 1])
                 current_inside_values.append(current_inside)
@@ -516,6 +538,7 @@ class PETTrackActor(PETTrackBaseActor):
                 present_next_values.append(present[:, frame_index + 1])
                 previous_observation = observation.detach()
                 planned_anchor = prediction.next_box.detach()
+                previous_event_search = event_search.detach()
         finally:
             model.train(was_training)
         return {
@@ -529,6 +552,8 @@ class PETTrackActor(PETTrackBaseActor):
             "pursuit_specialist_outputs": specialist_outputs,
             "pursuit_specialist_targets": specialist_targets,
             "pursuit_specialist_present": specialist_present,
+            "pursuit_specialist_image_boxes": specialist_image_boxes,
+            "pursuit_specialist_image_targets": specialist_image_targets,
         }
 
     # helpers for the CE logic (kept local)
@@ -864,6 +889,45 @@ class PETTrackActor(PETTrackBaseActor):
             loss = torch.stack(specialist_losses).sum() / specialist_weight
         else:
             loss = controller_loss
+        motion_loss = loss * 0.0
+        motion_pair_count = 0
+        if specialist_id == MOTION_EXPERT_ID:
+            image_boxes = predictions.get(
+                "pursuit_specialist_image_boxes", ())
+            image_targets = predictions.get(
+                "pursuit_specialist_image_targets", ())
+            image_present = predictions.get(
+                "pursuit_specialist_present", ())
+            if (image_boxes or image_targets) and not (
+                    len(image_boxes) == len(image_targets)
+                    == len(image_present)):
+                raise RuntimeError(
+                    "motion pursuit fields must describe the same causal steps")
+            pair_losses = []
+            pair_weights = []
+            for index in range(1, len(image_boxes)):
+                pair_mask = image_present[index - 1] & image_present[index]
+                if not bool(pair_mask.any()):
+                    continue
+                predicted_motion = relative_box_motion(
+                    image_boxes[index], image_boxes[index - 1])
+                target_motion = relative_box_motion(
+                    image_targets[index], image_targets[index - 1])
+                per_row = F.smooth_l1_loss(
+                    predicted_motion, target_motion, reduction="none"
+                ).mean(dim=-1)
+                pair_losses.append(
+                    (per_row * pair_mask.to(per_row.dtype)).sum())
+                pair_weights.append(pair_mask.float().sum())
+                motion_pair_count += int(pair_mask.sum())
+            if pair_losses:
+                motion_loss = (
+                    torch.stack(pair_losses).sum()
+                    / torch.stack(pair_weights).sum().clamp_min(1.0)
+                )
+                motion_weight = float(getattr(
+                    train_cfg, "MOTION_DISPLACEMENT_WEIGHT", 1.0))
+                loss = loss + motion_weight * motion_loss
         if not return_status:
             return loss
         status = {
@@ -874,6 +938,12 @@ class PETTrackActor(PETTrackBaseActor):
         status["Loss/total"] = float(loss.detach())
         status["Loss/pursuit_controller_diagnostic"] = float(
             controller_loss.detach())
+        motion_weight = float(getattr(
+            train_cfg, "MOTION_DISPLACEMENT_WEIGHT", 1.0))
+        status["Loss/motion_displacement"] = float(motion_loss.detach())
+        status["Loss/motion_displacement_weighted"] = float(
+            (motion_weight * motion_loss).detach())
+        status["MotionTrain/pair_count"] = motion_pair_count
         if specialist_statuses:
             total_weight = sum(
                 float(weight.detach()) for _, weight in specialist_statuses)

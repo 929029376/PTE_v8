@@ -29,7 +29,10 @@ from lib.models.layers.expert_ensemble import (
     fuse_expert_predictions,
     normalized_response_psr,
 )
-from lib.models.layers.search_window_controller import event_motion_centroid
+from lib.models.layers.search_window_controller import (
+    event_motion_centroid,
+    relative_box_motion,
+)
 from lib.train.trainers.base_trainer import load_srbt_checkpoint_file
 
 
@@ -167,6 +170,35 @@ class PETTrack(BaseTracker):
         self._search_diagnostics = []
         self._planned_search_state = None
         self._search_controller_previous_box = None
+        self._motion_previous_event_search = None
+
+    def _build_motion_context(self, event_search, reference_state=None):
+        previous_event = getattr(
+            self, "_motion_previous_event_search", None)
+        history_valid = previous_event is not None
+        current_state = (
+            self.state if reference_state is None else reference_state)
+        previous_state = getattr(self, "state", None)
+        if previous_state is None:
+            previous_state = current_state
+        current_box = torch.as_tensor(
+            current_state, device=event_search.device,
+            dtype=event_search.dtype).reshape(1, 4)
+        previous_box = torch.as_tensor(
+            previous_state, device=event_search.device,
+            dtype=event_search.dtype).reshape(1, 4)
+        return {
+            "current_event": event_search,
+            "previous_event": (
+                event_search if previous_event is None else previous_event),
+            "history_valid": torch.full(
+                (event_search.shape[0],), history_valid,
+                device=event_search.device, dtype=torch.bool),
+            "box_delta": relative_box_motion(current_box, previous_box),
+        }
+
+    def _commit_motion_event_search(self, event_search):
+        self._motion_previous_event_search = event_search.detach().clone()
 
     def _search_state_for_frame(self):
         if (self._srbt_last_action in (
@@ -426,6 +458,8 @@ class PETTrack(BaseTracker):
             "xe": event_search,
             "small_template_features": getattr(
                 self, "small_template_features", None),
+            "motion_context": self._build_motion_context(
+                event_search, reference_state),
         }
         expert_names = tuple(getattr(self.network, "expert_names", ()))
         forced_expert_id = getattr(self, "forced_expert_id", None)
@@ -559,6 +593,7 @@ class PETTrack(BaseTracker):
             "expert_states": expert_states,
             "expert_peaks": expert_peaks,
             "expert_psr": expert_psr_values,
+            "motion_event_search": event_search,
         }
 
     def get_update_count(self):
@@ -839,6 +874,11 @@ class PETTrack(BaseTracker):
                 recovery_accepted_count=self._recovery_diagnostic_value(
                     recovery, "accepted", count=True),
             )
+
+        motion_event_search = (
+            local_candidate.get("motion_event_search", event_search)
+            if local_candidate is not None else event_search)
+        self._commit_motion_event_search(motion_event_search)
 
         # The current observation is committed only after its action is known.
         tracking_result_arr, tracking_result_event_arr, _, tracking_result_amask_arr = sample_target(

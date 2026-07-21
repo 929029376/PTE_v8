@@ -17,6 +17,7 @@ from lib.models.layers.search_window_controller import (
     crop_target_inside,
     dynamic_search_crop,
     event_motion_centroid,
+    relative_box_motion,
     search_window_pursuit_loss,
 )
 
@@ -149,6 +150,19 @@ def test_event_centroid_reports_motion_location_and_empty_confidence():
     assert confidence[0].item() > 0.9
     assert center[1].tolist() == pytest.approx([0.5, 0.5])
     assert confidence[1].item() == pytest.approx(0.0)
+
+
+def test_relative_box_motion_uses_previous_target_scale():
+    previous = torch.tensor([[0.10, 0.20, 0.20, 0.10]])
+    current = torch.tensor([[0.20, 0.15, 0.40, 0.05]])
+
+    delta = relative_box_motion(current, previous)
+
+    assert delta[0, :2].tolist() == pytest.approx([1.0, -0.75])
+    assert delta[0, 2:].tolist() == pytest.approx([
+        torch.log(torch.tensor(2.0)).item(),
+        torch.log(torch.tensor(0.5)).item(),
+    ])
 
 
 def test_controller_is_lightweight_and_initializes_from_expert_consensus():
@@ -736,9 +750,13 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
             self.motion_bias = torch.nn.Parameter(torch.tensor(0.0))
             self.search_window_controller = FixedController()
             self.calls = []
+            self.event_inputs = []
+            self.motion_contexts = []
 
         def inference(self, **kwargs):
             self.calls.append(kwargs.get("active_expert_names"))
+            self.event_inputs.append(kwargs["xe"].detach().clone())
+            self.motion_contexts.append(kwargs.get("motion_context"))
             batch_size = kwargs["xi"].shape[0]
 
             def output(center):
@@ -775,6 +793,11 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
         TRAIN=SimpleNamespace(SPECIALIST_EXPERT_IDS=[1]),
     )
     frames = torch.zeros(3, 1, 3, 8, 8)
+    event_frames = torch.stack((
+        torch.full_like(frames[0], 1.0),
+        torch.full_like(frames[0], 2.0),
+        torch.full_like(frames[0], 3.0),
+    ))
     challenge_labels = torch.zeros(
         3, 1, len(pet_track_actor_module.CHALLENGE_NAMES), dtype=torch.bool)
     challenge_labels[
@@ -783,7 +806,7 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
         "template_images": torch.zeros(2, 1, 3, 4, 4),
         "template_event_images": torch.zeros(2, 1, 3, 4, 4),
         "pursuit_search_images": frames,
-        "pursuit_search_event_images": frames,
+        "pursuit_search_event_images": event_frames,
         "pursuit_search_anno": torch.tensor([
             [[0.10, 0.40, 0.10, 0.10]],
             [[0.20, 0.40, 0.10, 0.10]],
@@ -802,6 +825,16 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
     loss.backward()
 
     assert model.calls == [("m",), ("m",)]
+    assert model.motion_contexts[0] is not None
+    assert not bool(model.motion_contexts[0]["history_valid"].any())
+    assert bool(model.motion_contexts[1]["history_valid"].all())
+    assert model.motion_contexts[0]["current_event"] is not \
+        model.motion_contexts[1]["current_event"]
+    assert torch.equal(
+        model.motion_contexts[1]["previous_event"], model.event_inputs[0])
+    assert torch.equal(
+        model.motion_contexts[1]["current_event"], model.event_inputs[1])
+    assert not torch.equal(model.event_inputs[1], event_frames[2])
     assert model.motion_bias.grad is not None
     assert bool(model.motion_bias.grad.abs() > 0)
     assert model.search_window_controller.bias.grad is None
@@ -857,6 +890,73 @@ def test_causal_specialist_total_loss_backpropagates_only_eligible_outputs(
     assert bool(motion_bias.grad.abs() > 0)
     assert status["Expert/train_count_1"] == 1
     assert status["Loss/causal_specialist"] == pytest.approx(float(loss.detach()))
+
+
+def test_motion_displacement_loss_trains_consecutive_specialist_boxes(
+        monkeypatch):
+    motion_offset = torch.nn.Parameter(torch.tensor(0.0))
+
+    def fake_base_loss(_self, output, _gt_dict, return_status=True):
+        loss = output["pred_boxes"].sum() * 0.0
+        return loss, {"Loss/total": float(loss.detach()), "IoU": 0.5}
+
+    monkeypatch.setattr(PETTrackActor.__mro__[1], "compute_losses", fake_base_loss)
+    actor = object.__new__(PETTrackActor)
+    actor.settings = SimpleNamespace(search_area_factor={"search": 2.0})
+    actor.cfg = SimpleNamespace(
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(FACTOR=2.0)),
+        TRAIN=SimpleNamespace(
+            PURSUIT_CENTER_WEIGHT=1.0,
+            PURSUIT_SCALE_WEIGHT=0.5,
+            PURSUIT_CONTAINMENT_WEIGHT=2.0,
+            PURSUIT_INSIDE_WEIGHT=0.5,
+            PURSUIT_QUALITY_WEIGHT=0.25,
+            MOTION_DISPLACEMENT_WEIGHT=2.0,
+        ),
+    )
+    controller_step = SimpleNamespace(
+        next_box=torch.tensor([[0.2, 0.2, 0.1, 0.1]]),
+        inside_logit=torch.zeros(1),
+        quality_logit=torch.zeros(1),
+    )
+    first = torch.tensor([[0.10, 0.40, 0.10, 0.10]])
+    second = torch.stack((
+        0.15 + motion_offset,
+        0.40 + motion_offset * 0.0,
+        0.10 + motion_offset * 0.0,
+        0.10 + motion_offset * 0.0,
+    )).reshape(1, 4)
+    dummy_output = {
+        "pred_boxes": (motion_offset * 0.0 + 0.5).expand(1, 1, 4),
+    }
+    predictions = {
+        "pursuit_predictions": [controller_step, controller_step],
+        "pursuit_targets": [first, second.detach()],
+        "pursuit_current_inside": [
+            torch.tensor([True]), torch.tensor([True])],
+        "pursuit_current_quality": [
+            torch.tensor([0.5]), torch.tensor([0.5])],
+        "pursuit_present_next": [
+            torch.tensor([True]), torch.tensor([True])],
+        "pursuit_specialist_id": 1,
+        "pursuit_specialist_outputs": [dummy_output, dummy_output],
+        "pursuit_specialist_targets": [first, first],
+        "pursuit_specialist_present": [
+            torch.tensor([True]), torch.tensor([True])],
+        "pursuit_specialist_image_boxes": [first, second],
+        "pursuit_specialist_image_targets": [
+            first, torch.tensor([[0.30, 0.40, 0.10, 0.10]])],
+    }
+
+    loss, status = actor._compute_pursuit_losses(predictions)
+    loss.backward()
+
+    assert status["MotionTrain/pair_count"] == 1
+    assert status["Loss/motion_displacement"] > 0.0
+    assert status["Loss/motion_displacement_weighted"] == pytest.approx(
+        2.0 * status["Loss/motion_displacement"])
+    assert motion_offset.grad is not None
+    assert bool(motion_offset.grad.abs() > 0.0)
 
 
 def test_synthetic_training_improves_next_center_and_crop_inclusion():

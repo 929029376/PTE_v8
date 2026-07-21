@@ -19,6 +19,23 @@ def _box_center(boxes):
     return boxes[..., :2] + 0.5 * boxes[..., 2:]
 
 
+def relative_box_motion(current_boxes, previous_boxes, max_abs=4.0):
+    """Encode causal center displacement and scale change in target units."""
+    current = torch.as_tensor(current_boxes)
+    previous = torch.as_tensor(
+        previous_boxes, device=current.device, dtype=current.dtype)
+    if current.shape != previous.shape or current.shape[-1] != 4:
+        raise ValueError("current and previous boxes must have matching [..., 4] shapes")
+    previous_size = previous[..., 2:].clamp_min(1e-4)
+    motion = torch.cat((
+        (_box_center(current) - _box_center(previous)) / previous_size,
+        torch.log(current[..., 2:].clamp_min(1e-4) / previous_size),
+    ), dim=-1)
+    return torch.nan_to_num(
+        motion, nan=0.0, posinf=max_abs, neginf=-max_abs
+    ).clamp(-max_abs, max_abs)
+
+
 def _search_crop_box(anchor_boxes, search_factor):
     side = (
         anchor_boxes[..., 2:].clamp_min(1e-6).prod(dim=-1).sqrt()

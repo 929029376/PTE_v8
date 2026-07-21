@@ -106,6 +106,83 @@ def test_expert_bank_uses_distinct_rgb_event_fusion_mechanisms():
     assert tuple(bank.experts) == SHARED_EXPERT_NAMES
 
 
+def test_motion_fusion_uses_only_valid_causal_event_history():
+    torch.manual_seed(7)
+    fusion = expert_fusion_module.MotionFusion(embed_dim=8).eval()
+    rgb = torch.randn(1, 4, 8)
+    event = torch.randn(1, 4, 8)
+    current_event = torch.zeros(1, 3, 8, 8)
+    current_event[:, :, 2, 2] = 4.0
+    previous_left = torch.zeros_like(current_event)
+    previous_left[:, :, 2, 1] = 4.0
+    previous_right = torch.zeros_like(current_event)
+    previous_right[:, :, 2, 6] = 4.0
+    box_delta = torch.tensor([[0.25, 0.0, 0.0, 0.0]])
+
+    baseline = fusion(rgb, event)
+    with torch.no_grad():
+        fusion.temporal_scale.fill_(1.0)
+    invalid = fusion(rgb, event, context={
+        "current_event": current_event,
+        "previous_event": previous_left,
+        "history_valid": torch.tensor([False]),
+        "box_delta": box_delta,
+    })
+    from_left = fusion(rgb, event, context={
+        "current_event": current_event,
+        "previous_event": previous_left,
+        "history_valid": torch.tensor([True]),
+        "box_delta": box_delta,
+    })
+    from_right = fusion(rgb, event, context={
+        "current_event": current_event,
+        "previous_event": previous_right,
+        "history_valid": torch.tensor([True]),
+        "box_delta": box_delta,
+    })
+
+    assert torch.equal(invalid, baseline)
+    assert not torch.allclose(from_left, baseline)
+    assert not torch.allclose(from_left, from_right)
+
+
+def test_motion_fusion_zero_gate_opens_then_trains_temporal_parameters():
+    torch.manual_seed(11)
+    fusion = expert_fusion_module.MotionFusion(embed_dim=8).train()
+    optimizer = torch.optim.SGD(fusion.parameters(), lr=0.1)
+    rgb = torch.randn(2, 4, 8)
+    event = torch.randn(2, 4, 8)
+    context = {
+        "current_event": torch.randn(2, 3, 8, 8),
+        "previous_event": torch.randn(2, 3, 8, 8),
+        "history_valid": torch.tensor([True, True]),
+        "box_delta": torch.randn(2, 4),
+    }
+    probe = torch.randn(2, 4, 8)
+
+    baseline = fusion(rgb, event)
+    gated = fusion(rgb, event, context=context)
+    assert torch.equal(gated, baseline)
+    (gated * probe).sum().backward()
+    assert fusion.temporal_scale.grad.abs().item() > 1e-8
+    optimizer.step()
+    assert fusion.temporal_scale.detach().abs().item() > 1e-8
+
+    optimizer.zero_grad(set_to_none=True)
+    (fusion(rgb, event, context=context) * probe).sum().backward()
+    temporal_parameters = [
+        parameter
+        for name, parameter in fusion.named_parameters()
+        if name.startswith(("temporal_stem.", "temporal_box."))
+    ]
+    assert temporal_parameters
+    assert any(
+        parameter.grad is not None
+        and parameter.grad.detach().abs().sum().item() > 0.0
+        for parameter in temporal_parameters
+    )
+
+
 def test_small_target_expert_is_outside_shared_fusion_and_head_banks():
     model = _expert_model()
 
