@@ -488,7 +488,7 @@ def test_shared_experts_keep_direct_boxes_and_use_fixed_soft_dependencies():
     assert "upstream_pred_boxes" not in output["visibility_foc_ov"]
 
 
-def test_specialize_phase_passes_training_expert_and_full_compound_labels():
+def test_specialize_phase_passes_training_expert_for_exclusive_labels():
     class CaptureNet:
         expert_names = list(EXPERT_NAMES)
 
@@ -513,7 +513,7 @@ def test_specialize_phase_passes_training_expert_and_full_compound_labels():
         "template_anno": torch.zeros(1, 3, 4),
         "training_expert_id": torch.tensor([2, 2, 2]),
         "challenge_labels": torch.tensor([
-            [True, True, False, False, False, False, False],
+            [True, False, False, False, False, False, False],
         ]).repeat(3, 1),
     }
 
@@ -547,7 +547,7 @@ def test_specialize_phase_accepts_challenge_labels_from_training_loader():
         "template_anno": torch.zeros(1, 4),
         "training_expert_id": torch.tensor(2),
         "challenge_labels": torch.tensor(
-            [True, True, False, False, False, False, False]),
+            [True, False, False, False, False, False, False]),
     })
     data = ltr_collate_stack1([sample, sample, sample])
 
@@ -556,6 +556,23 @@ def test_specialize_phase_accepts_challenge_labels_from_training_loader():
 
     assert torch.equal(
         actor.net.kwargs["training_expert_ids"], torch.tensor([2, 2, 2]))
+
+
+def test_specialize_phase_rejects_compound_challenge_labels():
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+    data = {
+        "training_expert_id": torch.tensor([2]),
+        "challenge_labels": torch.tensor([
+            [True, True, False, False, False, False, False],
+        ]),
+    }
+
+    with pytest.raises(ValueError, match="not eligible for exclusive"):
+        actor._validated_training_expert_ids(
+            data, batch_size=1, device=torch.device("cpu"))
 
 
 def test_specialize_phase_rejects_expert_not_eligible_for_challenge_labels():

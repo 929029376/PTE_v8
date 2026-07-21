@@ -53,7 +53,7 @@ def test_default_ambiguity_threshold_matches_calibrated_boundary():
     assert getattr(ownership, "DEFAULT_AMBIGUITY_THRESHOLD", None) == 1.29
 
 
-def test_compound_frame_is_eligible_for_each_relevant_specialist():
+def test_compound_frame_is_reserved_for_dispatch_not_specialization():
     sampler_module = importlib.import_module("lib.train.data.sampler")
     sampler = object.__new__(sampler_module.TrackingSampler)
     attributes = _empty_attributes(3)
@@ -71,15 +71,47 @@ def test_compound_frame_is_eligible_for_each_relevant_specialist():
         "bbox": torch.ones(3, 4),
         "absent": torch.ones(3, dtype=torch.uint8),
     }
+    sampler.expert_phase = "specialize"
     assert sampler._expert_candidate_groups(
-        Dataset(), 0, info, training_expert_id=1) == {"expert": [1]}
+        Dataset(), 0, info, training_expert_id=1) == {"expert": []}
     assert sampler._expert_candidate_groups(
-        Dataset(), 0, info, training_expert_id=2) == {"expert": [1]}
+        Dataset(), 0, info, training_expert_id=2) == {"expert": []}
     assert sampler._expert_candidate_groups(
-        Dataset(), 0, info, training_expert_id=4) == {"expert": [1]}
+        Dataset(), 0, info, training_expert_id=4) == {"expert": []}
+
+    sampler.expert_phase = "dispatch"
+    for expert_id in (1, 2, 4):
+        assert sampler._expert_candidate_groups(
+            Dataset(), 0, info, training_expert_id=expert_id
+        ) == {"expert": [1]}
 
     labels = sampler._frame_challenge_labels(Dataset(), 0, info, 1)
     assert labels.tolist() == [True, True, True, False, False, False, False]
+
+
+def test_specialize_keeps_multiple_labels_owned_by_one_specialist():
+    sampler_module = importlib.import_module("lib.train.data.sampler")
+    sampler = object.__new__(sampler_module.TrackingSampler)
+    sampler.expert_phase = "specialize"
+    attributes = _empty_attributes(3)
+    attributes["low_light"][1] = True
+    attributes["ambiguity"][1] = True
+    sampler._expert_manifest = {
+        "sequence-a": {"attributes": attributes},
+    }
+
+    class Dataset:
+        sequence_list = ["sequence-a"]
+
+    info = {
+        "bbox": torch.ones(3, 4),
+        "absent": torch.ones(3, dtype=torch.uint8),
+    }
+
+    assert sampler._expert_candidate_groups(
+        Dataset(), 0, info, training_expert_id=4) == {"expert": [1]}
+    labels = sampler._frame_challenge_labels(Dataset(), 0, info, 1)
+    assert labels.tolist() == [False, False, True, False, True, False, False]
 
 
 def test_sampler_has_no_single_or_composite_compatibility_modes():
@@ -569,9 +601,10 @@ def test_epoch_schedule_activates_only_declared_specialist_blocks():
         assert expert_ids == expected
 
 
-def test_sampler_uses_every_matching_frame_without_single_composite_modes():
+def test_specialize_sampler_uses_only_exclusive_specialist_frames():
     sampler_module = importlib.import_module("lib.train.data.sampler")
     sampler = object.__new__(sampler_module.TrackingSampler)
+    sampler.expert_phase = "specialize"
     sampler._expert_manifest = {
         "sequence-a": {
             "attributes": {
@@ -592,13 +625,13 @@ def test_sampler_uses_every_matching_frame_without_single_composite_modes():
     info = {"bbox": torch.ones(9, 4)}
     assert sampler._expert_candidate_groups(
         Dataset(), 0, info, training_expert_id=1) == {
-            "expert": [1, 3, 7]}
+            "expert": [1]}
     assert sampler._expert_candidate_groups(
         Dataset(), 0, info, training_expert_id=2) == {
-            "expert": [2, 3, 4, 5]}
+            "expert": [2]}
     assert sampler._expert_candidate_groups(
         Dataset(), 0, info, training_expert_id=4) == {
-            "expert": [0, 4, 6, 7]}
+            "expert": [0, 6]}
 
     sampler.num_template_frames = 1
     sampler.num_search_frames = 1
@@ -608,7 +641,7 @@ def test_sampler_uses_every_matching_frame_without_single_composite_modes():
         training_expert_id=1)
     assert sampled[3] == 1
     assert sampled[2] == "expert_1"
-    assert sampled[1][0] in [1, 3, 7]
+    assert sampled[1] == [1]
     assert sampled[4].shape == (7,)
 
 

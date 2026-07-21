@@ -196,3 +196,11 @@ def expert_supervision_mask(challenge_attributes):
             mask[:, expert_id] |= labels[name]
     mask[:, GENERALIST] = ~mask[:, 1:].any(dim=1)
     return mask
+
+
+def exclusive_specialist_supervision_mask(challenge_attributes):
+    """Keep specialist supervision only when exactly one expert is eligible."""
+    mask = expert_supervision_mask(challenge_attributes)
+    exclusive = mask[:, 1:].sum(dim=1).eq(1)
+    mask[:, 1:] &= exclusive[:, None]
+    return mask

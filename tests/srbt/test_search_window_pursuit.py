@@ -840,6 +840,31 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
     assert model.search_window_controller.bias.grad is None
 
 
+def test_causal_specialist_context_excludes_compound_frames_from_loss():
+    actor = object.__new__(PETTrackActor)
+    actor.expert_enabled = True
+    actor.cfg = SimpleNamespace(
+        TRAIN=SimpleNamespace(SPECIALIST_EXPERT_IDS=[1]))
+    model = SimpleNamespace(expert_names=["g", "m", "p", "v", "d"])
+    labels = torch.zeros(
+        3, 1, len(pet_track_actor_module.CHALLENGE_NAMES), dtype=torch.bool)
+    labels[
+        :, :, pet_track_actor_module.CHALLENGE_NAMES.index("motion")] = True
+    labels[
+        1, :, pet_track_actor_module.CHALLENGE_NAMES.index("small_target")
+    ] = True
+    data = {
+        "training_expert_id": torch.tensor([1]),
+        "pursuit_challenge_labels": labels,
+    }
+
+    specialist_id, eligible = actor._pursuit_specialist_context(
+        data, model, batch_size=1, frame_count=3, device=torch.device("cpu"))
+
+    assert specialist_id == 1
+    assert eligible.tolist() == [[True, False, True]]
+
+
 def test_causal_specialist_total_loss_backpropagates_only_eligible_outputs(
         monkeypatch):
     motion_bias = torch.nn.Parameter(torch.tensor(0.25))

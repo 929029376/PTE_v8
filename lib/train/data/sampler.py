@@ -6,6 +6,7 @@ from lib.train.data.challenge_manifest import load_manifest
 from lib.train.data.felt_challenges import (
     CHALLENGE_NAMES,
     EXPERT_CHALLENGE_NAMES,
+    exclusive_specialist_supervision_mask,
     expert_supervision_mask,
 )
 
@@ -451,7 +452,11 @@ class TrackingSampler(torch.utils.data.Dataset):
             self, dataset, seq_id, seq_info_dict, training_expert_id):
         labels = self._expert_attribute_labels(
             dataset, seq_id, seq_info_dict)
-        expert_mask = expert_supervision_mask(labels)
+        expert_mask = (
+            exclusive_specialist_supervision_mask(labels)
+            if getattr(self, "expert_phase", "specialize") == "specialize"
+            else expert_supervision_mask(labels)
+        )
         target = expert_mask[:, training_expert_id]
         if training_expert_id != 3:
             return {
@@ -465,10 +470,10 @@ class TrackingSampler(torch.utils.data.Dataset):
         previous_absent = torch.cat([
             torch.zeros(1, dtype=torch.bool), ~present[:-1]
         ])
-        reappear = labels["recovery"] & present & previous_absent
-        recovery = labels["recovery"] & ~reappear
+        reappear = labels["recovery"] & present & previous_absent & target
+        recovery = labels["recovery"] & ~reappear & target
         groups = {
-            "absent": labels["absent"],
+            "absent": labels["absent"] & target,
             "reappear": reappear,
             "recovery": recovery,
         }
@@ -577,8 +582,10 @@ class TrackingSampler(torch.utils.data.Dataset):
                         if training_expert_id is not None:
                             labels = self._expert_attribute_labels(
                                 dataset, seq_id, seq_info_dict)
-                            eligible_frames = expert_supervision_mask(labels)[
-                                :, training_expert_id]
+                            eligible_frames = (
+                                exclusive_specialist_supervision_mask(labels)[
+                                    :, training_expert_id]
+                            )
                         template_frame_ids, search_frame_ids, sampler_event_type = \
                             self._sample_pursuit_causal_frame_ids(
                                 visible, seq_info_dict, pursuit_episode_type,
