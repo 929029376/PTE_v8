@@ -300,16 +300,18 @@ def small_target_diagnostic_sums(
                 frame_trace.get("presence_score")),
             "controller_output_score": _optional_finite_float(
                 frame_trace.get("controller_output_score")),
-            "theta_present": _optional_finite_float(
-                frame_trace.get("theta_present")),
+            "theta_observable": _optional_finite_float(
+                frame_trace.get("theta_observable")),
+            "theta_localized": _optional_finite_float(
+                frame_trace.get("theta_localized")),
             "theta_recover": _optional_finite_float(
                 frame_trace.get("theta_recover")),
-            "controller_weak_streak": int(frame_trace.get(
-                "controller_weak_streak", 0)),
-            "controller_verify_streak": int(frame_trace.get(
-                "controller_verify_streak", 0)),
-            "controller_stable_visible": int(frame_trace.get(
-                "controller_stable_visible", 0)),
+            "decoder_state_duration": int(frame_trace.get(
+                "decoder_state_duration", 0)),
+            "decoder_unresolved_duration": int(frame_trace.get(
+                "decoder_unresolved_duration", 0)),
+            "decoder_stable_visible": int(frame_trace.get(
+                "decoder_stable_visible", 0)),
             "recovery_attempted": bool(frame_trace.get(
                 "recovery_attempted", False)),
             "recovery_confirmed": bool(frame_trace.get(
@@ -494,7 +496,8 @@ def recovery_diagnostic_sums(
         elapsed = float(times[index])
         if not math.isfinite(elapsed) or elapsed < 0:
             continue
-        if trace[index].get("action") in ("absent", "verify"):
+        if trace[index].get("action") in (
+                "global_unresolved", "verify"):
             values["RECOVERY_TIME_SUM"] += elapsed
             values["RECOVERY_FRAME_COUNT"] += 1.0
         else:

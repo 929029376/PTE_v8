@@ -279,6 +279,7 @@ def _optimizer_groups(net, cfg):
         recovery_modules = (
             getattr(model, "visibility_gate", None),
             getattr(model, "localization_validity_gate", None),
+            getattr(model, "duration_evidence_decoder", None),
             getattr(model, "rgb_identity_verifier", None),
             getattr(model, "redetect_expert", None),
         )
@@ -447,6 +448,7 @@ def _optimizer_groups(net, cfg):
                 lambda name: name.startswith((
                     "rgb_identity_verifier.", "visibility_gate.",
                     "localization_validity_gate.",
+                    "duration_evidence_decoder.",
                     "redetect_expert.")))
 
     other = [name for name, param in named_params

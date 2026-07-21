@@ -15,6 +15,7 @@ from lib.models.pet_track.pet_track import PETTrack
 from lib.train.base_functions import _optimizer_groups
 from lib.train.data.loader import ltr_collate_stack1
 from lib.train.data.felt_challenges import CHALLENGE_NAMES
+from lib.models.layers.srbt_controller import DurationEvidenceDecoder
 from lib.utils import TensorDict
 
 
@@ -918,6 +919,7 @@ def test_dart_intervention_loss_separates_observability_and_localization():
     actor.dart_geometry_weight = 3.0
     actor.dart_ranking_weight = 0.5
     actor.dart_ranking_margin = 0.2
+    actor.dart_decoder_weight = 1.0
     clean_logits = torch.tensor([[0.0, 2.0], [1.0, 0.0]],
                                 requires_grad=True)
     coverage_logits = torch.tensor([[0.0, 1.0], [1.0, 0.0]],
@@ -926,11 +928,16 @@ def test_dart_intervention_loss_separates_observability_and_localization():
                                    requires_grad=True)
     negative_logits = torch.tensor([[0.0, 1.0], [1.0, 0.0]],
                                    requires_grad=True)
+    duration_logits = torch.zeros(4, 2, 4, requires_grad=True)
     predictions = {
         "clean_observability_logits": clean_logits,
         "coverage_observability_logits": coverage_logits,
         "positive_localization_logits": positive_logits,
         "negative_localization_logits": negative_logits,
+        "duration_state_logits": duration_logits,
+        "duration_state_targets": torch.tensor([
+            [0, 0], [1, 1], [2, 2], [3, 3],
+        ]),
     }
 
     loss, status = actor._compute_reliability_intervention_loss(
@@ -945,8 +952,12 @@ def test_dart_intervention_loss_separates_observability_and_localization():
     assert positive_logits.grad[1].abs().sum() == 0
     assert negative_logits.grad[0].abs().sum() > 0
     assert negative_logits.grad[1].abs().sum() == 0
+    assert duration_logits.grad[:, 0].abs().sum() > 0
+    assert duration_logits.grad[:, 1].abs().sum() == 0
     assert status["Loss/dart_coverage"] > 0
     assert status["Loss/dart_geometry"] > 0
+    assert status["Loss/dart_decoder"] > 0
+    assert 0.0 <= status["DART/decoder_acc"] <= 1.0
     assert status["DART/observability_gap"] > 0
     assert status["DART/localization_gap"] < 0
 
@@ -963,6 +974,8 @@ def test_recovery_forward_builds_paired_reliability_interventions():
         def __init__(self):
             super().__init__()
             self.localization_validity_gate = CandidateGate()
+            self.duration_evidence_decoder = DurationEvidenceDecoder(
+                hidden_dim=8)
             self.visibility_gate = torch.nn.Linear(1, 2)
             self.rgb_identity_verifier = torch.nn.Linear(1, 2)
             self.redetect_expert = torch.nn.Linear(1, 2)
@@ -1012,6 +1025,8 @@ def test_recovery_forward_builds_paired_reliability_interventions():
         "coverage_observability_logits",
         "positive_localization_logits",
         "negative_localization_logits",
+        "duration_state_logits",
+        "duration_state_targets",
     }
     assert actor.net.calls[1]["redetect_images"] is None
     assert actor.net.calls[1]["redetect_event_images"] is None
@@ -1092,11 +1107,13 @@ def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
     actor.dart_geometry_weight = 1.0
     actor.dart_ranking_weight = 0.5
     actor.dart_ranking_margin = 0.2
+    actor.dart_decoder_weight = 1.0
 
     base_boxes = torch.ones(2, 1, 4, requires_grad=True)
     presence_logits = torch.tensor(
         [[0.0, 1.0], [1.0, 0.0]], requires_grad=True)
     redetect_signal = torch.tensor(2.0, requires_grad=True)
+    duration_logits = torch.zeros(4, 2, 4, requires_grad=True)
     actor._compute_redetect_loss = lambda predictions, data: (
         predictions["signal"], {"Loss/redetect": predictions["signal"].item()})
     pred_dict = {
@@ -1112,6 +1129,10 @@ def test_recovery_phase_ignores_base_and_challenge_losses(monkeypatch):
             "coverage_observability_logits": presence_logits + 0.1,
             "positive_localization_logits": presence_logits + 0.2,
             "negative_localization_logits": presence_logits - 0.2,
+            "duration_state_logits": duration_logits,
+            "duration_state_targets": torch.tensor([
+                [0, 0], [1, 1], [2, 2], [3, 3],
+            ]),
         },
     }
     gt_dict = {

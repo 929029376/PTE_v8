@@ -5,10 +5,11 @@ import torch
 
 from lib.models.layers.srbt_controller import (
     Action,
+    DurationEvidenceDecoder,
+    DurationStructuredDecoder,
     LocalizationValidityGate,
-    VisibilityController,
     VisibilityGate,
-    build_visibility_controller,
+    build_duration_decoder,
     factorize_reliability,
 )
 from lib.test.tracker.pet_track import PETTrack
@@ -90,100 +91,118 @@ def test_visibility_gate_detaches_shared_features_and_returns_binary_logits():
     assert all(parameter.grad is not None for parameter in gate.parameters())
 
 
-def test_weak_presence_progresses_from_track_to_suspect_to_absent():
-    controller = VisibilityController(
-        suspect_frames=2, absent_frames=4, long_stable_frames=3)
-
-    first = controller.step(0.69)
-    second = controller.step(0.69)
-    third = controller.step(0.69)
-    fourth = controller.step(0.69)
-
-    assert first.action is Action.TRACK
-    assert not first.allow_recent_write
-    assert not first.output_absent
-    assert second.action is Action.SUSPECT
-    assert third.action is Action.SUSPECT
-    assert not second.output_absent
-    assert fourth.action is Action.ABSENT
-    assert fourth.output_absent
+def test_duration_decoder_exposes_only_dart_control_states():
+    assert set(Action) == {
+        Action.TRACK,
+        Action.LOCAL_UNRESOLVED,
+        Action.GLOBAL_UNRESOLVED,
+        Action.VERIFY,
+    }
 
 
-def test_strong_presence_resets_suspicion_and_preserves_memory_stability_gate():
-    controller = VisibilityController(
-        suspect_frames=2, absent_frames=4, long_stable_frames=3)
-    controller.step(0.2)
-    assert controller.step(0.2).action is Action.SUSPECT
+def test_duration_evidence_decoder_is_lightweight_and_trainable():
+    decoder = DurationEvidenceDecoder(hidden_dim=16)
+    observability = torch.tensor([0.9, 0.2], requires_grad=True)
+    localization = torch.tensor([0.8, 0.7], requires_grad=True)
+    identity = torch.tensor([-1.0, 0.9], requires_grad=True)
+    previous_state = torch.tensor([0, 2])
+    state_duration = torch.tensor([1.0, 5.0])
 
-    recovered = controller.step(0.9)
-    stable = controller.step(0.9)
-    long_ready = controller.step(0.9)
+    logits = decoder(
+        observability, localization, identity,
+        previous_state, state_duration)
+    logits.sum().backward()
 
-    assert recovered.action is Action.TRACK
-    assert recovered.allow_recent_write
-    assert not recovered.allow_long_write
-    assert not stable.allow_long_write
-    assert long_ready.allow_long_write
+    assert logits.shape == (2, len(Action))
+    assert sum(parameter.numel() for parameter in decoder.parameters()) <= 256
+    assert all(parameter.grad is not None for parameter in decoder.parameters())
+    assert observability.grad is None
+    assert localization.grad is None
+    assert identity.grad is None
 
 
-def test_absent_recovery_requires_two_rgb_localization_confirmations():
-    controller = VisibilityController(
-        suspect_frames=2, absent_frames=4, verify_frames=2)
-    for _ in range(4):
-        result = controller.step(0.1)
-    assert result.action is Action.ABSENT
+def test_duration_decoder_separates_localization_failure_from_unobservability():
+    decoder = DurationStructuredDecoder(
+        local_duration=2, global_duration=3, verify_duration=2)
 
-    verifying = controller.step(
-        0.9, identity_score=0.85, localization_score=0.8)
-    recovered = controller.step(
-        0.88, identity_score=0.82, localization_score=0.79)
+    first_local = decoder.step(observability=0.9, localization=0.2)
+    local = decoder.step(observability=0.9, localization=0.2)
 
+    assert first_local.action is Action.TRACK
+    assert local.action is Action.LOCAL_UNRESOLVED
+    assert not local.output_absent
+    assert not local.allow_recent_write
+
+    decoder.reset()
+    decoder.step(observability=0.2, localization=0.9)
+    decoder.step(observability=0.2, localization=0.9)
+    global_unresolved = decoder.step(observability=0.2, localization=0.9)
+
+    assert global_unresolved.action is Action.GLOBAL_UNRESOLVED
+    assert global_unresolved.output_absent
+
+
+def test_duration_decoder_requires_verified_recovery_before_commitment():
+    decoder = DurationStructuredDecoder(
+        local_duration=1, global_duration=2, verify_duration=2)
+    decoder.step(observability=0.1, localization=0.1)
+    assert decoder.step(
+        observability=0.1, localization=0.1
+    ).action is Action.GLOBAL_UNRESOLVED
+
+    rejected = decoder.step(
+        observability=0.9, localization=0.9, identity=0.4)
+    verifying = decoder.step(
+        observability=0.9, localization=0.9, identity=0.9)
+    committed = decoder.step(
+        observability=0.9, localization=0.9, identity=0.9)
+
+    assert rejected.action is Action.GLOBAL_UNRESOLVED
     assert verifying.action is Action.VERIFY
     assert verifying.output_absent
-    assert not verifying.allow_recent_write
-    assert recovered.action is Action.TRACK
-    assert not recovered.output_absent
-    assert not recovered.allow_recent_write
+    assert committed.action is Action.TRACK
+    assert not committed.output_absent
+    assert not committed.allow_recent_write
 
 
-def test_failed_recovery_confirmation_returns_to_absent():
-    controller = VisibilityController()
-    for _ in range(4):
-        controller.step(0.1)
-    assert controller.step(
-        0.9, identity_score=0.9, localization_score=0.9
-    ).action is Action.VERIFY
+def test_duration_decoder_writes_memory_only_after_stable_tracking():
+    decoder = DurationStructuredDecoder(long_stable_duration=3)
 
-    failed = controller.step(
-        0.9, identity_score=0.4, localization_score=0.9)
+    first = decoder.step(observability=0.9, localization=0.9)
+    second = decoder.step(observability=0.9, localization=0.9)
+    third = decoder.step(observability=0.9, localization=0.9)
 
-    assert failed.action is Action.ABSENT
-    assert failed.output_absent
+    assert first.allow_recent_write
+    assert second.allow_recent_write
+    assert not second.allow_long_write
+    assert third.allow_long_write
 
 
-def test_builder_reads_visibility_controller_thresholds():
+def test_builder_reads_duration_decoder_thresholds():
     values = SimpleNamespace(
-        THETA_PRESENT=0.71,
+        THETA_OBSERVABLE=0.71,
+        THETA_LOCALIZED=0.72,
         THETA_RECOVER=0.81,
-        SUSPECT_FRAMES=3,
-        ABSENT_FRAMES=6,
-        VERIFY_FRAMES=4,
-        LONG_STABLE_FRAMES=7,
+        LOCAL_DURATION=3,
+        GLOBAL_DURATION=6,
+        VERIFY_DURATION=4,
+        LONG_STABLE_DURATION=7,
     )
     cfg = SimpleNamespace(MODEL=SimpleNamespace(
         SRBT=SimpleNamespace(CONTROLLER=values)))
 
-    controller = build_visibility_controller(cfg)
+    decoder = build_duration_decoder(cfg)
 
-    assert controller.theta_present == 0.71
-    assert controller.theta_recover == 0.81
-    assert controller.suspect_frames == 3
-    assert controller.absent_frames == 6
-    assert controller.verify_frames == 4
-    assert controller.long_stable_frames == 7
+    assert decoder.theta_observable == 0.71
+    assert decoder.theta_localized == 0.72
+    assert decoder.theta_recover == 0.81
+    assert decoder.local_duration == 3
+    assert decoder.global_duration == 6
+    assert decoder.verify_duration == 4
+    assert decoder.long_stable_duration == 7
 
 
-def test_tracker_uses_candidate_acceptance_for_commit_control():
+def test_tracker_passes_factorized_reliability_to_duration_decoder():
     class _Recorder:
         def __init__(self):
             self.args = None
@@ -194,10 +213,10 @@ def test_tracker_uses_candidate_acceptance_for_commit_control():
 
     tracker = object.__new__(PETTrack)
     tracker.frame_id = 9
-    tracker.visibility_controller = _Recorder()
+    tracker.duration_decoder = _Recorder()
 
     assert PETTrack._step_srbt_controller(tracker, {"score_peak": 0.9}) is None
-    assert tracker.visibility_controller.args is None
+    assert tracker.duration_decoder.args is None
 
     result = PETTrack._step_srbt_controller(tracker, {
         "presence_score": 0.82,
@@ -206,7 +225,7 @@ def test_tracker_uses_candidate_acceptance_for_commit_control():
         "acceptance_score": 0.41,
     })
     assert result == "controlled"
-    assert tracker.visibility_controller.args == (0.41,)
+    assert tracker.duration_decoder.args == (0.82, 0.5, None)
 
 
 def test_recovery_confirmation_ranks_by_localization_and_preserves_factors():
@@ -235,10 +254,12 @@ def test_tracker_bypasses_untrained_srbt_gate_when_disabled():
 
     tracker = object.__new__(PETTrack)
     tracker.srbt_controller_enabled = False
-    tracker.visibility_controller = _UnexpectedController()
+    tracker.duration_decoder = _UnexpectedController()
 
     result = PETTrack._step_srbt_controller(tracker, {
-        "presence_score": 0.45,
+        "observability_score": 0.9,
+        "localization_validity_score": 0.5,
+        "acceptance_score": 0.45,
     })
 
     assert result.action is Action.TRACK
@@ -274,7 +295,7 @@ def test_tracker_has_no_event_background_fallback():
 
 def test_new_sequence_resets_runtime_recovery_state():
     tracker = object.__new__(PETTrack)
-    tracker._srbt_last_action = Action.ABSENT
+    tracker._srbt_last_action = Action.GLOBAL_UNRESOLVED
     tracker._redetect_hypotheses = {"active_count": 1}
     tracker._pending_redetect_box = [1.0, 2.0, 3.0, 4.0]
 
@@ -350,7 +371,7 @@ def test_track_commits_final_refined_motion_event_once(monkeypatch):
     )
     tracker.preprocessor = _Preprocessor()
     tracker.thor_wrapper = _Thor()
-    tracker._srbt_last_action = Action.ABSENT
+    tracker._srbt_last_action = Action.GLOBAL_UNRESOLVED
     tracker._pending_redetect_box = [12.0, 12.0, 8.0, 8.0]
     tracker._last_redetect_error = ""
     tracker._recovery_diagnostics = []
@@ -643,7 +664,7 @@ def test_tracker_replaces_small_template_cache_for_each_sequence(monkeypatch):
         BACKBONE=SimpleNamespace(CE_LOC=False)))
     tracker.network = Network()
     tracker.thor_wrapper = Thor()
-    tracker.visibility_controller = SimpleNamespace(reset=lambda: None)
+    tracker.duration_decoder = SimpleNamespace(reset=lambda: None)
     tracker._reset_srbt_sequence_state = lambda: None
     tracker._record_search_diagnostic = lambda *_args, **_kwargs: None
     tracker.output_window = torch.ones(1, 1, 2, 2)

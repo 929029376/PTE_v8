@@ -152,6 +152,19 @@ def test_normal_forward_uses_only_lightweight_presence_gate():
     assert "srbt_teacher" not in output
 
 
+def test_model_checkpoints_trainable_duration_evidence_decoder():
+    model = _model()
+
+    decoder_state = {
+        key: value for key, value in model.state_dict().items()
+        if key.startswith("duration_evidence_decoder.")
+    }
+
+    assert model.ARCHITECTURE_VERSION == 30
+    assert decoder_state
+    assert sum(value.numel() for value in decoder_state.values()) <= 256
+
+
 def test_presence_gate_trains_without_changing_shared_features():
     model = _model()
     output = model(*_images())

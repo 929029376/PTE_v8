@@ -14,6 +14,7 @@ from lib.models.layers.atu import build_atu
 from lib.models.layers.redetection import build_redetection_expert
 from lib.models.layers.event_recovery import RGBIdentityVerifier
 from lib.models.layers.srbt_controller import (
+    DurationEvidenceDecoder,
     LocalizationValidityGate,
     VisibilityGate,
     factorize_reliability,
@@ -28,12 +29,12 @@ from lib.utils.box_ops import box_xyxy_to_cxcywh
 
 
 class PETTrack(nn.Module):
-    ARCHITECTURE_VERSION = 29
+    ARCHITECTURE_VERSION = 30
     _PET_STATE_PREFIXES = (
         "visibility_gate.", "rgb_identity_verifier.", "redetect_expert.",
         "small_target_expert.", "proposal_adapters.",
         "search_window_controller.", "expert_activator.",
-        "localization_validity_gate.")
+        "localization_validity_gate.", "duration_evidence_decoder.")
 
     def __init__(self, transformer, memory, box_head, cfg,
                  aux_loss=False, head_type="CORNER"):
@@ -171,6 +172,12 @@ class PETTrack(nn.Module):
         self.localization_validity_gate = (
             LocalizationValidityGate(hidden_dim=int(getattr(
                 gate_cfg, "LOCALIZATION_HIDDEN_DIM", 32)))
+            if self.srbt_enabled else None
+        )
+        controller_cfg = getattr(srbt_cfg, "CONTROLLER", None)
+        self.duration_evidence_decoder = (
+            DurationEvidenceDecoder(hidden_dim=int(getattr(
+                controller_cfg, "HIDDEN_DIM", 16)))
             if self.srbt_enabled else None
         )
         search_controller_cfg = getattr(
@@ -1272,6 +1279,9 @@ def _load_retained_model_checkpoint(
     if source_version is None or source_version < 29:
         migration_prefixes = (
             *migration_prefixes, "localization_validity_gate.")
+    if source_version is None or source_version < 30:
+        migration_prefixes = (
+            *migration_prefixes, "duration_evidence_decoder.")
     extension_prefixes = ("_pet_architecture_version", *migration_prefixes)
     retained = sorted(
         key for key in target if not key.startswith(extension_prefixes))

@@ -1018,8 +1018,9 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
         "/root/fnvme/PTE_v8_manifests/felt_val_challenges_v3.json")
     assert configured.MODEL.SRBT.ENABLE is True
     assert configured.DATA.SRBT.ENABLE is False
-    assert configured.MODEL.SRBT.CONTROLLER.THETA_PRESENT == 0.70
-    assert configured.MODEL.SRBT.CONTROLLER.ABSENT_FRAMES == 4
+    assert configured.MODEL.SRBT.CONTROLLER.THETA_OBSERVABLE == 0.70
+    assert configured.MODEL.SRBT.CONTROLLER.THETA_LOCALIZED == 0.70
+    assert configured.MODEL.SRBT.CONTROLLER.GLOBAL_DURATION == 4
     assert configured.TEST.POLICY_MODE == "stateful"
     assert configured.TRAIN.SAVE_EPOCHS == []
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True

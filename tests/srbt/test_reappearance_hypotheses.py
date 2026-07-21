@@ -513,10 +513,10 @@ def test_failed_redetect_cycle_discards_stale_hypotheses(monkeypatch):
             identity=[[1.0, 0.0]],
         ),
     )
-    tracker._srbt_last_action = Action.ABSENT
+    tracker._srbt_last_action = Action.GLOBAL_UNRESOLVED
     tracker.debug = False
     tracker._step_srbt_controller = lambda *_args, **_kwargs: ControllerAction(
-        action=Action.ABSENT,
+        action=Action.GLOBAL_UNRESOLVED,
         allow_recent_write=False,
         allow_long_write=False,
         output_absent=True,

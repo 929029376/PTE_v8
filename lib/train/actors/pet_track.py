@@ -18,6 +18,7 @@ from lib.train.data.felt_challenges import (
     expert_supervision_mask,
 )
 from lib.models.layers.expert_ensemble import normalized_response_psr
+from lib.models.layers.srbt_controller import Action
 from lib.models.layers.search_window_controller import (
     crop_box_to_image,
     crop_target_inside,
@@ -47,7 +48,7 @@ class PETTrackActor(PETTrackBaseActor):
             loss_cfg, "FOCAL_GAMMA", 2.0))
         controller_cfg = getattr(cfg.MODEL.SRBT, "CONTROLLER", None)
         self.presence_present_threshold = float(getattr(
-            controller_cfg, "THETA_PRESENT", 0.70))
+            controller_cfg, "THETA_OBSERVABLE", 0.70))
         self.presence_recover_threshold = float(getattr(
             controller_cfg, "THETA_RECOVER", 0.75))
         recovery_loss_cfg = getattr(cfg.TRAIN, "RECOVERY_LOSS", None)
@@ -66,6 +67,12 @@ class PETTrackActor(PETTrackBaseActor):
             dart_loss_cfg, "RANKING_WEIGHT", 0.5))
         self.dart_ranking_margin = float(getattr(
             dart_loss_cfg, "RANKING_MARGIN", 0.2))
+        self.dart_decoder_weight = float(getattr(
+            dart_loss_cfg, "DECODER_WEIGHT", 1.0))
+        self.dart_local_duration = int(getattr(
+            controller_cfg, "LOCAL_DURATION", 2))
+        self.dart_global_duration = int(getattr(
+            controller_cfg, "GLOBAL_DURATION", 4))
         self.expert_advantage_weight = float(getattr(
             cfg.TRAIN, "EXPERT_ADVANTAGE_WEIGHT", 1.0))
         self.expert_advantage_margin = float(getattr(
@@ -270,15 +277,63 @@ class PETTrackActor(PETTrackBaseActor):
         model = self.net.module if hasattr(self.net, "module") else self.net
         positive_boxes, negative_boxes = self._geometry_candidate_pair(boxes)
         score_map = self._reliability_score_map(output)
+        clean_observability_logits = output[
+            "presence_predictions"]["logits"]
+        coverage_observability_logits = covered_output[
+            "presence_predictions"]["logits"]
+        positive_localization_logits = model.localization_validity_gate(
+            score_map, positive_boxes)
+        negative_localization_logits = model.localization_validity_gate(
+            score_map, negative_boxes)
+        duration_decoder = getattr(
+            model, "duration_evidence_decoder", None)
+        if duration_decoder is None:
+            raise RuntimeError(
+                "recovery training requires duration_evidence_decoder")
+        clean_observability = clean_observability_logits.softmax(
+            dim=-1)[:, 1]
+        covered_observability = coverage_observability_logits.softmax(
+            dim=-1)[:, 1]
+        positive_localization = positive_localization_logits.softmax(
+            dim=-1)[:, 1]
+        negative_localization = negative_localization_logits.softmax(
+            dim=-1)[:, 1]
+        state_ids = {action: index for index, action in enumerate(Action)}
+        batch_state = lambda action: torch.full(
+            (batch_size,), state_ids[action], device=device,
+            dtype=torch.long)
+        batch_duration = lambda value: torch.full(
+            (batch_size,), float(value), device=device,
+            dtype=clean_observability.dtype)
+        unknown_identity = clean_observability.new_full((batch_size,), -1.0)
+        verified_identity = clean_observability.new_ones(batch_size)
+        duration_state_logits = torch.stack((
+            duration_decoder(
+                clean_observability, positive_localization,
+                unknown_identity, batch_state(Action.TRACK),
+                batch_duration(1)),
+            duration_decoder(
+                clean_observability, negative_localization,
+                unknown_identity, batch_state(Action.TRACK),
+                batch_duration(getattr(self, "dart_local_duration", 2))),
+            duration_decoder(
+                covered_observability, positive_localization,
+                unknown_identity, batch_state(Action.LOCAL_UNRESOLVED),
+                batch_duration(getattr(self, "dart_global_duration", 4))),
+            duration_decoder(
+                clean_observability, positive_localization,
+                verified_identity, batch_state(Action.GLOBAL_UNRESOLVED),
+                batch_duration(1)),
+        ), dim=0)
+        duration_state_targets = torch.stack(tuple(
+            batch_state(action) for action in Action), dim=0)
         return {
-            "clean_observability_logits": output[
-                "presence_predictions"]["logits"],
-            "coverage_observability_logits": covered_output[
-                "presence_predictions"]["logits"],
-            "positive_localization_logits": model.localization_validity_gate(
-                score_map, positive_boxes),
-            "negative_localization_logits": model.localization_validity_gate(
-                score_map, negative_boxes),
+            "clean_observability_logits": clean_observability_logits,
+            "coverage_observability_logits": coverage_observability_logits,
+            "positive_localization_logits": positive_localization_logits,
+            "negative_localization_logits": negative_localization_logits,
+            "duration_state_logits": duration_state_logits,
+            "duration_state_targets": duration_state_targets,
         }
 
     def forward_pass(self, data):
@@ -884,6 +939,8 @@ class PETTrackActor(PETTrackBaseActor):
             "Loss/presence_threshold", presence_threshold_loss.item())
         status.setdefault("Loss/redetect", redetect_loss.item())
         status.setdefault("Loss/DART", dart_loss.item())
+        status.setdefault("Loss/dart_decoder", 0.0)
+        status.setdefault("DART/decoder_acc", 0.0)
         status["Expert/phase_id"] = {
             "specialize": 0, "refine": 1, "recovery": 2, "pursuit": 3,
             "dispatch": 4,
@@ -898,6 +955,8 @@ class PETTrackActor(PETTrackBaseActor):
             "coverage_observability_logits",
             "positive_localization_logits",
             "negative_localization_logits",
+            "duration_state_logits",
+            "duration_state_targets",
         }
         missing = sorted(required - set(predictions))
         if missing:
@@ -908,29 +967,45 @@ class PETTrackActor(PETTrackBaseActor):
         covered_logits = predictions["coverage_observability_logits"].float()
         positive_logits = predictions["positive_localization_logits"].float()
         negative_logits = predictions["negative_localization_logits"].float()
+        duration_logits = predictions["duration_state_logits"].float()
+        duration_targets = predictions["duration_state_targets"].long()
         tensors = (clean_logits, covered_logits, positive_logits, negative_logits)
         if any(tensor.ndim != 2 or tensor.shape[1] != 2 for tensor in tensors):
             raise ValueError("reliability intervention logits must have shape (B,2)")
         if any(tensor.shape != clean_logits.shape for tensor in tensors[1:]):
             raise ValueError("reliability intervention logits must share shape")
+        expected_duration_shape = (
+            len(Action), clean_logits.shape[0], len(Action))
+        if duration_logits.shape != expected_duration_shape:
+            raise ValueError(
+                "duration_state_logits must have shape (states,B,states)")
+        if duration_targets.shape != expected_duration_shape[:2]:
+            raise ValueError(
+                "duration_state_targets must have shape (states,B)")
         present = torch.as_tensor(
             present, device=clean_logits.device, dtype=torch.bool).reshape(-1)
         if present.numel() != clean_logits.shape[0]:
             raise ValueError("reliability intervention mask must match batch size")
         if not bool(present.any()):
-            zero = sum(tensor.sum() for tensor in tensors) * 0.0
+            zero = (
+                sum(tensor.sum() for tensor in tensors)
+                + duration_logits.sum()) * 0.0
             return zero, {
                 "Loss/DART": 0.0,
                 "Loss/dart_coverage": 0.0,
                 "Loss/dart_geometry": 0.0,
                 "DART/observability_gap": 0.0,
                 "DART/localization_gap": 0.0,
+                "Loss/dart_decoder": 0.0,
+                "DART/decoder_acc": 0.0,
             }
 
         clean = clean_logits[present]
         covered = covered_logits[present]
         positive = positive_logits[present]
         negative = negative_logits[present]
+        duration = duration_logits[:, present].reshape(-1, len(Action))
+        duration_target = duration_targets[:, present].reshape(-1)
         ones = torch.ones(clean.shape[0], device=clean.device, dtype=torch.long)
         zeros = torch.zeros_like(ones)
         clean_probability = clean.softmax(dim=-1)[:, 1]
@@ -957,13 +1032,19 @@ class PETTrackActor(PETTrackBaseActor):
         geometry_loss = (
             geometry_classification
             + self.dart_ranking_weight * geometry_ranking)
+        decoder_loss = F.cross_entropy(duration, duration_target)
+        decoder_accuracy = (
+            duration.argmax(dim=-1) == duration_target).float().mean()
         total = (
             self.dart_coverage_weight * coverage_loss
-            + self.dart_geometry_weight * geometry_loss)
+            + self.dart_geometry_weight * geometry_loss
+            + self.dart_decoder_weight * decoder_loss)
         return total, {
             "Loss/DART": total.item(),
             "Loss/dart_coverage": coverage_loss.item(),
             "Loss/dart_geometry": geometry_loss.item(),
+            "Loss/dart_decoder": decoder_loss.item(),
+            "DART/decoder_acc": decoder_accuracy.item(),
             "DART/observability_gap": (
                 clean_probability - covered_probability).mean().item(),
             "DART/localization_gap": (

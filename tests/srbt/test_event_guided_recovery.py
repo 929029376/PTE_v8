@@ -12,8 +12,8 @@ from lib.models.pet_track.pet_track import PETTrack as PETTrackModel
 from lib.models.layers.srbt_controller import (
     Action,
     ControllerAction,
+    DurationStructuredDecoder,
     LocalizationValidityGate,
-    VisibilityController,
 )
 from lib.test.tracker.pet_track import PETTrack as PETTrackTracker
 
@@ -500,7 +500,7 @@ def test_verify_keeps_thor_frozen_and_does_not_write_memory(monkeypatch):
     tracker.state = [1.0, 1.0, 2.0, 2.0]
     tracker._pending_redetect_box = [5.0, 5.0, 2.0, 2.0]
     tracker._redetect_hypotheses = {"active_count": 1}
-    tracker._srbt_last_action = Action.ABSENT
+    tracker._srbt_last_action = Action.GLOBAL_UNRESOLVED
     tracker._last_redetect_error = ""
     tracker._last_score_peak = 0.0
     tracker._last_redetect_conf = 0.9
@@ -570,7 +570,7 @@ def test_two_current_recovery_confirmations_resume_tracking(monkeypatch):
     tracker.state = [1.0, 1.0, 4.0, 4.0]
     tracker._pending_redetect_box = None
     tracker._redetect_hypotheses = None
-    tracker._srbt_last_action = Action.ABSENT
+    tracker._srbt_last_action = Action.GLOBAL_UNRESOLVED
     tracker._last_redetect_error = ""
     tracker._last_score_peak = 0.0
     tracker._last_redetect_conf = 0.0
@@ -584,9 +584,9 @@ def test_two_current_recovery_confirmations_resume_tracking(monkeypatch):
     tracker.preprocessor = SimpleNamespace(process=lambda patch, _mask:
         SimpleNamespace(tensors=patch.permute(2, 0, 1).unsqueeze(0)))
     tracker.thor_wrapper = ThorProbe()
-    tracker.visibility_controller = VisibilityController(
-        theta_recover=0.75, verify_frames=2)
-    tracker.visibility_controller.state = Action.ABSENT
+    tracker.duration_decoder = DurationStructuredDecoder(
+        theta_recover=0.75, verify_duration=2)
+    tracker.duration_decoder.state = Action.GLOBAL_UNRESOLVED
     tracker.debug = False
     tracker.full_rgb_fallback_interval = 10
     tracker._run_local_candidate = lambda *_args, **_kwargs: {

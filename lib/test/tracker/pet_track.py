@@ -22,7 +22,7 @@ from lib.models.layers.srbt_hypotheses import (
 from lib.models.layers.srbt_controller import (
     Action as BeliefAction,
     ControllerAction,
-    build_visibility_controller,
+    build_duration_decoder,
 )
 from lib.models.layers.event_recovery import EventProposalExtractor
 from lib.models.layers.expert_ensemble import (
@@ -73,7 +73,10 @@ class PETTrack(BaseTracker):
         if self.forced_expert_id is not None:
             self.forced_expert_id = int(self.forced_expert_id)
         self.hypothesis_tracker = build_hypothesis_tracker(self.cfg)
-        self.visibility_controller = build_visibility_controller(self.cfg)
+        self.duration_decoder = build_duration_decoder(
+            self.cfg,
+            predictor=getattr(network, "duration_evidence_decoder", None),
+        )
         self._srbt_last_action = BeliefAction.TRACK
         self._redetect_hypotheses = None
         self.network = network
@@ -202,13 +205,13 @@ class PETTrack(BaseTracker):
 
     def _search_state_for_frame(self):
         if (self._srbt_last_action in (
-                BeliefAction.ABSENT, BeliefAction.VERIFY)
+                BeliefAction.GLOBAL_UNRESOLVED, BeliefAction.VERIFY)
                 and self._pending_redetect_box is not None):
             return self._pending_redetect_box
         if (getattr(self, "search_controller_enabled", False)
                 and getattr(self, "_planned_search_state", None) is not None
                 and self._srbt_last_action in (
-                    BeliefAction.TRACK, BeliefAction.SUSPECT)):
+                    BeliefAction.TRACK, BeliefAction.LOCAL_UNRESOLVED)):
             return self._planned_search_state
         return self.state
 
@@ -222,7 +225,7 @@ class PETTrack(BaseTracker):
     def _plan_next_search_state(
             self, event_image, height, width, local_candidate, action):
         if not getattr(self, "search_controller_enabled", False) or action not in (
-                "track", "suspect") or local_candidate is None:
+                "track", "local_unresolved") or local_candidate is None:
             self._planned_search_state = None
             return None
         expert_states = local_candidate.get("expert_states")
@@ -311,7 +314,7 @@ class PETTrack(BaseTracker):
             candidate.get("localization_validity_score"))
         acceptance_score = self._diagnostic_scalar(
             candidate.get("acceptance_score"))
-        controller = getattr(self, "visibility_controller", None)
+        controller = getattr(self, "duration_decoder", None)
         self._search_diagnostics.append({
             "frame_id": int(self.frame_id if frame_id is None else frame_id),
             "is_initial": bool(is_initial),
@@ -329,15 +332,17 @@ class PETTrack(BaseTracker):
             "acceptance_score": acceptance_score,
             "controller_output_score": self._diagnostic_scalar(
                 controller_output_score),
-            "theta_present": self._diagnostic_scalar(
-                getattr(controller, "theta_present", None)),
+            "theta_observable": self._diagnostic_scalar(
+                getattr(controller, "theta_observable", None)),
+            "theta_localized": self._diagnostic_scalar(
+                getattr(controller, "theta_localized", None)),
             "theta_recover": self._diagnostic_scalar(
                 getattr(controller, "theta_recover", None)),
-            "controller_weak_streak": int(getattr(
-                controller, "_weak_streak", 0)),
-            "controller_verify_streak": int(getattr(
-                controller, "_verify_streak", 0)),
-            "controller_stable_visible": int(getattr(
+            "decoder_state_duration": int(getattr(
+                controller, "state_duration", 0)),
+            "decoder_unresolved_duration": int(getattr(
+                controller, "_unresolved_duration", 0)),
+            "decoder_stable_visible": int(getattr(
                 controller, "_stable_visible", 0)),
             "recovery_attempted": bool(recovery_attempted),
             "recovery_confirmed": bool(recovery_confirmed),
@@ -420,7 +425,7 @@ class PETTrack(BaseTracker):
             self._last_trusted_zi = template.detach().clone()
             self._last_trusted_ze = event_template.detach().clone()
             self.thor_wrapper.setup(self.static_zi, self.static_ze)
-            self.visibility_controller.reset()
+            self.duration_decoder.reset()
             self._reset_srbt_sequence_state()
             self._last_score_peak = 0.0
             self._last_redetect_conf = 0.0
@@ -654,31 +659,37 @@ class PETTrack(BaseTracker):
 
     def _step_srbt_controller(self, local_candidate,
                               identity_score=None,
+                              observability_score=None,
                               localization_score=None,
                               acceptance_score=None):
         if local_candidate is None:
             return None
+        observability_score = (
+            local_candidate.get("observability_score")
+            if observability_score is None else observability_score)
+        localization_score = (
+            local_candidate.get("localization_validity_score")
+            if localization_score is None else localization_score)
         acceptance_score = (
             local_candidate.get("acceptance_score")
             if acceptance_score is None else acceptance_score)
-        if acceptance_score is None:
-            acceptance_score = local_candidate.get("presence_score")
-        if acceptance_score is None:
+        if observability_score is None or localization_score is None:
             return None
         if not getattr(self, "srbt_controller_enabled", True):
+            score = (
+                observability_score * localization_score
+                if acceptance_score is None else acceptance_score)
             return ControllerAction(
                 action=BeliefAction.TRACK,
                 allow_recent_write=False,
                 allow_long_write=False,
                 output_absent=False,
-                output_score=float(acceptance_score),
+                output_score=float(score),
             )
-        if identity_score is None and localization_score is None:
-            return self.visibility_controller.step(acceptance_score)
-        return self.visibility_controller.step(
-            acceptance_score,
-            identity_score,
+        return self.duration_decoder.step(
+            observability_score,
             localization_score,
+            identity_score,
         )
 
     def _refine_pending_recovery(self, image, event_image, height, width):
@@ -786,7 +797,8 @@ class PETTrack(BaseTracker):
             recovery = None
             confirmation = None
             recovery_attempted = False
-            if previous_action in (BeliefAction.ABSENT, BeliefAction.VERIFY):
+            if previous_action in (
+                    BeliefAction.GLOBAL_UNRESOLVED, BeliefAction.VERIFY):
                 recovery_attempted = True
                 recovery = self._run_recovery_cycle(image, event_image, H, W)
                 confirmation = self._best_recovery_confirmation(recovery)
@@ -796,13 +808,17 @@ class PETTrack(BaseTracker):
                     srbt_control = self._step_srbt_controller(
                         local_candidate,
                         identity_score=confirmation["identity_score"],
+                        observability_score=confirmation[
+                            "observability_score"],
                         localization_score=confirmation[
                             "localization_validity_score"],
                         acceptance_score=confirmation["acceptance_score"],
                     )
             else:
                 srbt_control = self._step_srbt_controller(local_candidate)
-                if srbt_control is not None and srbt_control.action is BeliefAction.ABSENT:
+                if (srbt_control is not None
+                        and srbt_control.action
+                        is BeliefAction.GLOBAL_UNRESOLVED):
                     recovery_attempted = True
                     recovery = self._run_recovery_cycle(image, event_image, H, W)
                     confirmation = self._best_recovery_confirmation(recovery)
@@ -810,6 +826,8 @@ class PETTrack(BaseTracker):
                         srbt_control = self._step_srbt_controller(
                             local_candidate,
                             identity_score=confirmation["identity_score"],
+                            observability_score=confirmation[
+                                "observability_score"],
                             localization_score=confirmation[
                                 "localization_validity_score"],
                             acceptance_score=confirmation[
@@ -854,7 +872,7 @@ class PETTrack(BaseTracker):
             is_absent = False
             response = None
 
-            if action in ("track", "suspect"):
+            if action in ("track", "local_unresolved"):
                 if local_candidate is None:
                     raise RuntimeError(
                         "tracking action requires a current local candidate")
@@ -870,7 +888,7 @@ class PETTrack(BaseTracker):
                     else local_candidate["score_peak"])
                 response = local_candidate["response"]
                 self._last_score_peak = pred_score
-            elif action == "absent":
+            elif action == "global_unresolved":
                 is_absent = True
             elif action == "verify":
                 is_absent = True
@@ -886,7 +904,8 @@ class PETTrack(BaseTracker):
                 "localization_validity_scores": [],
                 "acceptance_scores": [],
             }
-            if action in ("absent", "verify") and recovery is not None:
+            if action in (
+                    "global_unresolved", "verify") and recovery is not None:
                 diagnostic["event_centers"] = list(
                     recovery.get("_proposal_centers", []))
                 diagnostic["identity_scores"] = (
@@ -990,7 +1009,8 @@ class PETTrack(BaseTracker):
         return {"target_bbox": self.state,
                 "prediction_image": prediction_image,
                 "prediction_event_image": prediction_event_image,
-                "response": response if action in ("track", "suspect") else None,
+                "response": response if action in (
+                    "track", "local_unresolved") else None,
                 "pred_score": pred_score,
                 "absent": is_absent,
                 "allow_recent_write": bool(allow_recent_write),

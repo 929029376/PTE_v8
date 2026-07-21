@@ -649,9 +649,9 @@ def test_tracker_prefers_planned_search_state_only_in_local_tracking_modes():
 
     tracker._srbt_last_action = BeliefAction.TRACK
     assert tracker._search_state_for_frame() == tracker._planned_search_state
-    tracker._srbt_last_action = BeliefAction.SUSPECT
+    tracker._srbt_last_action = BeliefAction.LOCAL_UNRESOLVED
     assert tracker._search_state_for_frame() == tracker._planned_search_state
-    tracker._srbt_last_action = BeliefAction.ABSENT
+    tracker._srbt_last_action = BeliefAction.GLOBAL_UNRESOLVED
     assert tracker._search_state_for_frame() == tracker._pending_redetect_box
     tracker._pending_redetect_box = None
     assert tracker._search_state_for_frame() == tracker.state

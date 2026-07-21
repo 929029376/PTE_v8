@@ -26,8 +26,8 @@ def factorize_reliability(observability, localization_validity):
 
 class Action(str, Enum):
     TRACK = "track"
-    SUSPECT = "suspect"
-    ABSENT = "absent"
+    LOCAL_UNRESOLVED = "local_unresolved"
+    GLOBAL_UNRESOLVED = "global_unresolved"
     VERIFY = "verify"
 
 
@@ -113,36 +113,129 @@ class LocalizationValidityGate(nn.Module):
         return self.network(features)
 
 
-class VisibilityController:
-    """Causal visibility state machine for tracking and recovery activation."""
+class DurationEvidenceDecoder(nn.Module):
+    """Learn state evidence from factorized reliability and causal context."""
 
-    def __init__(self, theta_present=0.70, theta_recover=0.75,
-                 suspect_frames=2, absent_frames=4, verify_frames=2,
-                 long_stable_frames=5):
-        self.theta_present = float(theta_present)
+    def __init__(self, hidden_dim=16, duration_scale=32.0):
+        super().__init__()
+        self.duration_scale = float(duration_scale)
+        if not math.isfinite(self.duration_scale) or self.duration_scale <= 0:
+            raise ValueError("duration_scale must be finite and positive")
+        self.network = nn.Sequential(
+            nn.Linear(9, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), len(Action)),
+        )
+
+    @staticmethod
+    def _vector(value, name, *, dtype=None, device=None):
+        value = torch.as_tensor(value, dtype=dtype, device=device).reshape(-1)
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} must be finite")
+        return value
+
+    def forward(self, observability, localization, identity,
+                previous_state, state_duration):
+        reference = next(self.parameters())
+        observability = self._vector(
+            observability, "observability",
+            dtype=reference.dtype, device=reference.device)
+        localization = self._vector(
+            localization, "localization",
+            dtype=reference.dtype, device=reference.device)
+        identity = self._vector(
+            identity, "identity",
+            dtype=reference.dtype, device=reference.device)
+        state_duration = self._vector(
+            state_duration, "state_duration",
+            dtype=reference.dtype, device=reference.device)
+        previous_state = self._vector(
+            previous_state, "previous_state",
+            dtype=torch.long, device=reference.device)
+        batch = observability.numel()
+        values = (localization, identity, state_duration, previous_state)
+        if any(value.numel() != batch for value in values):
+            raise ValueError("duration decoder inputs must share batch size")
+        if torch.any((observability < 0.0) | (observability > 1.0)):
+            raise ValueError("observability must be in [0, 1]")
+        if torch.any((localization < 0.0) | (localization > 1.0)):
+            raise ValueError("localization must be in [0, 1]")
+        if torch.any((identity < -1.0) | (identity > 1.0)):
+            raise ValueError("identity must be -1 or in [0, 1]")
+        if torch.any((previous_state < 0) | (previous_state >= len(Action))):
+            raise ValueError("previous_state is outside the DART state space")
+        if torch.any(state_duration < 0.0):
+            raise ValueError("state_duration must be non-negative")
+
+        observability = observability.detach()
+        localization = localization.detach()
+        identity = identity.detach()
+        previous_state = previous_state.detach()
+        state_duration = state_duration.detach()
+        acceptance = factorize_reliability(observability, localization)
+        state_one_hot = F.one_hot(
+            previous_state, num_classes=len(Action)).to(reference.dtype)
+        duration_feature = torch.log1p(state_duration).div(
+            math.log1p(self.duration_scale)).clamp(0.0, 1.0)
+        features = torch.cat((
+            observability[:, None],
+            localization[:, None],
+            acceptance[:, None],
+            identity[:, None],
+            state_one_hot,
+            duration_feature[:, None],
+        ), dim=-1)
+        return self.network(features)
+
+
+class DurationStructuredDecoder:
+    """Strictly causal DART state decoder with explicit state durations."""
+
+    def __init__(self, theta_observable=0.70, theta_localized=0.70,
+                 theta_recover=0.75, local_duration=2, global_duration=4,
+                 verify_duration=2, long_stable_duration=5, predictor=None):
+        self.theta_observable = float(theta_observable)
+        self.theta_localized = float(theta_localized)
         self.theta_recover = float(theta_recover)
-        self.suspect_frames = int(suspect_frames)
-        self.absent_frames = int(absent_frames)
-        self.verify_frames = int(verify_frames)
-        self.long_stable_frames = int(long_stable_frames)
+        self.local_duration = int(local_duration)
+        self.global_duration = int(global_duration)
+        self.verify_duration = int(verify_duration)
+        self.long_stable_duration = int(long_stable_duration)
+        self.predictor = predictor
         for name, threshold in (
-                ("theta_present", self.theta_present),
+                ("theta_observable", self.theta_observable),
+                ("theta_localized", self.theta_localized),
                 ("theta_recover", self.theta_recover)):
             if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
                 raise ValueError(f"{name} must be finite and in [0, 1]")
-        if self.suspect_frames < 1:
-            raise ValueError("suspect_frames must be positive")
-        if self.absent_frames <= self.suspect_frames:
-            raise ValueError("absent_frames must be greater than suspect_frames")
-        if self.verify_frames < 1 or self.long_stable_frames < 1:
+        if self.local_duration < 1:
+            raise ValueError("local_duration must be positive")
+        if self.global_duration < self.local_duration:
+            raise ValueError(
+                "global_duration must be at least local_duration")
+        if self.verify_duration < 1 or self.long_stable_duration < 1:
             raise ValueError("verification and stability lengths must be positive")
         self.reset()
 
     def reset(self):
         self.state = Action.TRACK
-        self._weak_streak = 0
-        self._verify_streak = 0
+        self.state_duration = 0
+        self._unresolved_duration = 0
         self._stable_visible = 0
+        self.last_state_probabilities = None
+
+    def _predict_action(self, observability, localization, identity):
+        if self.predictor is None:
+            return None
+        identity_value = -1.0 if identity is None else identity
+        previous_state = list(Action).index(self.state)
+        with torch.no_grad():
+            logits = self.predictor(
+                [observability], [localization], [identity_value],
+                [previous_state], [self.state_duration])
+            probabilities = logits.softmax(dim=-1)[0]
+        self.last_state_probabilities = probabilities.detach().cpu()
+        return list(Action)[int(probabilities.argmax().item())]
 
     @staticmethod
     def _scalar(value, name):
@@ -163,7 +256,7 @@ class VisibilityController:
     def _result(action, score=0.0, allow_recent=False, allow_long=False):
         tracking = action is Action.TRACK
         allow_recent = tracking and bool(allow_recent)
-        output_absent = action in (Action.ABSENT, Action.VERIFY)
+        output_absent = action in (Action.GLOBAL_UNRESOLVED, Action.VERIFY)
         return ControllerAction(
             action=action,
             allow_recent_write=allow_recent,
@@ -172,73 +265,90 @@ class VisibilityController:
             output_score=0.0 if output_absent else float(score),
         )
 
-    def _step_recovery(self, present, identity, localization):
+    def _transition(self, state):
+        if state is self.state:
+            self.state_duration += 1
+        else:
+            self.state = state
+            self.state_duration = 1
+
+    def _step_recovery(self, observability, localization, identity):
         confirmed = (
-            present >= self.theta_recover
-            and identity is not None
-            and localization is not None
-            and identity >= self.theta_recover
+            observability >= self.theta_recover
             and localization >= self.theta_recover
+            and identity is not None
+            and identity >= self.theta_recover
         )
         if not confirmed:
-            self.state = Action.ABSENT
-            self._verify_streak = 0
-            return self._result(Action.ABSENT)
+            self._transition(Action.GLOBAL_UNRESOLVED)
+            return self._result(Action.GLOBAL_UNRESOLVED)
 
-        self._verify_streak += 1
-        if self._verify_streak < self.verify_frames:
-            self.state = Action.VERIFY
+        self._transition(Action.VERIFY)
+        if self.state_duration < self.verify_duration:
             return self._result(Action.VERIFY)
 
-        self.state = Action.TRACK
-        self._weak_streak = 0
-        self._verify_streak = 0
+        self._transition(Action.TRACK)
+        self._unresolved_duration = 0
         self._stable_visible = 0
-        return self._result(Action.TRACK, score=present)
+        return self._result(
+            Action.TRACK, score=observability * localization)
 
-    def step(self, present_probability, identity_score=None,
-             localization_score=None):
-        present = self._scalar(present_probability, "present_probability")
-        identity = self._optional_scalar(identity_score, "identity_score")
-        localization = self._optional_scalar(
-            localization_score, "localization_score")
+    def step(self, observability, localization, identity=None):
+        observability = self._scalar(observability, "observability")
+        localization = self._scalar(localization, "localization")
+        identity = self._optional_scalar(identity, "identity")
+        acceptance = observability * localization
+        predicted_action = self._predict_action(
+            observability, localization, identity)
 
-        if self.state in (Action.ABSENT, Action.VERIFY):
-            return self._step_recovery(present, identity, localization)
+        if self.state in (Action.GLOBAL_UNRESOLVED, Action.VERIFY):
+            return self._step_recovery(
+                observability, localization, identity)
 
-        if present >= self.theta_present:
-            self.state = Action.TRACK
-            self._weak_streak = 0
-            self._verify_streak = 0
+        observable = observability >= self.theta_observable
+        localized = localization >= self.theta_localized
+        if observable and localized:
+            self._transition(Action.TRACK)
+            self._unresolved_duration = 0
             self._stable_visible += 1
             return self._result(
                 Action.TRACK,
-                score=present,
+                score=acceptance,
                 allow_recent=True,
-                allow_long=self._stable_visible >= self.long_stable_frames,
+                allow_long=(
+                    self._stable_visible >= self.long_stable_duration),
             )
 
         self._stable_visible = 0
-        self._weak_streak += 1
-        if self._weak_streak >= self.absent_frames:
-            self.state = Action.ABSENT
-            return self._result(Action.ABSENT)
-        if self._weak_streak >= self.suspect_frames:
-            self.state = Action.SUSPECT
-            return self._result(Action.SUSPECT, score=present)
-        self.state = Action.TRACK
-        return self._result(Action.TRACK, score=present)
+        self._unresolved_duration += 1
+        if (not observable
+                and self._unresolved_duration >= self.global_duration):
+            if (predicted_action is Action.LOCAL_UNRESOLVED
+                    and self._unresolved_duration < 2 * self.global_duration):
+                self._transition(Action.LOCAL_UNRESOLVED)
+                return self._result(
+                    Action.LOCAL_UNRESOLVED, score=acceptance)
+            self._transition(Action.GLOBAL_UNRESOLVED)
+            return self._result(Action.GLOBAL_UNRESOLVED)
+        if self._unresolved_duration >= self.local_duration:
+            self._transition(Action.LOCAL_UNRESOLVED)
+            return self._result(Action.LOCAL_UNRESOLVED, score=acceptance)
+        self._transition(Action.TRACK)
+        return self._result(Action.TRACK, score=acceptance)
 
 
-def build_visibility_controller(cfg):
+def build_duration_decoder(cfg, predictor=None):
     controller_cfg = getattr(getattr(cfg.MODEL, "SRBT", None), "CONTROLLER", None)
     if controller_cfg is None:
-        return VisibilityController()
-    return VisibilityController(
-        theta_present=getattr(controller_cfg, "THETA_PRESENT", 0.70),
+        return DurationStructuredDecoder(predictor=predictor)
+    return DurationStructuredDecoder(
+        theta_observable=getattr(controller_cfg, "THETA_OBSERVABLE", 0.70),
+        theta_localized=getattr(controller_cfg, "THETA_LOCALIZED", 0.70),
         theta_recover=getattr(controller_cfg, "THETA_RECOVER", 0.75),
-        suspect_frames=getattr(controller_cfg, "SUSPECT_FRAMES", 2),
-        absent_frames=getattr(controller_cfg, "ABSENT_FRAMES", 4),
-        verify_frames=getattr(controller_cfg, "VERIFY_FRAMES", 2),
-        long_stable_frames=getattr(controller_cfg, "LONG_STABLE_FRAMES", 5),
+        local_duration=getattr(controller_cfg, "LOCAL_DURATION", 2),
+        global_duration=getattr(controller_cfg, "GLOBAL_DURATION", 4),
+        verify_duration=getattr(controller_cfg, "VERIFY_DURATION", 2),
+        long_stable_duration=getattr(
+            controller_cfg, "LONG_STABLE_DURATION", 5),
+        predictor=predictor,
     )

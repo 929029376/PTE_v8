@@ -7,6 +7,7 @@ from lib.models.layers.expert_fusion import ProposalBoxAdapter
 from lib.models.layers.expert_ensemble import ExpertActivator
 from lib.models.layers.small_target_expert import SmallTargetExpert
 from lib.models.layers.search_window_controller import SearchWindowController
+from lib.models.layers.srbt_controller import DurationEvidenceDecoder
 from lib.models.pet_track.pet_track import _load_filtered_baseline_checkpoint
 from lib.train.base_functions import _optimizer_groups
 
@@ -26,6 +27,7 @@ class TinyStudent(torch.nn.Module):
         self.rgb_identity_verifier = torch.nn.Linear(2, 2)
         self.visibility_gate = torch.nn.Linear(2, 2)
         self.localization_validity_gate = torch.nn.Linear(2, 2)
+        self.duration_evidence_decoder = DurationEvidenceDecoder(hidden_dim=8)
         self.small_target_expert = torch.nn.Linear(2, 2)
         self.default_expert = "generalist"
         self.expert_fusion = torch.nn.Module()
@@ -190,6 +192,7 @@ def test_optimizer_groups_enforce_separate_expert_training_phases():
     assert all(name.startswith((
         "visibility_gate.",
         "localization_validity_gate.",
+        "duration_evidence_decoder.",
         "rgb_identity_verifier.",
         "redetect_expert.",
     )) for name in trainable)

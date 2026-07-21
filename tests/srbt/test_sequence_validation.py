@@ -154,10 +154,12 @@ def test_recovery_diagnostics_are_posthoc_and_aggregation_ready():
     predicted_absent = [False, True, True, True, False, False, False, False, False]
     trace = [
         {"action": "track", "event_centers": [], "identity_scores": []},
-        {"action": "absent", "event_centers": [], "identity_scores": [0.8, 0.2]},
-        {"action": "absent", "event_centers": [], "identity_scores": [0.7]},
+        {"action": "global_unresolved", "event_centers": [],
+         "identity_scores": [0.8, 0.2]},
+        {"action": "global_unresolved", "event_centers": [],
+         "identity_scores": [0.7]},
         {
-            "action": "absent",
+            "action": "global_unresolved",
             "event_centers": [[5.0, 5.0], [35.0, 35.0]],
             "identity_scores": [0.1, 0.9],
         },
@@ -278,10 +280,10 @@ def test_small_target_diagnostics_separate_crop_miss_from_in_crop_failure():
             "search_state": [18.0, 18.0, 8.0, 8.0],
             "crop_bounds_xyxy": [16.0, 16.0, 32.0, 32.0],
             "resize_factor": 4.0,
-            "previous_action": "suspect",
+            "previous_action": "local_unresolved",
             "presence_score": 0.42,
             "controller_output_score": 0.0,
-            "controller_weak_streak": 4,
+            "decoder_unresolved_duration": 4,
             "recovery_attempted": True,
             "recovery_confirmed": False,
             "recovery_max_identity": 0.61,
@@ -337,10 +339,10 @@ def test_small_target_diagnostics_separate_crop_miss_from_in_crop_failure():
     assert records[0]["state_iou"] == pytest.approx(0.25)
     assert records[0]["specialist_iou"] == pytest.approx(0.0)
     assert records[0]["full_box_in_crop"] is True
-    assert records[0]["previous_action"] == "suspect"
+    assert records[0]["previous_action"] == "local_unresolved"
     assert records[0]["presence_score"] == pytest.approx(0.42)
     assert records[0]["controller_output_score"] == pytest.approx(0.0)
-    assert records[0]["controller_weak_streak"] == 4
+    assert records[0]["decoder_unresolved_duration"] == 4
     assert records[0]["recovery_attempted"] is True
     assert records[0]["recovery_confirmed"] is False
     assert records[0]["recovery_max_identity"] == pytest.approx(0.61)
@@ -479,7 +481,8 @@ def test_test_tracker_uses_injected_network_without_building_or_loading(monkeypa
     monkeypatch.setattr(
         pet_tracker_module, "build_hypothesis_tracker", lambda _cfg: object())
     monkeypatch.setattr(
-        pet_tracker_module, "build_visibility_controller", lambda _cfg: object())
+        pet_tracker_module, "build_duration_decoder",
+        lambda _cfg, **_kwargs: object())
     monkeypatch.setattr(pet_tracker_module, "THOR_Wrapper", DummyThor)
 
     cfg = SimpleNamespace(
@@ -512,11 +515,12 @@ def test_test_tracker_uses_injected_network_without_building_or_loading(monkeypa
 def test_search_diagnostics_are_frame_aligned_and_detached():
     tracker = pet_tracker_module.PETTrack.__new__(pet_tracker_module.PETTrack)
     tracker.params = SimpleNamespace(search_factor=4.0, search_size=32)
-    tracker.visibility_controller = SimpleNamespace(
-        theta_present=0.7,
+    tracker.duration_decoder = SimpleNamespace(
+        theta_observable=0.7,
+        theta_localized=0.7,
         theta_recover=0.75,
-        _weak_streak=4,
-        _verify_streak=0,
+        state_duration=4,
+        _unresolved_duration=4,
         _stable_visible=0,
     )
     tracker._last_redetect_conf = 0.37
@@ -546,7 +550,7 @@ def test_search_diagnostics_are_frame_aligned_and_detached():
             "retained_expert_ids": (2, 4),
             "ensemble_weights": [0.0, 0.0, 0.6, 0.0, 0.4],
         },
-        previous_action="suspect",
+        previous_action="local_unresolved",
         controller_output_score=0.0,
         recovery_attempted=True,
         recovery_confirmed=False,
@@ -581,11 +585,13 @@ def test_search_diagnostics_are_frame_aligned_and_detached():
     assert trace[1]["observability_score"] == pytest.approx(0.84)
     assert trace[1]["localization_validity_score"] == pytest.approx(0.5)
     assert trace[1]["acceptance_score"] == pytest.approx(0.42)
-    assert trace[1]["previous_action"] == "suspect"
+    assert trace[1]["previous_action"] == "local_unresolved"
     assert trace[1]["controller_output_score"] == pytest.approx(0.0)
-    assert trace[1]["theta_present"] == pytest.approx(0.7)
+    assert trace[1]["theta_observable"] == pytest.approx(0.7)
+    assert trace[1]["theta_localized"] == pytest.approx(0.7)
     assert trace[1]["theta_recover"] == pytest.approx(0.75)
-    assert trace[1]["controller_weak_streak"] == 4
+    assert trace[1]["decoder_state_duration"] == 4
+    assert trace[1]["decoder_unresolved_duration"] == 4
     assert trace[1]["recovery_attempted"] is True
     assert trace[1]["recovery_confirmed"] is False
     assert trace[1]["recovery_max_identity"] == pytest.approx(0.61)
