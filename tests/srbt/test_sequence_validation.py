@@ -1605,7 +1605,7 @@ def test_refine_best_uses_stage1_checkpoint_reference():
     assert saved == ["best_stage2"]
 
 
-def test_causal_specialist_experiment_defers_full_sequence_validation():
+def test_precision_specialist_experiment_defers_full_sequence_validation():
     assert default_cfg.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert default_cfg.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert default_cfg.TRAIN.BEST_LOADER == "val"
@@ -1616,12 +1616,12 @@ def test_causal_specialist_experiment_defers_full_sequence_validation():
         .read_text(encoding="utf-8")
     )
 
-    assert experiment["TRAIN"]["EXPERT_PHASE"] == "pursuit"
-    assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [4]
-    assert experiment["DATA"]["PURSUIT"]["ENABLE"] is True
+    assert experiment["TRAIN"]["EXPERT_PHASE"] == "specialize"
+    assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [2]
+    assert experiment["DATA"]["PURSUIT"]["ENABLE"] is False
     assert experiment["TRAIN"]["SEQUENCE_VAL_ENABLE"] is False
     assert experiment["TRAIN"]["MIN_EPOCH"] == 10
-    assert experiment["TRAIN"]["EPOCH"] == 30
+    assert experiment["TRAIN"]["EPOCH"] == 60
     assert experiment["TRAIN"]["REFINE_MAX_EPOCH"] == 12
     assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == []
     assert experiment["TRAIN"][
@@ -1638,7 +1638,7 @@ def test_causal_specialist_experiment_defers_full_sequence_validation():
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
     assert experiment["TRAIN"]["BEST_LOADER"] == "val"
-    assert experiment["TRAIN"]["BEST_METRIC"] == "Expert/train_iou_4"
+    assert experiment["TRAIN"]["BEST_METRIC"] == "Expert/train_iou_2"
     assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
     assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is False
 
