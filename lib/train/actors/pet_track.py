@@ -98,6 +98,8 @@ class PETTrackActor(PETTrackBaseActor):
             expert_cfg, "ENABLE", False)) if expert_cfg is not None else False
         self.expert_phase = str(getattr(
             cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
+        self.dart_decoder_only = bool(getattr(
+            cfg.TRAIN, "DART_DECODER_ONLY", False))
         if self.expert_phase not in {
                 "specialize", "refine", "recovery", "pursuit", "dispatch"}:
             raise ValueError(
@@ -137,10 +139,16 @@ class PETTrackActor(PETTrackBaseActor):
         if self.expert_phase == "dispatch":
             model.expert_activator.train(mode)
             return
+        if getattr(self, "dart_decoder_only", False):
+            model.duration_evidence_decoder.train(mode)
+            return
         for name in (
                 "visibility_gate", "localization_validity_gate",
-                "rgb_identity_verifier", "redetect_expert"):
-            getattr(model, name).train(mode)
+                "duration_evidence_decoder", "rgb_identity_verifier",
+                "redetect_expert"):
+            module = getattr(model, name, None)
+            if module is not None:
+                module.train(mode)
 
     # ------------------------------------------------------------------ #
     def _validated_training_expert_ids(self, data, batch_size, device):

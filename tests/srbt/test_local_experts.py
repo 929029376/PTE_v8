@@ -873,6 +873,39 @@ def test_recovery_training_keeps_tracker_eval_and_only_recovery_heads_train():
     assert actor.net.redetect_expert.training is True
 
 
+def test_decoder_only_recovery_keeps_all_frozen_batchnorm_buffers_in_eval():
+    class DecoderOnlyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Sequential(
+                torch.nn.Linear(2, 2),
+                torch.nn.BatchNorm1d(2),
+            )
+            self.visibility_gate = torch.nn.Linear(2, 2)
+            self.localization_validity_gate = torch.nn.Linear(2, 2)
+            self.rgb_identity_verifier = torch.nn.Linear(2, 2)
+            self.redetect_expert = torch.nn.Sequential(
+                torch.nn.Linear(2, 2),
+                torch.nn.BatchNorm1d(2),
+            )
+            self.duration_evidence_decoder = torch.nn.Linear(2, 4)
+
+    actor = object.__new__(PETTrackActor)
+    actor.net = DecoderOnlyModel()
+    actor.expert_phase = "recovery"
+    actor.dart_decoder_only = True
+
+    actor.train(True)
+
+    assert actor.net.training is False
+    assert actor.net.backbone.training is False
+    assert actor.net.visibility_gate.training is False
+    assert actor.net.localization_validity_gate.training is False
+    assert actor.net.rgb_identity_verifier.training is False
+    assert actor.net.redetect_expert.training is False
+    assert actor.net.duration_evidence_decoder.training is True
+
+
 def test_coverage_intervention_masks_only_present_target_pixels():
     rgb = torch.arange(2 * 1 * 1 * 4 * 4, dtype=torch.float32).reshape(
         2, 1, 1, 4, 4)
