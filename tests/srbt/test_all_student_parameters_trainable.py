@@ -336,11 +336,16 @@ def test_pursuit_phase_trains_only_search_window_controller():
     }
 
 
-def test_pursuit_single_specialist_trains_only_declared_motion_path():
+@pytest.mark.parametrize(("expert_id", "expert_name"), [
+    (1, "motion"),
+    (4, "discrimination"),
+])
+def test_pursuit_single_specialist_trains_only_declared_path(
+        expert_id, expert_name):
     model = TinyStudent()
     cfg = _cfg()
     cfg.TRAIN.EXPERT_PHASE = "pursuit"
-    cfg.TRAIN.SPECIALIST_EXPERT_IDS = [1]
+    cfg.TRAIN.SPECIALIST_EXPERT_IDS = [expert_id]
 
     groups = _optimizer_groups(model, cfg)
     trainable = {
@@ -348,10 +353,10 @@ def test_pursuit_single_specialist_trains_only_declared_motion_path():
         if parameter.requires_grad
     }
     expected_prefixes = (
-        "expert_fusion.experts.motion.",
-        "expert_fusion.residual_scale_logits.motion",
-        "expert_heads.motion.",
-        "proposal_adapters.motion.",
+        f"expert_fusion.experts.{expert_name}.",
+        f"expert_fusion.residual_scale_logits.{expert_name}",
+        f"expert_heads.{expert_name}.",
+        f"proposal_adapters.{expert_name}.",
     )
 
     assert trainable
@@ -359,7 +364,7 @@ def test_pursuit_single_specialist_trains_only_declared_motion_path():
     assert not any(
         name.startswith("search_window_controller.") for name in trainable)
     assert [group["name"] for group in groups] == [
-        "causal_specialist_motion"]
+        f"causal_specialist_{expert_name}"]
 
 
 def test_real_motion_pursuit_optimizer_includes_temporal_branch_only():

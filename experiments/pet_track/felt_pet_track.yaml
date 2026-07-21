@@ -44,7 +44,7 @@ DATA:
   VAL:
     DATASETS_NAME: [FELT_VAL]
     DATASETS_RATIO: [1]
-    SAMPLE_PER_EPOCH: 600
+    SAMPLE_PER_EPOCH: 608
 
 MODEL:
   PRETRAIN_PATH: ./pretrained_networks
@@ -52,7 +52,7 @@ MODEL:
   PRETRAINED_BASELINE_CKPT: "pretrained_networks/AMTTrack_ep0098.pth.tar"
   PRETRAINED_SRBT_CKPT: ""
   PRETRAINED_EXPERT_CKPT: ""
-  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/causal_event_motion_exclusive_v35_20260721/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
+  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/causal_event_motion_context_v38_20260721/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
   EXPERT:
     ENABLE: true
     DEFAULT: generalist
@@ -67,7 +67,7 @@ MODEL:
     HIDDEN_DIM: 64
     MAX_CENTER_STEP: 1.0
     TRAINED: true
-    USE_INFERENCE: true
+    USE_INFERENCE: false
   SRBT:
     ENABLE: true
     GATE:
@@ -129,7 +129,7 @@ MODEL:
 TRAIN:
   STAGE: pursuit
   EXPERT_PHASE: pursuit
-  SPECIALIST_EXPERT_IDS: [1]
+  SPECIALIST_EXPERT_IDS: [4]
   SPECIALIST_EXPERT_SCHEDULE: []
   LOAD_LATEST: false
   REBASE_SCHEDULER_ON_RESUME: true
@@ -137,7 +137,7 @@ TRAIN:
   BASE_LR_MULTIPLIER_IN_ALL: 0.1
   EXPERT_LR_MULTIPLIER: 5.0
   DROP_PATH_RATE: 0.1
-  BATCH_SIZE: 12
+  BATCH_SIZE: 32
   MIN_EPOCH: 10
   EPOCH: 30
   REFINE_MAX_EPOCH: 12
@@ -190,7 +190,7 @@ TRAIN:
   SAVE_FINAL_CHECKPOINT: false
   SAVE_BEST: true
   BEST_LOADER: val
-  BEST_METRIC: Expert/train_iou_1
+  BEST_METRIC: Expert/train_iou_4
   BEST_METRIC_MODE: max
   SPECIALIST_GATE_ENABLE: false
   SPECIALIST_MIN_COUNT: 100
