@@ -1421,7 +1421,7 @@ def _print_stage_report(model, cfg):
     active_losses = {
         "specialize": ["base", "srbt", "redetect"],
         "refine": ["base", "srbt", "redetect"],
-        "recovery": ["srbt", "redetect"],
+        "recovery": ["presence", "reliability", "redetect", "identity"],
         "pursuit": ["pursuit"],
         "dispatch": ["activation"],
     }.get(expert_phase, ["invalid_configuration"])

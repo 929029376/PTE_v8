@@ -1032,6 +1032,47 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     assert configured.TRAIN.GENERALIST_MAX_DROP == 0.005
 
 
+def test_dart_reliability_config_is_isolated_recovery_training():
+    from copy import deepcopy
+    from lib.config.pet_track.config import cfg, update_config_from_file
+
+    configured = deepcopy(cfg)
+    update_config_from_file(
+        "experiments/pet_track/felt_pet_track_dart_reliability.yaml",
+        configured,
+    )
+
+    assert configured.DATA.SRBT.ENABLE is True
+    assert configured.DATA.PURSUIT.ENABLE is False
+    assert configured.TRAIN.STAGE == "recovery"
+    assert configured.TRAIN.EXPERT_PHASE == "recovery"
+    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [3]
+    assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
+    assert configured.TRAIN.LOAD_LATEST is False
+    assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
+    assert configured.TRAIN.SAVE_BEST is True
+    assert configured.TRAIN.BEST_LOADER == "val"
+    assert configured.TRAIN.BEST_METRIC == "Loss/total"
+    assert configured.TRAIN.BEST_METRIC_MODE == "min"
+    assert configured.MODEL.INIT_CHECKPOINT.endswith(
+        "causal_event_motion_context_v38_20260721/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_best.pth.tar")
+    assert configured.TRAIN.DART_LOSS.COVERAGE_WEIGHT > 0
+    assert configured.TRAIN.DART_LOSS.GEOMETRY_WEIGHT > 0
+
+
+def test_recovery_stage_report_names_all_active_dart_losses(capsys):
+    from lib.models.pet_track.pet_track import _print_stage_report
+
+    _print_stage_report(None, edict({
+        "TRAIN": edict({"EXPERT_PHASE": "recovery"}),
+    }))
+
+    report = capsys.readouterr().out
+    assert "reliability" in report
+    assert "identity" in report
+
+
 def test_supervisor_uses_causal_event_motion_context_v38_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
