@@ -1032,13 +1032,13 @@ def test_canonical_causal_motion_strategy_trains_only_motion_specialist():
     assert configured.TRAIN.GENERALIST_MAX_DROP == 0.005
 
 
-def test_supervisor_uses_causal_motion_v33_run_directory():
+def test_supervisor_uses_causal_event_motion_v34_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "causal_motion_v33_20260721" in supervisor
+    assert "causal_event_motion_v34_20260721" in supervisor
     assert "sparse_dispatch_balanced_v32_20260720" not in supervisor
     assert "sparse_dispatch_v31_20260720" not in supervisor
     assert "multilabel_specialists_v29_20260720" not in supervisor
@@ -1062,7 +1062,7 @@ def test_supervisor_uses_causal_motion_v33_run_directory():
     assert "--nproc_per_node 2" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "causal_motion_v33_20260721/logs && exec") == 2
+        "causal_event_motion_v34_20260721/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():
