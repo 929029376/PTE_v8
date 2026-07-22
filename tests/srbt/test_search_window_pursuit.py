@@ -455,7 +455,7 @@ def test_pursuit_stage_requires_closed_loop_data_and_completed_experts():
     _validate_pursuit_stage(cfg)
 
 
-def test_actor_uses_previous_controller_output_for_the_next_frame_crop(monkeypatch):
+def test_specialist_pursuit_uses_its_own_output_for_the_next_frame_crop(monkeypatch):
     class ShiftController(torch.nn.Module):
         def forward(self, **kwargs):
             next_box = kwargs["current_box"].clone()
@@ -535,6 +535,9 @@ def test_actor_uses_previous_controller_output_for_the_next_frame_crop(monkeypat
     assert len(captured_anchors) == 4
     assert torch.equal(captured_anchors[0], boxes[0])
     assert torch.equal(captured_anchors[0], captured_anchors[1])
+    assert torch.equal(
+        captured_anchors[2],
+        output["pursuit_specialist_image_boxes"][0].detach())
     assert torch.equal(
         captured_anchors[2], output["pursuit_predictions"][0].next_box)
     assert torch.equal(captured_anchors[2], captured_anchors[3])
