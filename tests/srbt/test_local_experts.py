@@ -602,6 +602,25 @@ def test_specialize_phase_rejects_compound_challenge_labels():
             data, batch_size=1, device=torch.device("cpu"))
 
 
+def test_specialize_validation_accepts_compound_challenge_labels():
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.expert_enabled = True
+    actor.expert_phase = "specialize"
+    data = {
+        "training_expert_id": torch.tensor([2]),
+        "challenge_labels": torch.tensor([[
+            True, True, False, False, False, False, False,
+        ]]),
+        "exclusive_specialist_supervision": torch.tensor([False]),
+    }
+
+    expert_ids = actor._validated_training_expert_ids(
+        data, batch_size=1, device=torch.device("cpu"))
+
+    assert torch.equal(expert_ids, torch.tensor([2]))
+
+
 def test_specialize_phase_rejects_expert_not_eligible_for_challenge_labels():
     class CaptureNet:
         expert_names = list(EXPERT_NAMES)

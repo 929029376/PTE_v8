@@ -369,7 +369,12 @@ def test_pursuit_episode_type_follows_the_active_specialist_contract():
         0, training_expert_id=4) == "visible"
 
 
-def test_pursuit_sampling_excludes_compound_frames_from_single_expert():
+@pytest.mark.parametrize(("training", "expected"), [
+    (True, False),
+    (False, True),
+])
+def test_pursuit_sampling_separates_training_and_validation_masks(
+        training, expected):
     class ProbeStop(Exception):
         pass
 
@@ -384,6 +389,7 @@ def test_pursuit_sampling_excludes_compound_frames_from_single_expert():
     sampler.frame_sample_mode = "causal"
     sampler.pursuit_enabled = True
     sampler.srbt_enabled = False
+    sampler.training = training
     sampler.num_search_frames = 4
     sampler.num_template_frames = 2
     sampler.max_gap = 20
@@ -417,7 +423,7 @@ def test_pursuit_sampling_excludes_compound_frames_from_single_expert():
         sampler.getitem(
             training_expert_id=2, pursuit_episode_type="visible")
 
-    assert not bool(captured["eligible"][4])
+    assert bool(captured["eligible"][4]) is expected
 
 
 def test_pursuit_sampling_fails_after_a_bounded_number_of_attempts(monkeypatch):
@@ -1154,7 +1160,12 @@ def test_precision_pursuit_encodes_templates_once_and_keeps_template_gradients()
     assert bool(model.small_target_expert.template_bias.grad.abs() > 0)
 
 
-def test_causal_specialist_context_excludes_compound_frames_from_loss():
+@pytest.mark.parametrize(("exclusive", "expected"), [
+    (True, [[True, False, True]]),
+    (False, [[True, True, True]]),
+])
+def test_causal_specialist_context_separates_training_and_validation_masks(
+        exclusive, expected):
     actor = object.__new__(PETTrackActor)
     actor.expert_enabled = True
     actor.cfg = SimpleNamespace(
@@ -1170,6 +1181,7 @@ def test_causal_specialist_context_excludes_compound_frames_from_loss():
     data = {
         "training_expert_id": torch.tensor([1]),
         "pursuit_challenge_labels": labels,
+        "exclusive_specialist_supervision": torch.tensor([exclusive]),
     }
 
     specialist_id, eligible, normalized_labels = (
@@ -1178,7 +1190,7 @@ def test_causal_specialist_context_excludes_compound_frames_from_loss():
             device=torch.device("cpu")))
 
     assert specialist_id == 1
-    assert eligible.tolist() == [[True, False, True]]
+    assert eligible.tolist() == expected
     assert normalized_labels.shape == (
         1, 3, len(pet_track_actor_module.CHALLENGE_NAMES))
 

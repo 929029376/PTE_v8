@@ -173,6 +173,18 @@ class PETTrackActor(PETTrackBaseActor):
                 module.train(mode)
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _uses_exclusive_specialist_supervision(data):
+        flags = torch.as_tensor(
+            data.get("exclusive_specialist_supervision", True),
+            dtype=torch.bool,
+        ).reshape(-1)
+        if flags.numel() == 0 or not bool((flags == flags[0]).all()):
+            raise ValueError(
+                "exclusive_specialist_supervision must be uniform per batch")
+        return bool(flags[0])
+
+    # ------------------------------------------------------------------ #
     def _validated_training_expert_ids(self, data, batch_size, device):
         if not self.expert_enabled or self.expert_phase != "specialize":
             return None
@@ -204,7 +216,12 @@ class PETTrackActor(PETTrackBaseActor):
             name: challenge_labels[:, index]
             for index, name in enumerate(CHALLENGE_NAMES)
         }
-        eligible = exclusive_specialist_supervision_mask(attributes).to(device)
+        supervision_mask = (
+            exclusive_specialist_supervision_mask
+            if self._uses_exclusive_specialist_supervision(data)
+            else expert_supervision_mask
+        )
+        eligible = supervision_mask(attributes).to(device)
         selected = eligible.gather(1, training_expert_ids[:, None]).squeeze(1)
         if not bool(selected.all()):
             raise ValueError(
@@ -518,7 +535,12 @@ class PETTrackActor(PETTrackBaseActor):
             name: challenge_labels[..., index].reshape(-1)
             for index, name in enumerate(CHALLENGE_NAMES)
         }
-        eligible = exclusive_specialist_supervision_mask(attributes)[
+        supervision_mask = (
+            exclusive_specialist_supervision_mask
+            if self._uses_exclusive_specialist_supervision(data)
+            else expert_supervision_mask
+        )
+        eligible = supervision_mask(attributes)[
             :, specialist_id].reshape(batch_size, frame_count)
         if not bool(eligible.any(dim=1).all()):
             raise ValueError(

@@ -481,7 +481,8 @@ class TrackingSampler(torch.utils.data.Dataset):
             dataset, seq_id, seq_info_dict)
         expert_mask = (
             exclusive_specialist_supervision_mask(labels)
-            if getattr(self, "expert_phase", "specialize") == "specialize"
+            if (getattr(self, "training", True)
+                and getattr(self, "expert_phase", "specialize") == "specialize")
             else expert_supervision_mask(labels)
         )
         target = expert_mask[:, training_expert_id]
@@ -622,10 +623,13 @@ class TrackingSampler(torch.utils.data.Dataset):
                         if training_expert_id is not None:
                             labels = self._expert_attribute_labels(
                                 dataset, seq_id, seq_info_dict)
-                            eligible_frames = (
-                                exclusive_specialist_supervision_mask(labels)[
-                                    :, training_expert_id]
+                            supervision_mask = (
+                                exclusive_specialist_supervision_mask
+                                if self.training
+                                else expert_supervision_mask
                             )
+                            eligible_frames = supervision_mask(labels)[
+                                :, training_expert_id]
                             if training_expert_id == DISCRIMINATION:
                                 required_frames = (
                                     labels["ambiguity"] & eligible_frames)
@@ -731,6 +735,8 @@ class TrackingSampler(torch.utils.data.Dataset):
                 if sampled_training_expert_id is not None:
                     data['training_expert_id'] = torch.tensor(
                         sampled_training_expert_id, dtype=torch.long)
+                    data['exclusive_specialist_supervision'] = torch.tensor(
+                        self.training, dtype=torch.bool)
                     if self.pursuit_enabled:
                         data['pursuit_challenge_labels'] = challenge_labels
                     else:
