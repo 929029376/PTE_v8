@@ -108,6 +108,25 @@ def test_localization_validity_ranks_candidates_before_response_quality():
     assert torch.equal(result.box, boxes[1])
 
 
+def test_sparse_disagreement_rejects_isolated_specialist():
+    boxes = torch.tensor([
+        [10.0, 10.0, 20.0, 20.0],
+        [80.0, 80.0, 20.0, 20.0],
+    ])
+
+    result = fuse_expert_predictions(
+        boxes=boxes,
+        response_peaks=torch.tensor([0.60, 0.99]),
+        response_psr=torch.tensor([0.60, 0.99]),
+        localization_validity=torch.tensor([0.10, 0.99]),
+        last_box=boxes[0],
+        specialist_margin=1.0,
+    )
+
+    assert result.retained_ids == (0,)
+    assert torch.equal(result.box, boxes[0])
+
+
 def test_zero_quality_falls_back_to_generalist():
     boxes = torch.tensor([
         [0.0, 0.0, 5.0, 5.0],
