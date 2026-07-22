@@ -1012,7 +1012,7 @@ def test_canonical_motion_strategy_trains_only_owner_one_in_long_rollouts():
 
     assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 1600
     assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 400
-    assert configured.TRAIN.BATCH_SIZE == 12
+    assert configured.TRAIN.BATCH_SIZE == 10
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
