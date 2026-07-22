@@ -429,6 +429,35 @@ def test_real_motion_pursuit_optimizer_includes_temporal_branch_only():
     )
 
 
+def test_real_precision_pursuit_optimizer_trains_only_independent_path():
+    from tests.srbt.test_srbt_model_integration import _model
+
+    model = _model(expert_enabled=True)
+    model.search_window_controller = SearchWindowController(
+        expert_count=len(model.expert_names), hidden_dim=16)
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "pursuit"
+    cfg.TRAIN.SPECIALIST_EXPERT_IDS = [2]
+
+    groups = _optimizer_groups(model, cfg)
+    named = dict(model.named_parameters())
+    trainable = {
+        name for name, parameter in named.items()
+        if parameter.requires_grad
+    }
+
+    assert trainable
+    assert all(name.startswith((
+        "small_target_expert.",
+        "proposal_adapters.precision_refiner.",
+    )) for name in trainable)
+    assert [group["name"] for group in groups] == [
+        "causal_specialist_precision_refiner"]
+    assert {id(parameter) for parameter in groups[0]["params"]} == {
+        id(named[name]) for name in trainable
+    }
+
+
 def test_baseline_path_is_bitwise_immutable_after_precision_expert_step(tmp_path):
     torch.manual_seed(29)
     model = TinyStudent()
