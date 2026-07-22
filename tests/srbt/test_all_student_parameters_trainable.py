@@ -199,6 +199,45 @@ def test_optimizer_groups_enforce_separate_expert_training_phases():
     assert [group["name"] for group in groups] == ["recovery"]
 
 
+def test_single_visibility_specialization_trains_only_owner3_and_recovery_modules():
+    model = TinyStudent()
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "specialize"
+    cfg.TRAIN.SPECIALIST_EXPERT_IDS = [3]
+    cfg.TRAIN.RECOVERY_LR = 1e-5
+
+    groups = _optimizer_groups(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    allowed_prefixes = (
+        "expert_fusion.experts.visibility.",
+        "expert_heads.visibility.",
+        "visibility_gate.",
+        "localization_validity_gate.",
+        "duration_evidence_decoder.",
+        "rgb_identity_verifier.",
+        "redetect_expert.",
+    )
+    assert trainable
+    assert all(
+        name.startswith(allowed_prefixes)
+        or name == "expert_fusion.residual_scale_logits.visibility"
+        for name in trainable
+    )
+    assert not any(".motion." in name for name in trainable)
+    assert not any(".small." in name for name in trainable)
+    assert not any(".discrimination." in name for name in trainable)
+    assert {group["name"] for group in groups} == {
+        "expert_fusion_heads", "recovery"
+    }
+    by_name = {group["name"]: group for group in groups}
+    assert by_name["expert_fusion_heads"]["lr"] == pytest.approx(5e-4)
+    assert by_name["recovery"]["lr"] == pytest.approx(1e-5)
+
+
 def test_dispatch_trains_only_the_expert_activator():
     model = TinyStudent()
     cfg = _cfg()

@@ -211,6 +211,15 @@ def _optimizer_groups(net, cfg):
         else None
     )
     pursuit_specialist_name = None
+    single_specialist_name = None
+    if expert_phase == "specialize" and len(specialist_expert_ids) == 1:
+        expert_names = tuple(getattr(model, "expert_names", ()))
+        if not expert_names and expert_fusion is not None:
+            expert_names = tuple(expert_fusion.experts)
+        specialist_id = specialist_expert_ids[0]
+        if specialist_id <= 0 or specialist_id >= len(expert_names):
+            raise ValueError("specialist expert ID is invalid")
+        single_specialist_name = expert_names[specialist_id]
     small_target_only = (
         expert_phase == "specialize"
         and bool(specialist_expert_ids)
@@ -243,6 +252,38 @@ def _optimizer_groups(net, cfg):
                 for parameter in proposal_adapters[
                         "precision_refiner"].parameters():
                     parameter.requires_grad_(True)
+        elif single_specialist_name is not None:
+            if (single_specialist_name not in expert_fusion.experts
+                    or single_specialist_name not in expert_heads):
+                raise ValueError("single specialist path is unavailable")
+            for parameter in expert_fusion.experts[
+                    single_specialist_name].parameters():
+                parameter.requires_grad_(True)
+            expert_fusion.residual_scale_logits[
+                single_specialist_name].requires_grad_(True)
+            for parameter in expert_heads[
+                    single_specialist_name].parameters():
+                parameter.requires_grad_(True)
+            proposal_adapters = getattr(model, "proposal_adapters", None)
+            if (proposal_adapters is not None
+                    and single_specialist_name in proposal_adapters):
+                for parameter in proposal_adapters[
+                        single_specialist_name].parameters():
+                    parameter.requires_grad_(True)
+            if specialist_expert_ids[0] == 3:
+                recovery_modules = (
+                    getattr(model, "visibility_gate", None),
+                    getattr(model, "localization_validity_gate", None),
+                    getattr(model, "duration_evidence_decoder", None),
+                    getattr(model, "rgb_identity_verifier", None),
+                    getattr(model, "redetect_expert", None),
+                )
+                if any(module is None for module in recovery_modules):
+                    raise ValueError(
+                        "visibility specialization requires all recovery modules")
+                for module in recovery_modules:
+                    for parameter in module.parameters():
+                        parameter.requires_grad_(True)
         else:
             specialist_modules = [
                 expert_heads,
@@ -476,7 +517,11 @@ def _optimizer_groups(net, cfg):
                     "small_target_expert.", "proposal_adapters.")))
             add_group(
                 "recovery",
-                lr * float(getattr(cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0))
+                float(getattr(cfg.TRAIN, "RECOVERY_LR", 0.0))
+                if (expert_phase == "specialize" and float(getattr(
+                    cfg.TRAIN, "RECOVERY_LR", 0.0)) > 0.0)
+                else lr * float(getattr(
+                    cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0))
                 if expert_phase == "specialize" else lr,
                 lambda name: name.startswith((
                     "rgb_identity_verifier.", "visibility_gate.",

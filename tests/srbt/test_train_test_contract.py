@@ -992,8 +992,8 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "discrimination_direct_loop_v52_20260722/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_best.pth.tar")
+        "precision_exclusive_loop_v54_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_precision_owner2_ep0005_accepted.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -1002,28 +1002,27 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
 
 
-def test_canonical_precision_strategy_trains_only_owner_two_in_long_rollouts():
+def test_canonical_visibility_strategy_trains_only_owner_three_without_validation():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
-    from lib.train.train_script import _validate_pursuit_stage
 
     configured = deepcopy(cfg)
     update_config_from_file("experiments/pet_track/felt_pet_track.yaml", configured)
 
-    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 1600
+    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 1800
     assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 400
-    assert configured.TRAIN.BATCH_SIZE == 8
+    assert configured.TRAIN.BATCH_SIZE == 12
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "discrimination_direct_loop_v52_20260722/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_best.pth.tar")
-    assert configured.TRAIN.STAGE == "pursuit"
-    assert configured.TRAIN.EXPERT_PHASE == "pursuit"
-    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [2]
+        "precision_exclusive_loop_v54_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_precision_owner2_ep0005_accepted.pth.tar")
+    assert configured.TRAIN.STAGE == "specialize"
+    assert configured.TRAIN.EXPERT_PHASE == "specialize"
+    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [3]
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
-    assert configured.DATA.PURSUIT.ENABLE is True
+    assert configured.DATA.PURSUIT.ENABLE is False
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
     assert configured.DATA.PURSUIT.WINDOW_LENGTH == 16
     assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
@@ -1036,16 +1035,15 @@ def test_canonical_precision_strategy_trains_only_owner_two_in_long_rollouts():
     assert configured.DATA.SEARCH.PRECISION_SCALE_MULTIPLIER == pytest.approx(
         1.75)
     assert configured.TRAIN.MIN_EPOCH == 4
-    assert configured.TRAIN.EPOCH == 30
+    assert configured.TRAIN.EPOCH == 20
     assert configured.TRAIN.REFINE_MAX_EPOCH == 12
     assert configured.TRAIN.LR == 0.00001
-    assert configured.TRAIN.PURSUIT_LR == pytest.approx(0.00005)
+    assert configured.TRAIN.RECOVERY_LR == pytest.approx(0.00001)
     assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(0.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_WEIGHT == pytest.approx(2.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_MARGIN == pytest.approx(0.2)
     assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
     assert configured.TRAIN.ACTIVATOR_ADVANTAGE_MARGIN == pytest.approx(0.02)
-    _validate_pursuit_stage(configured)
     assert configured.TRAIN.ACTIVATOR_POS_WEIGHT == [4.0, 5.0, 1.5, 2.5]
     assert configured.TRAIN.SMALL_TARGET_ADAPTER_LR == pytest.approx(0.0)
     assert "SMALL_TARGET_CHANNEL_LR" not in configured.TRAIN
@@ -1060,12 +1058,12 @@ def test_canonical_precision_strategy_trains_only_owner_two_in_long_rollouts():
     assert "SMALL_TARGET_DENSE_GEOMETRY_WEIGHT" not in configured.TRAIN
     assert configured.TRAIN.SMALL_TARGET_SOFT_BOX_TEMPERATURE == pytest.approx(
         0.2)
-    assert configured.TRAIN.LR_DROP_EPOCH == 22
+    assert configured.TRAIN.LR_DROP_EPOCH == 14
     assert configured.TRAIN.REBASE_SCHEDULER_ON_RESUME is True
     assert configured.TRAIN.REFINE_TAIL_LR == 0.000001
     assert configured.TRAIN.REFINE_MEMORY_LR == 0.0000005
-    assert configured.TRAIN.VAL_START_EPOCH == 2
-    assert configured.TRAIN.VAL_SCHEDULE == [[2, 30, 4]]
+    assert configured.TRAIN.VAL_START_EPOCH == 21
+    assert configured.TRAIN.VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert configured.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_TRAIN_IOU_THRESHOLD == pytest.approx(
@@ -1085,16 +1083,16 @@ def test_canonical_precision_strategy_trains_only_owner_two_in_long_rollouts():
     assert configured.DATA.CHALLENGE_SAMPLING.VAL_MANIFEST == (
         "/root/fnvme/PTE_v8_manifests/felt_val_challenges_v3.json")
     assert configured.MODEL.SRBT.ENABLE is True
-    assert configured.DATA.SRBT.ENABLE is False
+    assert configured.DATA.SRBT.ENABLE is True
     assert configured.MODEL.SRBT.CONTROLLER.THETA_OBSERVABLE == 0.70
     assert configured.MODEL.SRBT.CONTROLLER.THETA_LOCALIZED == 0.70
     assert configured.MODEL.SRBT.CONTROLLER.GLOBAL_DURATION == 4
     assert configured.TEST.POLICY_MODE == "stateful"
     assert configured.TRAIN.SAVE_EPOCHS == []
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
-    assert configured.TRAIN.SAVE_BEST is True
-    assert configured.TRAIN.BEST_LOADER == "val"
-    assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_2"
+    assert configured.TRAIN.SAVE_BEST is False
+    assert configured.TRAIN.BEST_LOADER == "train"
+    assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_3"
     assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
     assert configured.TRAIN.SPECIALIST_MIN_DELTA == 0.02
@@ -1222,13 +1220,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_precision_exclusive_loop_v54_run_directory():
+def test_supervisor_uses_isolated_visibility_exclusive_loop_v55_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "precision_exclusive_loop_v54_20260723" in supervisor
+    assert "visibility_exclusive_loop_v55_20260723" in supervisor
+    assert "precision_exclusive_loop_v54_20260723" not in supervisor
     assert "precision_multilabel_loop_v53_20260722" not in supervisor
     assert "discrimination_direct_loop_v52_20260722" not in supervisor
     assert "discrimination_token_match_v51_20260722" not in supervisor
@@ -1268,7 +1267,7 @@ def test_supervisor_uses_isolated_precision_exclusive_loop_v54_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "precision_exclusive_loop_v54_20260723/logs && exec") == 2
+        "visibility_exclusive_loop_v55_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():
