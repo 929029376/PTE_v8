@@ -5,6 +5,7 @@ from lib.utils import TensorDict
 from lib.train.data.challenge_manifest import load_manifest
 from lib.train.data.felt_challenges import (
     CHALLENGE_NAMES,
+    DISCRIMINATION,
     EXPERT_CHALLENGE_NAMES,
     exclusive_specialist_supervision_mask,
     expert_supervision_mask,
@@ -346,7 +347,7 @@ class TrackingSampler(torch.utils.data.Dataset):
 
     def _sample_pursuit_causal_frame_ids(
             self, visible, seq_info_dict, episode_type=None,
-            eligible_frames=None):
+            eligible_frames=None, required_frames=None, minimum_required=0):
         """Sample a strict contiguous episode, including official absent frames."""
         frame_count = len(seq_info_dict["bbox"])
         window = int(self.num_search_frames)
@@ -361,6 +362,7 @@ class TrackingSampler(torch.utils.data.Dataset):
         reappearance_candidates = []
         presence = torch.as_tensor(visible, dtype=torch.bool).reshape(-1)
         eligible = None
+        required = None
         minimum_eligible = max(2, window // 2)
         if eligible_frames is not None:
             eligible = torch.as_tensor(
@@ -368,6 +370,18 @@ class TrackingSampler(torch.utils.data.Dataset):
             if eligible.numel() != frame_count:
                 raise ValueError(
                     "pursuit eligibility must provide one value per frame")
+        minimum_required = int(minimum_required)
+        if minimum_required < 0:
+            raise ValueError("minimum required pursuit frames cannot be negative")
+        if required_frames is not None:
+            required = torch.as_tensor(
+                required_frames, dtype=torch.bool).reshape(-1)
+            if required.numel() != frame_count:
+                raise ValueError(
+                    "required pursuit frames must provide one value per frame")
+        elif minimum_required:
+            raise ValueError(
+                "minimum required pursuit frames need an explicit frame mask")
         for start in range(1, frame_count - window + 1):
             search_ids = list(range(start, start + window))
             window_present = presence[search_ids]
@@ -376,6 +390,10 @@ class TrackingSampler(torch.utils.data.Dataset):
                 continue
             if (eligible is not None
                     and int(eligible[search_ids].sum()) < minimum_eligible):
+                continue
+            supervised_ids = search_ids[:-1]
+            if (required is not None
+                    and int(required[supervised_ids].sum()) < minimum_required):
                 continue
             base_id = self._previous_visible_id(visible, start)
             if base_id is None:
@@ -581,6 +599,8 @@ class TrackingSampler(torch.utils.data.Dataset):
                     # Sample test and train frames in a causal manner, i.e. search_frame_ids > template_frame_ids
                     if self.pursuit_enabled:
                         eligible_frames = None
+                        required_frames = None
+                        minimum_required = 0
                         if training_expert_id is not None:
                             labels = self._expert_attribute_labels(
                                 dataset, seq_id, seq_info_dict)
@@ -588,10 +608,17 @@ class TrackingSampler(torch.utils.data.Dataset):
                                 exclusive_specialist_supervision_mask(labels)[
                                     :, training_expert_id]
                             )
+                            if training_expert_id == DISCRIMINATION:
+                                required_frames = (
+                                    labels["ambiguity"] & eligible_frames)
+                                minimum_required = max(
+                                    1, self.num_search_frames // 4)
                         template_frame_ids, search_frame_ids, sampler_event_type = \
                             self._sample_pursuit_causal_frame_ids(
                                 visible, seq_info_dict, pursuit_episode_type,
-                                eligible_frames=eligible_frames)
+                                eligible_frames=eligible_frames,
+                                required_frames=required_frames,
+                                minimum_required=minimum_required)
                         if search_frame_ids is None:
                             continue
                         if training_expert_id is not None:

@@ -485,7 +485,7 @@ class PETTrackActor(PETTrackBaseActor):
         specialist_ids = tuple(int(expert_id) for expert_id in getattr(
             train_cfg, "SPECIALIST_EXPERT_IDS", ()))
         if len(specialist_ids) != 1:
-            return None, None
+            return None, None, None
         specialist_id = specialist_ids[0]
         if (not getattr(self, "expert_enabled", False)
                 or specialist_id <= 0
@@ -523,7 +523,7 @@ class PETTrackActor(PETTrackBaseActor):
         if not bool(eligible.any(dim=1).all()):
             raise ValueError(
                 "each pursuit episode must contain eligible specialist frames")
-        return specialist_id, eligible
+        return specialist_id, eligible, challenge_labels
 
     @staticmethod
     def _aligned_iou_xywh(first, second):
@@ -587,13 +587,17 @@ class PETTrackActor(PETTrackBaseActor):
         distractor_scores = scores.masked_fill(target_region, float("-inf"))
         positive = target_scores.flatten(1).max(dim=1).values[valid]
         hardest_negative = distractor_scores.flatten(1).max(dim=1).values[valid]
-        violations = F.relu(float(margin) - positive + hardest_negative)
+        positive_logits = torch.logit(positive.clamp(1e-4, 1.0 - 1e-4))
+        negative_logits = torch.logit(
+            hardest_negative.clamp(1e-4, 1.0 - 1e-4))
+        logit_gap = positive_logits - negative_logits
+        ranking_loss = F.softplus(float(margin) - logit_gap)
         return (
-            violations.mean(),
+            ranking_loss.mean(),
             positive.mean().detach(),
             hardest_negative.mean().detach(),
             int(valid.sum()),
-            (violations > 0).float().mean().detach(),
+            (logit_gap < float(margin)).float().mean().detach(),
         )
 
     def _forward_pursuit(self, data):
@@ -629,7 +633,7 @@ class PETTrackActor(PETTrackBaseActor):
         if annotations.shape[:2] != frames.shape[:2] \
                 or present.shape != frames.shape[:2]:
             raise ValueError("pursuit sequence fields must share [batch, time]")
-        specialist_id, specialist_eligible = (
+        specialist_id, specialist_eligible, specialist_challenge_labels = (
             self._pursuit_specialist_context(
                 data, model, frames.shape[0], frames.shape[1], frames.device)
         )
@@ -652,6 +656,7 @@ class PETTrackActor(PETTrackBaseActor):
         specialist_outputs = []
         specialist_targets = []
         specialist_present = []
+        specialist_discrimination_present = []
         specialist_image_boxes = []
         specialist_image_targets = []
         expert_cfg = getattr(
@@ -860,6 +865,13 @@ class PETTrackActor(PETTrackBaseActor):
                     specialist_present.append(
                         present[:, frame_index]
                         & specialist_eligible[:, frame_index])
+                    if specialist_id == DISCRIMINATION_EXPERT_ID:
+                        ambiguity_index = CHALLENGE_NAMES.index("ambiguity")
+                        specialist_discrimination_present.append(
+                            present[:, frame_index]
+                            & specialist_eligible[:, frame_index]
+                            & specialist_challenge_labels[
+                                :, frame_index, ambiguity_index])
                     specialist_outputs.append(
                         expert_outputs[specialist_name])
                     specialist_image_boxes.append(observation)
@@ -886,6 +898,8 @@ class PETTrackActor(PETTrackBaseActor):
             "pursuit_specialist_outputs": specialist_outputs,
             "pursuit_specialist_targets": specialist_targets,
             "pursuit_specialist_present": specialist_present,
+            "pursuit_discrimination_present": (
+                specialist_discrimination_present),
             "pursuit_specialist_image_boxes": specialist_image_boxes,
             "pursuit_specialist_image_targets": specialist_image_targets,
         }
@@ -1376,6 +1390,12 @@ class PETTrackActor(PETTrackBaseActor):
         discrimination_violation_rate = loss.detach() * 0.0
         discrimination_frame_count = 0
         if specialist_id == DISCRIMINATION_EXPERT_ID:
+            discrimination_present = predictions.get(
+                "pursuit_discrimination_present")
+            if (discrimination_present is None
+                    or len(discrimination_present) != len(specialist_outputs)):
+                raise RuntimeError(
+                    "discrimination pursuit requires ambiguity frame masks")
             ranking_losses = []
             ranking_weights = []
             positive_sums = []
@@ -1391,7 +1411,7 @@ class PETTrackActor(PETTrackBaseActor):
                     self._discrimination_ranking_loss(
                         output["score_map"],
                         predictions["pursuit_specialist_targets"][index],
-                        predictions["pursuit_specialist_present"][index],
+                        discrimination_present[index],
                         margin,
                     )
                 )
@@ -1480,6 +1500,10 @@ class PETTrackActor(PETTrackBaseActor):
         status["Loss/discrimination_ranking_weighted"] = float(
             (discrimination_weight * discrimination_loss).detach())
         status["DiscriminationTrain/frame_count"] = (
+            discrimination_frame_count)
+        status["DiscriminationTrain/ambiguity_frame_count"] = (
+            discrimination_frame_count)
+        status["DiscriminationTrain/gradient_frame_count"] = (
             discrimination_frame_count)
         status["DiscriminationTrain/target_peak"] = float(
             discrimination_positive)
