@@ -1626,7 +1626,7 @@ def test_motion_pursuit_experiment_defers_full_sequence_validation():
     assert experiment["TRAIN"]["REFINE_MAX_EPOCH"] == 12
     assert experiment["TRAIN"]["LOAD_LATEST"] is True
     assert experiment["TRAIN"]["VAL_START_EPOCH"] == 2
-    assert experiment["TRAIN"]["VAL_SCHEDULE"] == [[2, 20, 2]]
+    assert experiment["TRAIN"]["VAL_SCHEDULE"] == [[2, 20, 4]]
     assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == []
     assert experiment["TRAIN"][
         "SEQUENCE_VAL_TRAIN_IOU_THRESHOLD"] == pytest.approx(0.0)

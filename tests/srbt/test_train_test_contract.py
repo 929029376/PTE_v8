@@ -1065,7 +1065,7 @@ def test_canonical_motion_strategy_trains_only_owner_one_in_long_rollouts():
     assert configured.TRAIN.REFINE_TAIL_LR == 0.000001
     assert configured.TRAIN.REFINE_MEMORY_LR == 0.0000005
     assert configured.TRAIN.VAL_START_EPOCH == 2
-    assert configured.TRAIN.VAL_SCHEDULE == [[2, 20, 2]]
+    assert configured.TRAIN.VAL_SCHEDULE == [[2, 20, 4]]
     assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert configured.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_TRAIN_IOU_THRESHOLD == pytest.approx(
