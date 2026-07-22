@@ -665,12 +665,6 @@ class PETTrackActor(PETTrackBaseActor):
                 expert_cfg, "ACTIVATOR_TRAINED", False)):
             raise RuntimeError(
                 "pursuit sparse activation requires a trained expert activator")
-        encode_templates = getattr(model, "_encode_runtime_templates", None)
-        encoded_templates = None
-        if callable(encode_templates):
-            with torch.no_grad():
-                encoded_templates = encode_templates(
-                    zi[:, 0], ze[:, 0], zi[:, 1:], ze[:, 1:])
         was_training = model.training
         motion_center_jitter = 0.0
         motion_center_jitter_multiplier = float(getattr(
@@ -744,8 +738,6 @@ class PETTrackActor(PETTrackBaseActor):
                         dynamic_zi=zi[:, 1:], dynamic_ze=ze[:, 1:],
                         xi=search, xe=event_search,
                         motion_context=motion_context)
-                    if encoded_templates is not None:
-                        inference_kwargs["encoded_templates"] = encoded_templates
                     if specialist_id is not None:
                         inference_kwargs["active_expert_names"] = (
                             specialist_name,)

@@ -788,19 +788,11 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
             self.motion_bias = torch.nn.Parameter(torch.tensor(0.0))
             self.search_window_controller = FixedController()
             self.calls = []
-            self.template_encode_calls = 0
             self.event_inputs = []
             self.motion_contexts = []
 
-        def _encode_runtime_templates(
-                self, static_zi, static_ze, dynamic_zi, dynamic_ze):
-            self.template_encode_calls += 1
-            token = static_zi.new_zeros(static_zi.shape[0], 4, 8)
-            return token, token, token, token
-
         def inference(self, **kwargs):
             self.calls.append(kwargs.get("active_expert_names"))
-            assert kwargs["encoded_templates"][0].ndim == 3
             self.event_inputs.append(kwargs["xe"].detach().clone())
             self.motion_contexts.append(kwargs.get("motion_context"))
             batch_size = kwargs["xi"].shape[0]
@@ -871,7 +863,6 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
     loss.backward()
 
     assert model.calls == [("m",), ("m",)]
-    assert model.template_encode_calls == 1
     assert model.motion_contexts[0] is not None
     assert not bool(model.motion_contexts[0]["history_valid"].any())
     assert bool(model.motion_contexts[1]["history_valid"].all())
