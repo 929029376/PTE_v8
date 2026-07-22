@@ -5,6 +5,7 @@ import pytest
 import torch
 from easydict import EasyDict as edict
 
+from lib.models.layers.event_recovery import EventProposalExtractor
 from lib.models.pet_track.pet_track import PETTrack
 from lib.train.base_functions import _optimizer_groups
 
@@ -683,23 +684,40 @@ def test_training_forward_runs_redetect_only_when_observations_are_requested():
     model = _model()
     probe = ProbeRedetect()
     model.redetect_expert = probe
+    model.event_proposal_extractor = EventProposalExtractor(
+        top_k=3, nms_radius=1, min_robust_score=1.0,
+        density_kernel_size=1)
+    model.recovery_search_factor = 2.0
     zi, ze, xi, xe = _images(batch=2)
 
     ordinary = model(zi, ze, xi, xe)
     assert "redetect_predictions" not in ordinary
 
+    redetect_events = torch.zeros(2, 1, 3, 16, 16)
+    redetect_events[:, 0, 0, 8, 8] = 1.0
+    redetect_events[:, 0, 1, 2, 2] = -1.0
     output = model(
         zi, ze, xi, xe,
         redetect_images=torch.zeros(2, 1, 3, 16, 16),
-        redetect_event_images=torch.ones(2, 1, 3, 16, 16),
+        redetect_event_images=redetect_events,
         redetect_mask=torch.tensor([True, True]),
+        redetect_boxes=torch.tensor([
+            [0.4, 0.4, 0.2, 0.2],
+            [0.4, 0.4, 0.2, 0.2],
+        ]),
     )
     assert torch.equal(
         output["redetect_predictions"]["batch_indices"], torch.tensor([0, 1]))
     identity_scores = output["redetect_predictions"]["identity_scores"]
-    assert identity_scores.shape == (2, 2)
+    identity_targets = output["redetect_predictions"]["identity_targets"]
+    identity_valid = output["redetect_predictions"]["identity_valid"]
+    assert identity_scores.shape == (2, 3)
+    assert identity_targets.shape == (2, 3)
+    assert identity_valid.shape == (2, 3)
+    assert identity_targets[identity_valid].any()
+    assert (~identity_targets[identity_valid]).any()
     assert torch.isfinite(identity_scores).all()
-    identity_scores.sum().backward()
+    identity_scores[identity_valid].sum().backward()
     assert model.rgb_identity_verifier.projection[1].weight.grad is not None
     assert all(parameter.grad is None for parameter in model.backbone.parameters())
     assert probe.last_feat.shape[0] == 2
@@ -726,6 +744,10 @@ def test_recovery_optimizer_step_preserves_every_normal_path_parameter():
         redetect_images=torch.randn(2, 1, 3, 16, 16),
         redetect_event_images=torch.randn(2, 1, 3, 16, 16),
         redetect_mask=torch.tensor([True, True]),
+        redetect_boxes=torch.tensor([
+            [0.4, 0.4, 0.2, 0.2],
+            [0.4, 0.4, 0.2, 0.2],
+        ]),
     )
     recovery = output["redetect_predictions"]
     loss = (

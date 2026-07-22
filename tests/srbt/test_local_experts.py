@@ -630,9 +630,13 @@ def test_only_visibility_expert_forwards_global_recovery(
         "training_expert_id": torch.full((2,), expert_id),
         "challenge_labels": _challenge_labels(expert_id, 2),
         "is_reappear": torch.ones(1, 2),
-        "redetect_search_images": torch.zeros(1, 2, 3, 8, 8),
-        "redetect_search_event_images": torch.zeros(1, 2, 3, 8, 8),
-    }
+            "redetect_search_images": torch.zeros(1, 2, 3, 8, 8),
+            "redetect_search_event_images": torch.zeros(1, 2, 3, 8, 8),
+            "redetect_search_anno": torch.tensor([[
+                [0.25, 0.25, 0.5, 0.5],
+                [0.25, 0.25, 0.5, 0.5],
+            ]]),
+        }
 
     actor.forward_pass(data)
 
@@ -1325,14 +1329,22 @@ def test_recovery_loss_trains_localization_and_rgb_identity():
         [0.55, 0.55, 0.25, 0.25],
     ], requires_grad=True)
     identity_scores = torch.tensor([
-        [0.7, 0.6],
-        [0.5, 0.6],
+        [0.7, 0.6, 0.4],
+        [0.5, 0.6, 0.8],
     ], requires_grad=True)
     predictions = {
         "batch_indices": torch.tensor([0, 1]),
         "score_map": score_map,
         "bbox": boxes,
         "identity_scores": identity_scores,
+        "identity_targets": torch.tensor([
+            [True, False, False],
+            [True, False, False],
+        ]),
+        "identity_valid": torch.tensor([
+            [True, True, True],
+            [True, True, False],
+        ]),
     }
     data = {
         "redetect_search_anno": torch.tensor([[
@@ -1350,6 +1362,13 @@ def test_recovery_loss_trains_localization_and_rgb_identity():
     assert status["Loss/redetect_giou"] > 0.0
     assert status["Loss/recovery_identity"] > 0.0
     assert status["Loss/recovery_ranking"] > 0.0
+    assert status["Redetect/identity_positive_count"] == 2
+    assert status["Redetect/identity_negative_count"] == 3
+    assert status["Redetect/identity_positive_mean"] == pytest.approx(0.6)
+    assert status["Redetect/identity_negative_mean"] == pytest.approx(
+        (0.6 + 0.4 + 0.6) / 3.0)
+    assert status["Redetect/identity_hardest_gap_mean"] == pytest.approx(
+        0.0, abs=1e-6)
 
 
 class _BatchNormTinyHead(TinyHead):

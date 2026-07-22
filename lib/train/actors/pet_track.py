@@ -101,6 +101,11 @@ class PETTrackActor(PETTrackBaseActor):
             cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
         self.dart_decoder_only = bool(getattr(
             cfg.TRAIN, "DART_DECODER_ONLY", False))
+        self.proposal_identity_only = bool(getattr(
+            cfg.TRAIN, "PROPOSAL_IDENTITY_ONLY", False))
+        if self.dart_decoder_only and self.proposal_identity_only:
+            raise ValueError(
+                "DART_DECODER_ONLY and PROPOSAL_IDENTITY_ONLY are mutually exclusive")
         if self.expert_phase not in {
                 "specialize", "refine", "recovery", "pursuit", "dispatch"}:
             raise ValueError(
@@ -124,6 +129,9 @@ class PETTrackActor(PETTrackBaseActor):
             {"pursuit"}
             if self.expert_phase == "pursuit"
             else
+            {"proposal_identity"}
+            if (self.expert_phase == "recovery"
+                and self.proposal_identity_only) else
             {"presence", "reliability", "redetect", "identity"}
             if self.expert_phase == "recovery"
             else ({"base", "expert_advantage", "srbt", "redetect"}
@@ -152,6 +160,9 @@ class PETTrackActor(PETTrackBaseActor):
             return
         if getattr(self, "dart_decoder_only", False):
             model.duration_evidence_decoder.train(mode)
+            return
+        if getattr(self, "proposal_identity_only", False):
+            model.rgb_identity_verifier.train(mode)
             return
         for name in (
                 "visibility_gate", "localization_validity_gate",
@@ -383,6 +394,7 @@ class PETTrackActor(PETTrackBaseActor):
         redetect_images = None
         redetect_event_images = None
         redetect_mask = None
+        redetect_boxes = None
         is_reappear = data.get("is_reappear")
         trains_visibility = (
             training_expert_ids is None
@@ -403,6 +415,20 @@ class PETTrackActor(PETTrackBaseActor):
                 if redetect_images is None or redetect_event_images is None:
                     raise RuntimeError(
                         "reappearance training requires global RGB and event searches")
+                redetect_annotations = data.get("redetect_search_anno")
+                if redetect_annotations is None:
+                    raise RuntimeError(
+                        "proposal-aligned recovery requires redetect_search_anno")
+                redetect_boxes = torch.as_tensor(
+                    redetect_annotations,
+                    device=xi.device,
+                    dtype=xi.dtype,
+                )
+                if redetect_boxes.ndim == 3:
+                    redetect_boxes = redetect_boxes[-1]
+                if redetect_boxes.shape != (xi.shape[0], 4):
+                    raise ValueError(
+                        "redetect_search_anno must provide one current box per row")
             else:
                 redetect_mask = None
 
@@ -418,13 +444,15 @@ class PETTrackActor(PETTrackBaseActor):
             "redetect_images": redetect_images,
             "redetect_event_images": redetect_event_images,
             "redetect_mask": redetect_mask,
+            "redetect_boxes": redetect_boxes,
         }
         if training_expert_ids is not None:
             forward_kwargs["training_expert_ids"] = training_expert_ids
         if expert_phase == "dispatch":
             forward_kwargs["return_activation_logits"] = True
         out_dict = self.net(**forward_kwargs)
-        if expert_phase == "recovery":
+        if (expert_phase == "recovery"
+                and not getattr(self, "proposal_identity_only", False)):
             out_dict["reliability_interventions"] = (
                 self._forward_reliability_interventions(
                     out_dict, forward_kwargs, data))
@@ -869,6 +897,30 @@ class PETTrackActor(PETTrackBaseActor):
         if self.expert_phase == "pursuit":
             return self._compute_pursuit_losses(
                 pred_dict, return_status=return_status)
+        if (self.expert_phase == "recovery"
+                and getattr(self, "proposal_identity_only", False)):
+            predictions = pred_dict.get("redetect_predictions")
+            if predictions is None:
+                raise RuntimeError(
+                    "proposal identity training requires reappearance candidates")
+            loss, status = self._compute_proposal_identity_loss(predictions)
+            if not return_status:
+                return loss
+            status.update({
+                "Loss/base": 0.0,
+                "Loss/SRBT": 0.0,
+                "Loss/presence": 0.0,
+                "Loss/presence_threshold": 0.0,
+                "Loss/redetect": loss.item(),
+                "Loss/DART": 0.0,
+                "Loss/dart_decoder": 0.0,
+                "DART/decoder_acc": 0.0,
+                "Expert/phase_id": 2,
+                "Redetect/count": int(
+                    predictions["batch_indices"].numel()),
+                "Loss/total": loss.item(),
+            })
+            return loss, status
         loss, status = super().compute_losses(pred_dict, gt_dict, return_status=True)
         base_loss = loss
         if self.expert_enabled and self.expert_phase == "recovery":
@@ -1526,6 +1578,66 @@ class PETTrackActor(PETTrackBaseActor):
                 ] = per_sample[active_owned].mean().item()
         return weighted_loss, status
 
+    def _compute_proposal_identity_loss(self, predictions):
+        identity_scores = predictions.get("identity_scores")
+        identity_targets = predictions.get("identity_targets")
+        identity_valid = predictions.get("identity_valid")
+        if any(value is None for value in (
+                identity_scores, identity_targets, identity_valid)):
+            raise RuntimeError(
+                "recovery training requires proposal identity scores, targets, and validity")
+        if (identity_scores.ndim != 2
+                or identity_targets.shape != identity_scores.shape
+                or identity_valid.shape != identity_scores.shape):
+            raise ValueError(
+                "proposal identity tensors must share shape (B,K)")
+        targets = identity_targets.to(
+            device=identity_scores.device, dtype=torch.bool)
+        valid = identity_valid.to(
+            device=identity_scores.device, dtype=torch.bool)
+        targets = targets & valid
+        scores = identity_scores.float().clamp(1e-6, 1.0 - 1e-6)
+        zero = scores.sum() * 0.0
+        if valid.any():
+            identity_loss = F.binary_cross_entropy_with_logits(
+                torch.logit(scores[valid]), targets[valid].to(scores.dtype))
+        else:
+            identity_loss = zero
+        ranking_terms = []
+        score_gaps = []
+        for row in range(scores.shape[0]):
+            positives = scores[row][targets[row]]
+            negatives = scores[row][valid[row] & ~targets[row]]
+            if positives.numel() and negatives.numel():
+                score_gap = positives.max() - negatives.max()
+                score_gaps.append(score_gap)
+                ranking_terms.append(F.relu(
+                    self.identity_ranking_margin - score_gap))
+        ranking_loss = (
+            torch.stack(ranking_terms).mean() if ranking_terms else zero)
+        positive_scores = scores[targets]
+        negative_scores = scores[valid & ~targets]
+        positive_mean = (
+            positive_scores.mean() if positive_scores.numel() else zero)
+        negative_mean = (
+            negative_scores.mean() if negative_scores.numel() else zero)
+        hardest_gap_mean = (
+            torch.stack(score_gaps).mean() if score_gaps else zero)
+        weighted_loss = (
+            self.identity_loss_weight * identity_loss
+            + self.identity_ranking_weight * ranking_loss)
+        return weighted_loss, {
+            "Loss/recovery_identity": identity_loss.item(),
+            "Loss/recovery_ranking": ranking_loss.item(),
+            "Redetect/identity_positive_count": int(targets.sum().item()),
+            "Redetect/identity_negative_count": int(
+                (valid & ~targets).sum().item()),
+            "Redetect/identity_valid_count": int(valid.sum().item()),
+            "Redetect/identity_positive_mean": positive_mean.item(),
+            "Redetect/identity_negative_mean": negative_mean.item(),
+            "Redetect/identity_hardest_gap_mean": hardest_gap_mean.item(),
+        }
+
     def _compute_redetect_loss(self, predictions, data):
         indices = predictions["batch_indices"].to(
             device=predictions["score_map"].device, dtype=torch.long)
@@ -1556,43 +1668,20 @@ class PETTrackActor(PETTrackBaseActor):
         giou, _ = generalized_box_iou(pred_xyxy, target_xyxy)
         giou_loss = (1.0 - giou).mean()
 
-        identity_scores = predictions.get("identity_scores")
-        if identity_scores is None:
-            raise RuntimeError(
-                "recovery training requires RGB identity scores")
-        count = indices.numel()
-        if identity_scores.shape != (count, count):
-            raise ValueError(
-                "identity_scores must compare every template with every candidate")
-        identity_scores = identity_scores.float().clamp(1e-6, 1.0 - 1e-6)
-        identity_targets = torch.eye(
-            count, device=identity_scores.device, dtype=identity_scores.dtype)
-        identity_logits = torch.logit(identity_scores)
-        identity_loss = F.binary_cross_entropy_with_logits(
-            identity_logits, identity_targets)
-        if count > 1:
-            positive = identity_scores.diagonal()
-            negatives = identity_scores.masked_fill(
-                identity_targets.bool(), float("-inf"))
-            hardest_negative = negatives.max(dim=1).values
-            ranking_loss = F.relu(
-                self.identity_ranking_margin - positive + hardest_negative
-            ).mean()
-        else:
-            ranking_loss = identity_scores.sum() * 0.0
+        identity_loss, identity_status = (
+            self._compute_proposal_identity_loss(predictions))
         loss = (
             self.loss_weight["focal"] * focal_loss
             + self.loss_weight["l1"] * box_loss
             + self.loss_weight["giou"] * giou_loss
-            + self.identity_loss_weight * identity_loss
-            + self.identity_ranking_weight * ranking_loss
+            + identity_loss
         )
-        return loss, {
+        status = {
             "Loss/redetect": loss.item(),
             "Loss/redetect_focal": focal_loss.item(),
             "Loss/redetect_l1": box_loss.item(),
             "Loss/redetect_giou": giou_loss.item(),
-            "Loss/recovery_identity": identity_loss.item(),
-            "Loss/recovery_ranking": ranking_loss.item(),
             "Redetect/count": int(indices.numel()),
         }
+        status.update(identity_status)
+        return loss, status

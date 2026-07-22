@@ -278,6 +278,11 @@ def _optimizer_groups(net, cfg):
     elif expert_phase == "recovery":
         dart_decoder_only = bool(getattr(
             cfg.TRAIN, "DART_DECODER_ONLY", False))
+        proposal_identity_only = bool(getattr(
+            cfg.TRAIN, "PROPOSAL_IDENTITY_ONLY", False))
+        if dart_decoder_only and proposal_identity_only:
+            raise ValueError(
+                "DART_DECODER_ONLY and PROPOSAL_IDENTITY_ONLY are mutually exclusive")
         recovery_modules = (
             getattr(model, "visibility_gate", None),
             getattr(model, "localization_validity_gate", None),
@@ -293,7 +298,9 @@ def _optimizer_groups(net, cfg):
             parameter.requires_grad_(False)
         modules_to_train = (
             (getattr(model, "duration_evidence_decoder"),)
-            if dart_decoder_only else recovery_modules
+            if dart_decoder_only else
+            (getattr(model, "rgb_identity_verifier"),)
+            if proposal_identity_only else recovery_modules
         )
         for module in modules_to_train:
             for parameter in module.parameters():

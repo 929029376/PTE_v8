@@ -248,6 +248,30 @@ def test_recovery_decoder_only_owns_exactly_duration_decoder_parameters():
     }
 
 
+def test_proposal_identity_recovery_owns_only_identity_verifier_parameters():
+    model = TinyStudent()
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "recovery"
+    cfg.TRAIN.DART_DECODER_ONLY = False
+    cfg.TRAIN.PROPOSAL_IDENTITY_ONLY = True
+
+    groups = _optimizer_groups(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    expected = {
+        name for name, _ in model.rgb_identity_verifier.named_parameters(
+            prefix="rgb_identity_verifier")
+    }
+    assert trainable == expected
+    assert [group["name"] for group in groups] == ["recovery"]
+    assert {id(parameter) for parameter in groups[0]["params"]} == {
+        id(parameter) for parameter in model.rgb_identity_verifier.parameters()
+    }
+
+
 def test_precision_expert_specialization_trains_only_independent_branch():
     model = TinyStudent()
     cfg = _cfg()

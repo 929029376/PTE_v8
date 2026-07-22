@@ -7,6 +7,7 @@ import torch
 from lib.models.layers.event_recovery import (
     EventProposalExtractor,
     RGBIdentityVerifier,
+    extract_centered_candidate_crops,
 )
 from lib.models.pet_track.pet_track import PETTrack as PETTrackModel
 from lib.models.layers.srbt_controller import (
@@ -31,6 +32,27 @@ def test_zero_event_frame_returns_finite_invalid_proposals():
     assert torch.isfinite(output["heatmap"]).all()
     assert torch.equal(output["scores"], torch.zeros(2, 3))
     assert not output["valid"].any()
+
+
+def test_proposal_candidate_crops_follow_centers_and_mask_invalid_entries():
+    frame = torch.zeros(1, 1, 9, 9)
+    frame[0, 0, 4, 4] = 1.0
+    centers = torch.tensor([[[0.5, 0.5], [0.0, 0.0]]])
+    valid = torch.tensor([[True, False]])
+    target_boxes = torch.tensor([[0.4, 0.4, 0.2, 0.2]])
+
+    crops = extract_centered_candidate_crops(
+        frame,
+        centers,
+        valid,
+        target_boxes,
+        search_factor=2.0,
+        output_size=9,
+    )
+
+    assert crops.shape == (1, 2, 1, 9, 9)
+    assert crops[0, 0, 0, 4, 4] > 0.9
+    assert torch.equal(crops[0, 1], torch.zeros_like(crops[0, 1]))
 
 
 def test_white_background_colored_events_are_ranked_by_local_density():

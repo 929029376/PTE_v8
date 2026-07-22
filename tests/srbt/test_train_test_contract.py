@@ -817,6 +817,10 @@ def test_actor_forwards_global_rgb_event_search_only_for_frame_level_reappearanc
         "template_anno": torch.zeros(1, 2, 4),
         "redetect_search_images": images + 1.0,
         "redetect_search_event_images": images + 2.0,
+        "redetect_search_anno": torch.tensor([[
+            [0.25, 0.25, 0.5, 0.5],
+            [0.25, 0.25, 0.5, 0.5],
+        ]]),
         "is_reappear": torch.tensor([[True, False]]),
     }
 
@@ -939,6 +943,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
     assert configured.MODEL.REDETECT.EVENT_DENSITY_KERNEL_SIZE == 25
     assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is False
+    assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
 
 
 def test_canonical_precision_strategy_trains_only_owner_two():
@@ -1159,7 +1164,7 @@ def test_actor_avoids_legacy_counterfactual_route_outputs():
 def test_recovery_identity_loss_uses_amp_safe_bce_with_logits():
     import inspect
 
-    source = inspect.getsource(PETTrackActor._compute_redetect_loss)
+    source = inspect.getsource(PETTrackActor._compute_proposal_identity_loss)
 
     assert "binary_cross_entropy_with_logits" in source
     assert "binary_cross_entropy(" not in source

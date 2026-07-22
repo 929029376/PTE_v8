@@ -5,6 +5,64 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def extract_centered_candidate_crops(
+        frames, centers, valid, target_boxes, search_factor, output_size=None):
+    """Crop proposal-centered square searches using normalized coordinates."""
+    if frames.ndim != 4 or not torch.is_floating_point(frames):
+        raise ValueError("frames must have floating shape (B,C,H,W)")
+    batch, channels, height, width = frames.shape
+    if centers.ndim != 3 or centers.shape[0] != batch or centers.shape[-1] != 2:
+        raise ValueError("centers must have shape (B,K,2)")
+    candidate_count = centers.shape[1]
+    valid = torch.as_tensor(valid, device=frames.device, dtype=torch.bool)
+    if valid.shape != (batch, candidate_count):
+        raise ValueError("valid must have shape (B,K)")
+    boxes = torch.as_tensor(
+        target_boxes, device=frames.device, dtype=frames.dtype)
+    if boxes.shape != (batch, 4):
+        raise ValueError("target_boxes must have shape (B,4)")
+    factor = float(search_factor)
+    if not math.isfinite(factor) or factor <= 0.0:
+        raise ValueError("search_factor must be finite and positive")
+    size = int(output_size if output_size is not None else max(height, width))
+    if size < 1:
+        raise ValueError("output_size must be positive")
+    if not torch.isfinite(frames).all() or not torch.isfinite(centers).all():
+        raise ValueError("frames and centers must be finite")
+    if not torch.isfinite(boxes).all() or (boxes[:, 2:] <= 0).any():
+        raise ValueError("target boxes must be finite with positive size")
+
+    target_width = boxes[:, 2].clamp_min(1.0 / max(width, 1)) * width
+    target_height = boxes[:, 3].clamp_min(1.0 / max(height, 1)) * height
+    crop_size = (target_width * target_height).sqrt() * factor
+    scale_x = (crop_size / max(width, 1))[:, None].expand(
+        batch, candidate_count).reshape(-1)
+    scale_y = (crop_size / max(height, 1))[:, None].expand(
+        batch, candidate_count).reshape(-1)
+    flat_centers = centers.to(device=frames.device, dtype=frames.dtype).reshape(-1, 2)
+    theta = frames.new_zeros((batch * candidate_count, 2, 3))
+    theta[:, 0, 0] = scale_x
+    theta[:, 1, 1] = scale_y
+    theta[:, 0, 2] = 2.0 * flat_centers[:, 0] - 1.0
+    theta[:, 1, 2] = 2.0 * flat_centers[:, 1] - 1.0
+    repeated = frames[:, None].expand(
+        batch, candidate_count, channels, height, width).reshape(
+            batch * candidate_count, channels, height, width)
+    grid = F.affine_grid(
+        theta,
+        (batch * candidate_count, channels, size, size),
+        align_corners=False,
+    )
+    crops = F.grid_sample(
+        repeated,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False,
+    ).reshape(batch, candidate_count, channels, size, size)
+    return crops * valid[:, :, None, None, None].to(crops.dtype)
+
+
 class RGBIdentityVerifier(nn.Module):
     """Verify Event-proposed candidates against a clean RGB template."""
 

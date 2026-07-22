@@ -12,7 +12,11 @@ from lib.models.pet_track.pet_backbone import pet_vit_base_patch16_224
 from lib.models.layers.head import build_box_head
 from lib.models.layers.atu import build_atu
 from lib.models.layers.redetection import build_redetection_expert
-from lib.models.layers.event_recovery import RGBIdentityVerifier
+from lib.models.layers.event_recovery import (
+    EventProposalExtractor,
+    RGBIdentityVerifier,
+    extract_centered_candidate_crops,
+)
 from lib.models.layers.srbt_controller import (
     DurationEvidenceDecoder,
     LocalizationValidityGate,
@@ -159,6 +163,19 @@ class PETTrack(nn.Module):
             )
             if self.srbt_enabled else None
         )
+        self.event_proposal_extractor = (
+            EventProposalExtractor(
+                top_k=int(getattr(recovery_cfg, "EVENT_TOP_K", 5)),
+                nms_radius=int(getattr(recovery_cfg, "EVENT_NMS_RADIUS", 12)),
+                min_robust_score=float(getattr(
+                    recovery_cfg, "EVENT_MIN_ROBUST_SCORE", 3.0)),
+                density_kernel_size=int(getattr(
+                    recovery_cfg, "EVENT_DENSITY_KERNEL_SIZE", 25)),
+            )
+            if self.srbt_enabled else None
+        )
+        self.recovery_search_factor = float(getattr(
+            recovery_cfg, "RECOVERY_SEARCH_FACTOR", 5.0))
 
         gate_cfg = getattr(srbt_cfg, "GATE", None)
         self.visibility_gate = (
@@ -390,7 +407,8 @@ class PETTrack(nn.Module):
             )
 
     def _forward_redetect_training(self, zi, ze, redetect_images,
-                                   redetect_event_images, redetect_mask):
+                                   redetect_event_images, redetect_mask,
+                                   redetect_boxes):
         supplied = (
             redetect_images,
             redetect_event_images,
@@ -401,6 +419,9 @@ class PETTrack(nn.Module):
         if any(value is None for value in supplied):
             raise RuntimeError(
                 "redetect_images, redetect_event_images, and redetect_mask are required together")
+        if redetect_boxes is None:
+            raise RuntimeError(
+                "proposal-aligned redetection training requires redetect_boxes")
         if (redetect_images.shape != redetect_event_images.shape
                 or redetect_images.ndim != 5):
             raise ValueError(
@@ -418,6 +439,11 @@ class PETTrack(nn.Module):
         selected_ze = ze.index_select(0, indices)
         selected_redetect_images = redetect_images.index_select(0, indices)
         selected_redetect_events = redetect_event_images.index_select(0, indices)
+        boxes = torch.as_tensor(
+            redetect_boxes, device=zi.device, dtype=zi.dtype)
+        if boxes.shape != (batch, 4):
+            raise ValueError("redetect_boxes must have shape (B,4)")
+        selected_boxes = boxes.index_select(0, indices)
         prediction = self.redetect_from_observations(
             selected_zi,
             selected_ze,
@@ -426,18 +452,42 @@ class PETTrack(nn.Module):
         )
         if prediction is not None:
             clean_rgb = selected_zi[:, 0] if selected_zi.ndim == 5 else selected_zi
-            candidate_rgb = (
+            current_rgb = (
                 selected_redetect_images[:, -1]
                 if selected_redetect_images.ndim == 5
                 else selected_redetect_images
             )
+            current_event = (
+                selected_redetect_events[:, -1]
+                if selected_redetect_events.ndim == 5
+                else selected_redetect_events
+            )
+            proposals = self.event_proposal_extractor(current_event)
+            centers = proposals["centers"]
+            valid = proposals["valid"]
+            candidate_rgb = extract_centered_candidate_crops(
+                current_rgb,
+                centers,
+                valid,
+                selected_boxes,
+                search_factor=self.recovery_search_factor,
+                output_size=current_rgb.shape[-1],
+            )
             clean_tokens = self.rgb_identity_tokens(clean_rgb, template=True)
             candidate_tokens = self.rgb_identity_tokens(
-                candidate_rgb, template=False)
-            candidate_matrix = candidate_tokens.unsqueeze(0).expand(
-                indices.numel(), -1, -1, -1)
+                candidate_rgb.flatten(0, 1), template=False).reshape(
+                    indices.numel(), centers.shape[1], -1,
+                    clean_tokens.shape[-1])
             prediction["identity_scores"] = self.rgb_identity_verifier(
-                clean_tokens, candidate_matrix)
+                clean_tokens, candidate_tokens)
+            box_min = selected_boxes[:, None, :2]
+            box_max = box_min + selected_boxes[:, None, 2:]
+            prediction["identity_targets"] = (
+                (centers >= box_min) & (centers <= box_max)
+            ).all(dim=-1) & valid
+            prediction["identity_valid"] = valid
+            prediction["proposal_centers"] = centers
+            prediction["proposal_event_scores"] = proposals["scores"]
             prediction["batch_indices"] = indices
         return prediction
 
@@ -735,6 +785,7 @@ class PETTrack(nn.Module):
     def _forward_srbt(self, zi, ze, xi, xe,
                       redetect_images=None,
                       redetect_event_images=None, redetect_mask=None,
+                      redetect_boxes=None,
                       encoded_templates=None,
                       training_expert_ids=None,
                       active_expert_names=None,
@@ -790,7 +841,8 @@ class PETTrack(nn.Module):
             "reliability_predictions": reliability,
         })
         redetect_predictions = self._forward_redetect_training(
-            zi, ze, redetect_images, redetect_event_images, redetect_mask)
+            zi, ze, redetect_images, redetect_event_images, redetect_mask,
+            redetect_boxes)
         if redetect_predictions is not None:
             out["redetect_predictions"] = redetect_predictions
         return out
@@ -798,7 +850,8 @@ class PETTrack(nn.Module):
     def forward(self, zi, ze, xi, xe, mask_z=None, ce_template_mask=None,
                 ce_keep_rate=None, return_last_attn=False,
                 redetect_images=None, redetect_event_images=None,
-                redetect_mask=None, training_expert_ids=None,
+                redetect_mask=None, redetect_boxes=None,
+                training_expert_ids=None,
                 return_activation_logits=False):
         training_expert_name = self._training_expert(
             training_expert_ids, xi.shape[0], xi.device)
@@ -834,6 +887,7 @@ class PETTrack(nn.Module):
                 redetect_images=redetect_images,
                 redetect_event_images=redetect_event_images,
                 redetect_mask=redetect_mask,
+                redetect_boxes=redetect_boxes,
                 training_expert_ids=training_expert_ids,
                 return_activation_logits=return_activation_logits,
                 **kwargs)
