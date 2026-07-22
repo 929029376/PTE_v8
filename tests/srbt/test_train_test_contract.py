@@ -762,6 +762,59 @@ def test_recovery_sampling_uses_presence_transitions_not_challenge_labels():
     assert int(torch.as_tensor(sample["is_reappear"])[-1]) == 1
 
 
+def test_srbt_sampler_never_draws_an_available_zero_weight_event():
+    sampler = object.__new__(TrackingSampler)
+    sampler.num_template_frames = 2
+    sampler.srbt_anchor_weights = {
+        "visible_to_visible": 0.0,
+        "visible_to_absent": 0.0,
+        "absent_to_absent": 0.0,
+        "absent_to_present": 1.0,
+    }
+    sampler._srbt_anchor_ids = lambda info, event, min_id: (
+        [6] if event == "visible_to_visible" else [])
+    sampler._causal_frame_ids_for_anchor = (
+        lambda visible, search_id, event_ids: ([4, 5], [search_id]))
+
+    sampled = sampler._sample_srbt_event_causal_frame_ids(
+        torch.ones(12, dtype=torch.bool),
+        {"absent": torch.ones(12, dtype=torch.uint8)},
+    )
+
+    assert sampled == (None, None, None)
+
+
+def test_srbt_getitem_retries_sequence_instead_of_visible_fallback():
+    cfg = _srbt_cfg()
+    cfg.TRAIN.EXPERT_PHASE = "recovery"
+    sampler = TrackingSampler(
+        datasets=[_FakeSrbtVideo()],
+        p_datasets=[1],
+        samples_per_epoch=1,
+        max_gap=8,
+        num_search_frames=1,
+        num_template_frames=2,
+        processing=_valid_processing,
+        frame_sample_mode="causal",
+        cfg=cfg,
+        training=True,
+    )
+    attempts = []
+
+    def sample_after_retry(visible, info):
+        attempts.append(True)
+        if len(attempts) == 1:
+            return None, None, None
+        return [4, 5], [11], "absent_to_present"
+
+    sampler._sample_srbt_event_causal_frame_ids = sample_after_retry
+    sample = sampler[0]
+
+    assert len(attempts) == 2
+    assert sample["sampler_event_type"] == "absent_to_present"
+    assert int(torch.as_tensor(sample["is_reappear"])[-1]) == 1
+
+
 def test_actor_ignores_obsolete_future_and_history_inputs():
     class CaptureNet:
         def __call__(self, **kwargs):

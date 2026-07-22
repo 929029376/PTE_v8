@@ -308,7 +308,9 @@ class TrackingSampler(torch.utils.data.Dataset):
             return None, None, None
 
         examples = {}
-        for event_type in self.srbt_anchor_weights:
+        for event_type, event_weight in self.srbt_anchor_weights.items():
+            if event_weight <= 0.0:
+                continue
             event_ids = self._srbt_anchor_ids(
                 seq_info_dict,
                 event_type,
@@ -325,10 +327,10 @@ class TrackingSampler(torch.utils.data.Dataset):
         if not examples:
             return None, None, None
         events = list(examples)
-        weights = [max(0.0, self.srbt_anchor_weights[event]) for event in events]
+        weights = [self.srbt_anchor_weights[event] for event in events]
         event_type = random.choices(
             events,
-            weights=weights if sum(weights) > 0 else None,
+            weights=weights,
             k=1,
         )[0]
         template_frame_ids, search_frame_ids = examples[event_type]
@@ -612,6 +614,8 @@ class TrackingSampler(torch.utils.data.Dataset):
                         template_frame_ids, search_frame_ids, sampler_event_type = \
                             self._sample_srbt_event_causal_frame_ids(
                                 visible, seq_info_dict)
+                        if search_frame_ids is None:
+                            continue
                     while search_frame_ids is None:
                         base_frame_id = self._sample_visible_ids(visible, num_ids=1,
                                                                  min_id=self.num_template_frames - 1,
