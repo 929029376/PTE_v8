@@ -1188,16 +1188,17 @@ def test_proposal_identity_config_is_reappearance_only_and_isolated():
     assert configured.TRAIN.EPOCH == 30
     assert configured.TRAIN.LR == pytest.approx(5e-5)
     assert configured.TRAIN.LR_DROP_EPOCH == 24
-    assert configured.TRAIN.LOAD_LATEST is True
-    assert configured.TRAIN.VAL_START_EPOCH == 31
-    assert configured.TRAIN.VAL_SCHEDULE == []
+    assert configured.TRAIN.LOAD_LATEST is False
+    assert configured.TRAIN.VAL_START_EPOCH == 1
+    assert configured.TRAIN.VAL_SCHEDULE == [[1, 30, 1]]
     assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is True
-    assert configured.TRAIN.BEST_LOADER == "train"
+    assert configured.TRAIN.BEST_LOADER == "val"
     assert configured.TRAIN.BEST_METRIC == (
         "Redetect/identity_hardest_gap_mean")
     assert configured.TRAIN.BEST_METRIC_MODE == "max"
+    assert configured.TRAIN.RECOVERY_LOSS.RANKING_WEIGHT == pytest.approx(2.0)
     assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is False
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
         "precision_recovery_merged_v45_20260722/checkpoints/train/"
@@ -1219,13 +1220,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_proposal_identity_v46_run_directory():
+def test_supervisor_uses_isolated_proposal_identity_v47_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "proposal_identity_v46_20260722" in supervisor
+    assert "proposal_identity_ranked_v47_20260722" in supervisor
+    assert "proposal_identity_v46_20260722" not in supervisor
     assert "precision_specialist_v44_20260722" not in supervisor
     assert "discrimination_ranking_v43_20260722" not in supervisor
     assert "causal_discrimination_v42_20260721" not in supervisor
@@ -1258,7 +1260,7 @@ def test_supervisor_uses_isolated_proposal_identity_v46_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "proposal_identity_v46_20260722/logs && exec") == 2
+        "proposal_identity_ranked_v47_20260722/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():
