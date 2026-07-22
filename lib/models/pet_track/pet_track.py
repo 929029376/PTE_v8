@@ -951,7 +951,7 @@ class PETTrack(nn.Module):
     def inference(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe,
                   small_template_features=None, active_expert_names=None,
                   auto_activate=False, return_activation_logits=False,
-                  motion_context=None):
+                  motion_context=None, encoded_templates=None):
         if auto_activate and active_expert_names is not None:
             raise ValueError(
                 "explicit and automatic expert activation are mutually exclusive")
@@ -972,8 +972,9 @@ class PETTrack(nn.Module):
             raise ValueError(
                 "independent small-target inference requires raw static "
                 "RGB/event template images")
-        encoded_templates = self._encode_runtime_templates(
-            static_zi, static_ze, dynamic_zi, dynamic_ze)
+        if encoded_templates is None:
+            encoded_templates = self._encode_runtime_templates(
+                static_zi, static_ze, dynamic_zi, dynamic_ze)
         static_zi, static_ze, _, _ = encoded_templates
         if self.srbt_enabled:
             out = self._forward_srbt(
