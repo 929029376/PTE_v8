@@ -1205,6 +1205,33 @@ def test_proposal_identity_config_is_reappearance_only_and_isolated():
         "PETTrack_activator_ep0020_accepted.pth.tar")
 
 
+def test_final_inference_config_enables_accepted_behavior_contract():
+    from copy import deepcopy
+    from lib.config.pet_track.config import cfg, update_config_from_file
+
+    configured = deepcopy(cfg)
+    update_config_from_file(
+        "experiments/pet_track/felt_pet_track_final.yaml",
+        configured,
+    )
+
+    accepted = (
+        "/root/fnvme/PTE_v8_runs/proposal_identity_coverage_v59_20260723/"
+        "checkpoints/train/pet_track/felt_pet_track_proposal_identity/"
+        "PETTrack_identity_ep0030_accepted.pth.tar"
+    )
+    assert configured.MODEL.INIT_CHECKPOINT == accepted
+    assert configured.TEST.CHECKPOINT == accepted
+    assert configured.TEST.POLICY_MODE == "stateful"
+    assert configured.MODEL.EXPERT.ACTIVATOR_TRAINED is True
+    assert configured.MODEL.EXPERT.USE_ACTIVATION_INFERENCE is True
+    assert configured.MODEL.EXPERT.MAX_ACTIVE_SPECIALISTS == 2
+    assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
+    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
+    assert configured.MODEL.SRBT.ENABLE is True
+    assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is True
+
+
 def test_proposal_identity_stage_report_is_unambiguous(capsys):
     from lib.models.pet_track.pet_track import _print_stage_report
 
