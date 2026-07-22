@@ -681,6 +681,21 @@ class PETTrackActor(PETTrackBaseActor):
         model.eval()
         controller.train(was_training and specialist_id is None)
         try:
+            encoded_templates = None
+            if hasattr(model, "_encode_runtime_templates"):
+                with torch.no_grad():
+                    encoded_templates = model._encode_runtime_templates(
+                        zi[:, 0], ze[:, 0], zi[:, 1:], ze[:, 1:])
+            small_template_features = None
+            if specialist_name is not None and specialist_name == getattr(
+                    model, "precision_refiner_name", None):
+                small_target_expert = getattr(
+                    model, "small_target_expert", None)
+                if small_target_expert is None:
+                    raise RuntimeError(
+                        "precision pursuit requires small_target_expert")
+                small_template_features = small_target_expert.encode_template(
+                    zi[:, 0], ze[:, 0])
             for frame_index in range(frames.shape[1] - 1):
                 crop_anchor = planned_anchor
                 if motion_center_jitter > 0.0:
@@ -737,11 +752,21 @@ class PETTrackActor(PETTrackBaseActor):
                         planned_anchor, previous_observation),
                 }
                 with torch.set_grad_enabled(specialist_id is not None):
+                    if encoded_templates is None:
+                        runtime_templates = (
+                            zi[:, 0], ze[:, 0], zi[:, 1:], ze[:, 1:])
+                    else:
+                        runtime_templates = encoded_templates
                     inference_kwargs = dict(
-                        static_zi=zi[:, 0], static_ze=ze[:, 0],
-                        dynamic_zi=zi[:, 1:], dynamic_ze=ze[:, 1:],
+                        static_zi=runtime_templates[0],
+                        static_ze=runtime_templates[1],
+                        dynamic_zi=runtime_templates[2],
+                        dynamic_ze=runtime_templates[3],
                         xi=search, xe=event_search,
                         motion_context=motion_context)
+                    if small_template_features is not None:
+                        inference_kwargs["small_template_features"] = (
+                            small_template_features)
                     if specialist_id is not None:
                         inference_kwargs["active_expert_names"] = (
                             specialist_name,)

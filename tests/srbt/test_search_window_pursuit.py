@@ -1022,6 +1022,127 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
     assert model.search_window_controller.bias.grad is None
 
 
+def test_precision_pursuit_encodes_templates_once_and_keeps_template_gradients():
+    class FixedController(torch.nn.Module):
+        def forward(self, **kwargs):
+            current_box = kwargs["current_box"]
+            return SimpleNamespace(
+                next_box=current_box,
+                inside_logit=current_box[:, 0] * 0.0,
+                quality_logit=current_box[:, 0] * 0.0,
+            )
+
+    class CountingPrecisionExpert(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.template_bias = torch.nn.Parameter(torch.tensor(0.0))
+            self.encode_calls = 0
+
+        def encode_template(self, template_rgb, template_event):
+            self.encode_calls += 1
+            return self.template_bias + template_rgb.mean() + template_event.mean()
+
+    class CausalPrecisionModel(torch.nn.Module):
+        expert_names = ["g", "m", "p", "v", "d"]
+        precision_refiner_name = "p"
+
+        def __init__(self):
+            super().__init__()
+            self.search_window_controller = FixedController()
+            self.small_target_expert = CountingPrecisionExpert()
+            self.shared_template_encode_calls = 0
+            self.inference_calls = 0
+
+        def _encode_runtime_templates(
+                self, static_zi, static_ze, dynamic_zi, dynamic_ze):
+            templates = (static_zi, static_ze, dynamic_zi, dynamic_ze)
+            if any(template.dim() != 3 for template in templates):
+                self.shared_template_encode_calls += 1
+                batch_size = static_zi.shape[0]
+                token = static_zi.new_zeros(batch_size, 1, 1)
+                return token, token, token, token
+            return templates
+
+        def inference(self, **kwargs):
+            self.inference_calls += 1
+            self._encode_runtime_templates(
+                kwargs["static_zi"], kwargs["static_ze"],
+                kwargs["dynamic_zi"], kwargs["dynamic_ze"])
+            template_features = kwargs.get("small_template_features")
+            if template_features is None:
+                template_features = self.small_target_expert.encode_template(
+                    kwargs["static_zi"], kwargs["static_ze"])
+            batch_size = kwargs["xi"].shape[0]
+
+            def output(center):
+                center = center.expand(batch_size)
+                box = torch.stack((
+                    center,
+                    center * 0.0 + 0.5,
+                    center * 0.0 + 0.2,
+                    center * 0.0 + 0.2,
+                ), dim=1).unsqueeze(1)
+                score = center[:, None, None, None].expand(
+                    batch_size, 1, 4, 4)
+                return {"pred_boxes": box, "score_map": score}
+
+            return {
+                "expert_outputs": {
+                    "g": output(template_features.detach() * 0.0 + 0.5),
+                    "p": output(0.5 + 0.1 * template_features.tanh()),
+                },
+                "presence_score": torch.ones(batch_size),
+            }
+
+    model = CausalPrecisionModel()
+    actor = object.__new__(PETTrackActor)
+    actor.net = model
+    actor.expert_enabled = True
+    actor.expert_phase = "pursuit"
+    actor.settings = SimpleNamespace(search_area_factor={"search": 2.0})
+    actor.cfg = SimpleNamespace(
+        MODEL=SimpleNamespace(EXPERT=SimpleNamespace(
+            ACTIVATOR_TRAINED=False,
+            USE_ACTIVATION_INFERENCE=False,
+        )),
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(SIZE=8, FACTOR=2.0)),
+        TRAIN=SimpleNamespace(SPECIALIST_EXPERT_IDS=[2]),
+    )
+    frames = torch.zeros(3, 1, 3, 8, 8)
+    challenge_labels = torch.zeros(
+        3, 1, len(pet_track_actor_module.CHALLENGE_NAMES), dtype=torch.bool)
+    challenge_labels[
+        :, :, pet_track_actor_module.CHALLENGE_NAMES.index("small_target")
+    ] = True
+    data = {
+        "template_images": torch.zeros(2, 1, 3, 4, 4),
+        "template_event_images": torch.zeros(2, 1, 3, 4, 4),
+        "pursuit_search_images": frames,
+        "pursuit_search_event_images": frames,
+        "pursuit_search_anno": torch.tensor([
+            [[0.10, 0.40, 0.10, 0.10]],
+            [[0.20, 0.40, 0.10, 0.10]],
+            [[0.30, 0.40, 0.10, 0.10]],
+        ]),
+        "pursuit_search_present": torch.ones(3, 1, dtype=torch.uint8),
+        "training_expert_id": torch.tensor([2]),
+        "pursuit_challenge_labels": challenge_labels,
+    }
+
+    output = actor._forward_pursuit(data)
+    loss = torch.stack([
+        item["pred_boxes"].sum()
+        for item in output["pursuit_specialist_outputs"]
+    ]).mean()
+    loss.backward()
+
+    assert model.inference_calls == 2
+    assert model.shared_template_encode_calls == 1
+    assert model.small_target_expert.encode_calls == 1
+    assert model.small_target_expert.template_bias.grad is not None
+    assert bool(model.small_target_expert.template_bias.grad.abs() > 0)
+
+
 def test_causal_specialist_context_keeps_compound_frames_in_loss():
     actor = object.__new__(PETTrackActor)
     actor.expert_enabled = True
