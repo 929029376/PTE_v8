@@ -703,13 +703,24 @@ def test_pursuit_uses_per_row_sparse_activation_with_fixed_expert_slots():
 
     class SparseExperts(torch.nn.Module):
         expert_names = ["g", "m", "p", "v", "d"]
+        precision_refiner_name = "p"
 
         def __init__(self):
             super().__init__()
             self.search_window_controller = CapturingController()
             self.inference_kwargs = []
 
+        def _encode_runtime_templates(
+                self, static_zi, static_ze, dynamic_zi, dynamic_ze):
+            batch_size = static_zi.shape[0]
+            token = static_zi.new_zeros(batch_size, 1, 1)
+            return token, token, token, token
+
         def inference(self, **kwargs):
+            if kwargs["static_zi"].dim() == 3 \
+                    and kwargs.get("small_template_features") is None:
+                raise ValueError(
+                    "precision-capable activation requires raw templates")
             self.inference_kwargs.append(dict(kwargs))
             batch_size = kwargs["xi"].shape[0]
 

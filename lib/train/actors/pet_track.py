@@ -682,7 +682,8 @@ class PETTrackActor(PETTrackBaseActor):
         controller.train(was_training and specialist_id is None)
         try:
             encoded_templates = None
-            if hasattr(model, "_encode_runtime_templates"):
+            if specialist_id is not None and hasattr(
+                    model, "_encode_runtime_templates"):
                 with torch.no_grad():
                     encoded_templates = model._encode_runtime_templates(
                         zi[:, 0], ze[:, 0], zi[:, 1:], ze[:, 1:])
