@@ -992,7 +992,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "motion_closed_loop_v48_20260722/checkpoints/train/pet_track/"
+        "discrimination_direct_loop_v52_20260722/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
@@ -1002,7 +1002,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
 
 
-def test_canonical_discrimination_strategy_trains_only_owner_four_in_long_rollouts():
+def test_canonical_precision_strategy_trains_only_owner_two_in_long_rollouts():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
     from lib.train.train_script import _validate_pursuit_stage
@@ -1017,11 +1017,11 @@ def test_canonical_discrimination_strategy_trains_only_owner_four_in_long_rollou
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "motion_closed_loop_v48_20260722/checkpoints/train/pet_track/"
+        "discrimination_direct_loop_v52_20260722/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.TRAIN.STAGE == "pursuit"
     assert configured.TRAIN.EXPERT_PHASE == "pursuit"
-    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [4]
+    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [2]
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
     assert configured.DATA.PURSUIT.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -1094,7 +1094,7 @@ def test_canonical_discrimination_strategy_trains_only_owner_four_in_long_rollou
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is True
     assert configured.TRAIN.BEST_LOADER == "val"
-    assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_4"
+    assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_2"
     assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
     assert configured.TRAIN.SPECIALIST_MIN_DELTA == 0.02
@@ -1222,13 +1222,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_discrimination_direct_loop_v52_run_directory():
+def test_supervisor_uses_isolated_precision_multilabel_loop_v53_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "discrimination_direct_loop_v52_20260722" in supervisor
+    assert "precision_multilabel_loop_v53_20260722" in supervisor
+    assert "discrimination_direct_loop_v52_20260722" not in supervisor
     assert "discrimination_token_match_v51_20260722" not in supervisor
     assert "discrimination_hard_negative_v50_20260722" not in supervisor
     assert "discrimination_closed_loop_v49_20260722" not in supervisor
@@ -1266,7 +1267,7 @@ def test_supervisor_uses_isolated_discrimination_direct_loop_v52_run_directory()
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "discrimination_direct_loop_v52_20260722/logs && exec") == 2
+        "precision_multilabel_loop_v53_20260722/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

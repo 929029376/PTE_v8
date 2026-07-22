@@ -1605,7 +1605,7 @@ def test_refine_best_uses_stage1_checkpoint_reference():
     assert saved == ["best_stage2"]
 
 
-def test_discrimination_pursuit_experiment_defers_full_sequence_validation():
+def test_precision_pursuit_experiment_defers_full_sequence_validation():
     assert default_cfg.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert default_cfg.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert default_cfg.TRAIN.BEST_LOADER == "val"
@@ -1617,7 +1617,7 @@ def test_discrimination_pursuit_experiment_defers_full_sequence_validation():
     )
 
     assert experiment["TRAIN"]["EXPERT_PHASE"] == "pursuit"
-    assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [4]
+    assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [2]
     assert experiment["DATA"]["PURSUIT"]["ENABLE"] is True
     assert experiment["DATA"]["PURSUIT"]["WINDOW_LENGTH"] == 16
     assert experiment["TRAIN"]["SEQUENCE_VAL_ENABLE"] is False
@@ -1642,7 +1642,7 @@ def test_discrimination_pursuit_experiment_defers_full_sequence_validation():
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
     assert experiment["TRAIN"]["BEST_LOADER"] == "val"
-    assert experiment["TRAIN"]["BEST_METRIC"] == "Expert/train_iou_4"
+    assert experiment["TRAIN"]["BEST_METRIC"] == "Expert/train_iou_2"
     assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
     assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is False
 

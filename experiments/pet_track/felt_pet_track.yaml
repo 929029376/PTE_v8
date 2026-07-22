@@ -52,7 +52,7 @@ MODEL:
   PRETRAINED_BASELINE_CKPT: "pretrained_networks/AMTTrack_ep0098.pth.tar"
   PRETRAINED_SRBT_CKPT: ""
   PRETRAINED_EXPERT_CKPT: ""
-  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/motion_closed_loop_v48_20260722/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
+  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/discrimination_direct_loop_v52_20260722/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
   EXPERT:
     ENABLE: true
     DEFAULT: generalist
@@ -132,7 +132,7 @@ TRAIN:
   STAGE: pursuit
   EXPERT_PHASE: pursuit
   PROPOSAL_IDENTITY_ONLY: false
-  SPECIALIST_EXPERT_IDS: [4]
+  SPECIALIST_EXPERT_IDS: [2]
   SPECIALIST_EXPERT_SCHEDULE: []
   LOAD_LATEST: true
   REBASE_SCHEDULER_ON_RESUME: true
@@ -195,7 +195,7 @@ TRAIN:
   SAVE_FINAL_CHECKPOINT: false
   SAVE_BEST: true
   BEST_LOADER: val
-  BEST_METRIC: Expert/train_iou_4
+  BEST_METRIC: Expert/train_iou_2
   BEST_METRIC_MODE: max
   SPECIALIST_GATE_ENABLE: false
   SPECIALIST_MIN_COUNT: 100
