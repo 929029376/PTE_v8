@@ -408,17 +408,19 @@ class PETTrack(nn.Module):
 
     def _forward_redetect_training(self, zi, ze, redetect_images,
                                    redetect_event_images, redetect_mask,
-                                   redetect_boxes):
+                                   redetect_boxes, redetect_padding_mask):
         supplied = (
             redetect_images,
             redetect_event_images,
             redetect_mask,
+            redetect_padding_mask,
         )
         if all(value is None for value in supplied) or self.redetect_expert is None:
             return None
         if any(value is None for value in supplied):
             raise RuntimeError(
-                "redetect_images, redetect_event_images, and redetect_mask are required together")
+                "redetect images, events, selection mask, and padding mask "
+                "are required together")
         if redetect_boxes is None:
             raise RuntimeError(
                 "proposal-aligned redetection training requires redetect_boxes")
@@ -439,6 +441,13 @@ class PETTrack(nn.Module):
         selected_ze = ze.index_select(0, indices)
         selected_redetect_images = redetect_images.index_select(0, indices)
         selected_redetect_events = redetect_event_images.index_select(0, indices)
+        padding = torch.as_tensor(
+            redetect_padding_mask, device=zi.device, dtype=torch.bool)
+        if (padding.ndim != 4 or padding.shape[:2] != redetect_images.shape[:2]
+                or padding.shape[-2:] != redetect_images.shape[-2:]):
+            raise ValueError(
+                "redetect_padding_mask must have shape (B,T,H,W)")
+        selected_padding = padding.index_select(0, indices)
         boxes = torch.as_tensor(
             redetect_boxes, device=zi.device, dtype=zi.dtype)
         if boxes.shape != (batch, 4):
@@ -462,7 +471,8 @@ class PETTrack(nn.Module):
                 if selected_redetect_events.ndim == 5
                 else selected_redetect_events
             )
-            proposals = self.event_proposal_extractor(current_event)
+            proposals = self.event_proposal_extractor(
+                current_event, padding_mask=selected_padding[:, -1])
             centers = proposals["centers"]
             valid = proposals["valid"]
             candidate_rgb = extract_centered_candidate_crops(
@@ -786,6 +796,7 @@ class PETTrack(nn.Module):
                       redetect_images=None,
                       redetect_event_images=None, redetect_mask=None,
                       redetect_boxes=None,
+                      redetect_padding_mask=None,
                       encoded_templates=None,
                       training_expert_ids=None,
                       active_expert_names=None,
@@ -842,7 +853,7 @@ class PETTrack(nn.Module):
         })
         redetect_predictions = self._forward_redetect_training(
             zi, ze, redetect_images, redetect_event_images, redetect_mask,
-            redetect_boxes)
+            redetect_boxes, redetect_padding_mask)
         if redetect_predictions is not None:
             out["redetect_predictions"] = redetect_predictions
         return out
@@ -851,6 +862,7 @@ class PETTrack(nn.Module):
                 ce_keep_rate=None, return_last_attn=False,
                 redetect_images=None, redetect_event_images=None,
                 redetect_mask=None, redetect_boxes=None,
+                redetect_padding_mask=None,
                 training_expert_ids=None,
                 return_activation_logits=False):
         training_expert_name = self._training_expert(
@@ -888,6 +900,7 @@ class PETTrack(nn.Module):
                 redetect_event_images=redetect_event_images,
                 redetect_mask=redetect_mask,
                 redetect_boxes=redetect_boxes,
+                redetect_padding_mask=redetect_padding_mask,
                 training_expert_ids=training_expert_ids,
                 return_activation_logits=return_activation_logits,
                 **kwargs)

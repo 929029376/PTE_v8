@@ -692,6 +692,7 @@ def test_tracking_sampler_srbt_batch_is_real_actor_forward_without_legacy_route_
             sample["redetect_search_images"]),
         "redetect_search_event_images": _stack_images(
             sample["redetect_search_event_images"]),
+        "redetect_search_att": torch.zeros(1, 1, 16, 16, dtype=torch.bool),
         "redetect_search_anno": _stack_boxes(
             sample["redetect_search_anno"]),
         "is_reappear": torch.as_tensor(sample["is_reappear"]).unsqueeze(1),
@@ -817,6 +818,7 @@ def test_actor_forwards_global_rgb_event_search_only_for_frame_level_reappearanc
         "template_anno": torch.zeros(1, 2, 4),
         "redetect_search_images": images + 1.0,
         "redetect_search_event_images": images + 2.0,
+        "redetect_search_att": torch.zeros(1, 2, 4, 4, dtype=torch.bool),
         "redetect_search_anno": torch.tensor([[
             [0.25, 0.25, 0.5, 0.5],
             [0.25, 0.25, 0.5, 0.5],
@@ -828,6 +830,7 @@ def test_actor_forwards_global_rgb_event_search_only_for_frame_level_reappearanc
 
     assert actor.net.kwargs["redetect_images"].shape == (2, 1, 3, 4, 4)
     assert actor.net.kwargs["redetect_event_images"].shape == (2, 1, 3, 4, 4)
+    assert actor.net.kwargs["redetect_padding_mask"].shape == (2, 1, 4, 4)
     assert torch.equal(
         actor.net.kwargs["redetect_mask"], torch.tensor([True, False]))
 

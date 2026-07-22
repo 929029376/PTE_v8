@@ -701,6 +701,7 @@ def test_training_forward_runs_redetect_only_when_observations_are_requested():
         redetect_images=torch.zeros(2, 1, 3, 16, 16),
         redetect_event_images=redetect_events,
         redetect_mask=torch.tensor([True, True]),
+        redetect_padding_mask=torch.zeros(2, 1, 16, 16, dtype=torch.bool),
         redetect_boxes=torch.tensor([
             [0.4, 0.4, 0.2, 0.2],
             [0.4, 0.4, 0.2, 0.2],
@@ -744,6 +745,7 @@ def test_recovery_optimizer_step_preserves_every_normal_path_parameter():
         redetect_images=torch.randn(2, 1, 3, 16, 16),
         redetect_event_images=torch.randn(2, 1, 3, 16, 16),
         redetect_mask=torch.tensor([True, True]),
+        redetect_padding_mask=torch.zeros(2, 1, 16, 16, dtype=torch.bool),
         redetect_boxes=torch.tensor([
             [0.4, 0.4, 0.2, 0.2],
             [0.4, 0.4, 0.2, 0.2],

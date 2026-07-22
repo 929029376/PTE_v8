@@ -227,6 +227,19 @@ class PETTrackActor(PETTrackBaseActor):
         return value.contiguous()
 
     @staticmethod
+    def _batch_first_padding_masks(value, batch_size, device):
+        if value is None:
+            return None
+        value = torch.as_tensor(value, device=device, dtype=torch.bool)
+        if (value.ndim == 4 and value.shape[0] != batch_size
+                and value.shape[1] == batch_size):
+            value = value.permute(1, 0, 2, 3)
+        if value.ndim != 4 or value.shape[0] != batch_size:
+            raise ValueError(
+                "padding masks must have shape (B,T,H,W) or (T,B,H,W)")
+        return value.contiguous()
+
+    @staticmethod
     def _cover_target_observation(rgb, event, boxes_xywh, present):
         if rgb.ndim != 5 or event.shape != rgb.shape:
             raise ValueError("RGB and event observations must share shape (B,T,C,H,W)")
@@ -395,6 +408,7 @@ class PETTrackActor(PETTrackBaseActor):
         redetect_event_images = None
         redetect_mask = None
         redetect_boxes = None
+        redetect_padding_mask = None
         is_reappear = data.get("is_reappear")
         trains_visibility = (
             training_expert_ids is None
@@ -415,6 +429,11 @@ class PETTrackActor(PETTrackBaseActor):
                 if redetect_images is None or redetect_event_images is None:
                     raise RuntimeError(
                         "reappearance training requires global RGB and event searches")
+                redetect_padding_mask = self._batch_first_padding_masks(
+                    data.get("redetect_search_att"), xi.shape[0], xi.device)
+                if redetect_padding_mask is None:
+                    raise RuntimeError(
+                        "proposal-aligned recovery requires redetect_search_att")
                 redetect_annotations = data.get("redetect_search_anno")
                 if redetect_annotations is None:
                     raise RuntimeError(
@@ -445,6 +464,7 @@ class PETTrackActor(PETTrackBaseActor):
             "redetect_event_images": redetect_event_images,
             "redetect_mask": redetect_mask,
             "redetect_boxes": redetect_boxes,
+            "redetect_padding_mask": redetect_padding_mask,
         }
         if training_expert_ids is not None:
             forward_kwargs["training_expert_ids"] = training_expert_ids

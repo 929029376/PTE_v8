@@ -632,6 +632,7 @@ def test_only_visibility_expert_forwards_global_recovery(
         "is_reappear": torch.ones(1, 2),
             "redetect_search_images": torch.zeros(1, 2, 3, 8, 8),
             "redetect_search_event_images": torch.zeros(1, 2, 3, 8, 8),
+            "redetect_search_att": torch.zeros(1, 2, 8, 8, dtype=torch.bool),
             "redetect_search_anno": torch.tensor([[
                 [0.25, 0.25, 0.5, 0.5],
                 [0.25, 0.25, 0.5, 0.5],

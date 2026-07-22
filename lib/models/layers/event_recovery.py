@@ -166,14 +166,50 @@ class EventProposalExtractor(nn.Module):
         robust = ((flat - median) / scale).clamp_min(0.0)
         return robust.view_as(activity)
 
-    def forward(self, event_frame, background=None):
+    @staticmethod
+    def _normalized_padding_mask(padding_mask, event_frame):
+        if padding_mask is None:
+            return None
+        mask = torch.as_tensor(
+            padding_mask, device=event_frame.device, dtype=torch.bool)
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        expected = (event_frame.shape[0], 1, *event_frame.shape[-2:])
+        if mask.shape != expected:
+            raise ValueError(
+                "padding_mask must have shape (B,H,W) or (B,1,H,W)")
+        if (~mask).flatten(1).sum(dim=1).eq(0).any():
+            raise ValueError("padding_mask must leave valid image pixels")
+        return mask
+
+    @staticmethod
+    def _neutralize_padding(frame, padding_mask):
+        if frame is None or padding_mask is None:
+            return frame
+        valid = ~padding_mask[:, 0]
+        neutralized = []
+        for row in range(frame.shape[0]):
+            values = frame[row, :, valid[row]]
+            neutral = values.median(dim=-1).values[:, None, None]
+            neutralized.append(torch.where(
+                valid[row][None], frame[row], neutral))
+        return torch.stack(neutralized)
+
+    def forward(self, event_frame, background=None, padding_mask=None):
         self._validate_frame(event_frame, "event_frame")
         if background is not None:
             self._validate_frame(background, "background")
             if background.shape != event_frame.shape:
                 raise ValueError("background must match event_frame shape")
 
+        padding_mask = self._normalized_padding_mask(
+            padding_mask, event_frame)
+        event_frame = self._neutralize_padding(event_frame, padding_mask)
+        background = self._neutralize_padding(background, padding_mask)
+
         heatmap = self._robust_activity(event_frame, background)
+        if padding_mask is not None:
+            heatmap = heatmap.masked_fill(padding_mask, 0.0)
         kernel_size = 2 * self.nms_radius + 1
         pooled = F.max_pool2d(
             heatmap, kernel_size=kernel_size, stride=1,
@@ -182,6 +218,8 @@ class EventProposalExtractor(nn.Module):
             heatmap.eq(pooled)
             & (heatmap >= self.min_robust_score)
         )
+        if padding_mask is not None:
+            local_maximum = local_maximum & ~padding_mask
         suppressed = heatmap.flatten(1).masked_fill(
             ~local_maximum.flatten(1), float("-inf"))
 

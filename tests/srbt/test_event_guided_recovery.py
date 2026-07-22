@@ -74,6 +74,31 @@ def test_white_background_colored_events_are_ranked_by_local_density():
     assert 22 / 32 <= y <= 26 / 32
 
 
+def test_padding_mask_prevents_normalized_crop_border_proposals():
+    event = torch.zeros(1, 3, 33, 33)
+    event[:, 0, :8] = -2.1
+    event[:, 1, :8] = -2.0
+    event[:, 2, :8] = -1.8
+    event[0, :, 22:27, 23:28] = torch.tensor(
+        [2.2, -2.0, 2.6])[:, None, None]
+    padding_mask = torch.zeros(1, 33, 33, dtype=torch.bool)
+    padding_mask[:, :8] = True
+    extractor = EventProposalExtractor(
+        top_k=2,
+        nms_radius=3,
+        min_robust_score=1.0,
+        density_kernel_size=7,
+    )
+
+    output = extractor(event, padding_mask=padding_mask)
+
+    assert output["valid"].any()
+    assert not output["heatmap"][:, :, :8].any()
+    x, y = output["centers"][0, 0].tolist()
+    assert 23 / 32 <= x <= 27 / 32
+    assert 22 / 32 <= y <= 26 / 32
+
+
 def test_top_k_is_score_ordered_and_uses_original_image_coordinates():
     event = torch.zeros(1, 2, 5, 9)
     event[:, :, 1, 2] = 5.0
