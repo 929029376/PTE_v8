@@ -724,6 +724,41 @@ def test_training_forward_runs_redetect_only_when_observations_are_requested():
     assert probe.last_feat.shape[0] == 2
 
 
+def test_recovery_identity_targets_follow_candidate_crop_coverage():
+    class FixedProposals(torch.nn.Module):
+        def forward(self, event, padding_mask=None):
+            centers = event.new_tensor([[
+                [0.50, 0.50],
+                [0.55, 0.50],
+                [0.66, 0.50],
+                [0.95, 0.95],
+            ]])
+            return {
+                "centers": centers,
+                "scores": event.new_ones((1, 4)),
+                "valid": torch.ones(
+                    (1, 4), device=event.device, dtype=torch.bool),
+            }
+
+    model = _model()
+    model.redetect_expert = ProbeRedetect()
+    model.event_proposal_extractor = FixedProposals()
+    model.recovery_search_factor = 5.0
+    zi, ze, xi, xe = _images(batch=1)
+
+    output = model(
+        zi, ze, xi, xe,
+        redetect_images=torch.zeros(1, 1, 3, 16, 16),
+        redetect_event_images=torch.zeros(1, 1, 3, 16, 16),
+        redetect_mask=torch.tensor([True]),
+        redetect_padding_mask=torch.zeros(1, 1, 16, 16, dtype=torch.bool),
+        redetect_boxes=torch.tensor([[0.495, 0.495, 0.01, 0.01]]),
+    )["redetect_predictions"]
+
+    assert output["identity_targets"].tolist() == [[True, True, False, False]]
+    assert output["identity_valid"].tolist() == [[True, True, False, True]]
+
+
 def test_recovery_optimizer_step_preserves_every_normal_path_parameter():
     model = _model(expert_enabled=True)
     model.redetect_expert = ProbeRedetect()

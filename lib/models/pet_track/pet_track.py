@@ -492,10 +492,28 @@ class PETTrack(nn.Module):
                 clean_tokens, candidate_tokens)
             box_min = selected_boxes[:, None, :2]
             box_max = box_min + selected_boxes[:, None, 2:]
-            prediction["identity_targets"] = (
-                (centers >= box_min) & (centers <= box_max)
-            ).all(dim=-1) & valid
-            prediction["identity_valid"] = valid
+            frame_height, frame_width = current_rgb.shape[-2:]
+            target_width = selected_boxes[:, 2].clamp_min(
+                1.0 / frame_width) * frame_width
+            target_height = selected_boxes[:, 3].clamp_min(
+                1.0 / frame_height) * frame_height
+            crop_size = (target_width * target_height).sqrt() * (
+                self.recovery_search_factor)
+            crop_half_extent = torch.stack((
+                crop_size / frame_width,
+                crop_size / frame_height,
+            ), dim=-1)[:, None] * 0.5
+            intersection_size = (
+                torch.minimum(centers + crop_half_extent, box_max)
+                - torch.maximum(centers - crop_half_extent, box_min)
+            ).clamp_min(0.0)
+            target_area = selected_boxes[:, None, 2:].prod(dim=-1).clamp_min(
+                torch.finfo(selected_boxes.dtype).eps)
+            target_coverage = intersection_size.prod(dim=-1) / target_area
+            positive = target_coverage >= 0.9
+            negative = target_coverage <= 0.1
+            prediction["identity_targets"] = positive & valid
+            prediction["identity_valid"] = valid & (positive | negative)
             prediction["proposal_centers"] = centers
             prediction["proposal_event_scores"] = proposals["scores"]
             prediction["batch_indices"] = indices
