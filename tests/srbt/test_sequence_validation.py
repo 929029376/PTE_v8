@@ -1605,7 +1605,7 @@ def test_refine_best_uses_stage1_checkpoint_reference():
     assert saved == ["best_stage2"]
 
 
-def test_visibility_specialization_disables_all_validation():
+def test_dispatch_training_disables_all_validation():
     assert default_cfg.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert default_cfg.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert default_cfg.TRAIN.BEST_LOADER == "val"
@@ -1616,8 +1616,8 @@ def test_visibility_specialization_disables_all_validation():
         .read_text(encoding="utf-8")
     )
 
-    assert experiment["TRAIN"]["EXPERT_PHASE"] == "specialize"
-    assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [3]
+    assert experiment["TRAIN"]["EXPERT_PHASE"] == "dispatch"
+    assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [1, 2, 3, 4]
     assert experiment["DATA"]["PURSUIT"]["ENABLE"] is False
     assert experiment["DATA"]["PURSUIT"]["WINDOW_LENGTH"] == 16
     assert experiment["TRAIN"]["SEQUENCE_VAL_ENABLE"] is False
@@ -1643,7 +1643,7 @@ def test_visibility_specialization_disables_all_validation():
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
     assert experiment["TRAIN"]["BEST_LOADER"] == "train"
-    assert experiment["TRAIN"]["BEST_METRIC"] == "Expert/train_iou_3"
+    assert experiment["TRAIN"]["BEST_METRIC"] == "Activation/macro_f1"
     assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
     assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is False
 
