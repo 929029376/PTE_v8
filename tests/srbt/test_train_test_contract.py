@@ -1222,13 +1222,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_precision_multilabel_loop_v53_run_directory():
+def test_supervisor_uses_isolated_precision_exclusive_loop_v54_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "precision_multilabel_loop_v53_20260722" in supervisor
+    assert "precision_exclusive_loop_v54_20260723" in supervisor
+    assert "precision_multilabel_loop_v53_20260722" not in supervisor
     assert "discrimination_direct_loop_v52_20260722" not in supervisor
     assert "discrimination_token_match_v51_20260722" not in supervisor
     assert "discrimination_hard_negative_v50_20260722" not in supervisor
@@ -1267,7 +1268,7 @@ def test_supervisor_uses_isolated_precision_multilabel_loop_v53_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "precision_multilabel_loop_v53_20260722/logs && exec") == 2
+        "precision_exclusive_loop_v54_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

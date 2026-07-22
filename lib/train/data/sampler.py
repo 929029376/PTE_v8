@@ -623,7 +623,7 @@ class TrackingSampler(torch.utils.data.Dataset):
                             labels = self._expert_attribute_labels(
                                 dataset, seq_id, seq_info_dict)
                             eligible_frames = (
-                                expert_supervision_mask(labels)[
+                                exclusive_specialist_supervision_mask(labels)[
                                     :, training_expert_id]
                             )
                             if training_expert_id == DISCRIMINATION:

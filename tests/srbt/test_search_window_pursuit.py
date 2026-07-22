@@ -369,7 +369,7 @@ def test_pursuit_episode_type_follows_the_active_specialist_contract():
         0, training_expert_id=4) == "visible"
 
 
-def test_pursuit_sampling_keeps_compound_frames_for_each_matching_expert():
+def test_pursuit_sampling_excludes_compound_frames_from_single_expert():
     class ProbeStop(Exception):
         pass
 
@@ -417,7 +417,7 @@ def test_pursuit_sampling_keeps_compound_frames_for_each_matching_expert():
         sampler.getitem(
             training_expert_id=2, pursuit_episode_type="visible")
 
-    assert bool(captured["eligible"][4])
+    assert not bool(captured["eligible"][4])
 
 
 def test_pursuit_sampling_fails_after_a_bounded_number_of_attempts(monkeypatch):
@@ -1154,7 +1154,7 @@ def test_precision_pursuit_encodes_templates_once_and_keeps_template_gradients()
     assert bool(model.small_target_expert.template_bias.grad.abs() > 0)
 
 
-def test_causal_specialist_context_keeps_compound_frames_in_loss():
+def test_causal_specialist_context_excludes_compound_frames_from_loss():
     actor = object.__new__(PETTrackActor)
     actor.expert_enabled = True
     actor.cfg = SimpleNamespace(
@@ -1178,7 +1178,7 @@ def test_causal_specialist_context_keeps_compound_frames_in_loss():
             device=torch.device("cpu")))
 
     assert specialist_id == 1
-    assert eligible.tolist() == [[True, True, True]]
+    assert eligible.tolist() == [[True, False, True]]
     assert normalized_labels.shape == (
         1, 3, len(pet_track_actor_module.CHALLENGE_NAMES))
 
