@@ -1219,17 +1219,18 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_precision_specialist_v44_run_directory():
+def test_supervisor_uses_isolated_proposal_identity_v46_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "precision_specialist_v44_20260722" in supervisor
+    assert "proposal_identity_v46_20260722" in supervisor
+    assert "precision_specialist_v44_20260722" not in supervisor
     assert "discrimination_ranking_v43_20260722" not in supervisor
     assert "causal_discrimination_v42_20260721" not in supervisor
-    assert "--config felt_pet_track" in supervisor
-    assert "CONFIG_NAME=\"felt_pet_track\"" in supervisor
+    assert "--config felt_pet_track_proposal_identity" in supervisor
+    assert "CONFIG_NAME=\"felt_pet_track_proposal_identity\"" in supervisor
     assert "dart_duration_v40b_20260721/logs && exec" not in supervisor
     assert "dart_duration_v40_20260721" not in supervisor
     assert "dart_reliability_v39_20260721" not in supervisor
@@ -1257,7 +1258,7 @@ def test_supervisor_uses_precision_specialist_v44_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "precision_specialist_v44_20260722/logs && exec") == 2
+        "proposal_identity_v46_20260722/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():
