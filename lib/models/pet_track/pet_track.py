@@ -1495,13 +1495,18 @@ def _load_legacy_expert_checkpoint(
 def _print_stage_report(model, cfg):
     expert_phase = str(getattr(
         cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
-    active_losses = {
-        "specialize": ["base", "srbt", "redetect"],
-        "refine": ["base", "srbt", "redetect"],
-        "recovery": ["presence", "reliability", "redetect", "identity"],
-        "pursuit": ["pursuit"],
-        "dispatch": ["activation"],
-    }.get(expert_phase, ["invalid_configuration"])
+    proposal_identity_only = bool(getattr(
+        cfg.TRAIN, "PROPOSAL_IDENTITY_ONLY", False))
+    if expert_phase == "recovery" and proposal_identity_only:
+        active_losses = ["proposal_identity"]
+    else:
+        active_losses = {
+            "specialize": ["base", "srbt", "redetect"],
+            "refine": ["base", "srbt", "redetect"],
+            "recovery": ["presence", "reliability", "redetect", "identity"],
+            "pursuit": ["pursuit"],
+            "dispatch": ["activation"],
+        }.get(expert_phase, ["invalid_configuration"])
     print("PETTrack stage report")
     print("  Train/expert_phase:", expert_phase)
     print("  Train/active_losses:", active_losses)

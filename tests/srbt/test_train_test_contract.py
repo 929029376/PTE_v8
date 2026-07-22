@@ -1110,6 +1110,62 @@ def test_recovery_stage_report_names_all_active_dart_losses(capsys):
     assert "identity" in report
 
 
+def test_proposal_identity_config_is_reappearance_only_and_isolated():
+    from copy import deepcopy
+    from lib.config.pet_track.config import cfg, update_config_from_file
+
+    configured = deepcopy(cfg)
+    update_config_from_file(
+        "experiments/pet_track/felt_pet_track_proposal_identity.yaml",
+        configured,
+    )
+
+    weights = configured.DATA.SRBT.ANCHOR_WEIGHTS
+    assert configured.DATA.SRBT.ENABLE is True
+    assert weights.VISIBLE == pytest.approx(0.0)
+    assert weights.PRESENT_TO_ABSENT == pytest.approx(0.0)
+    assert weights.ABSENT == pytest.approx(0.0)
+    assert weights.REAPPEARING == pytest.approx(1.0)
+    assert configured.TRAIN.STAGE == "proposal_identity"
+    assert configured.TRAIN.EXPERT_PHASE == "recovery"
+    assert configured.TRAIN.DART_DECODER_ONLY is False
+    assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is True
+    assert configured.TRAIN.BATCH_SIZE == 32
+    assert configured.TRAIN.NUM_WORKER == 5
+    assert configured.TRAIN.EPOCH == 30
+    assert configured.TRAIN.LR == pytest.approx(5e-5)
+    assert configured.TRAIN.LR_DROP_EPOCH == 24
+    assert configured.TRAIN.LOAD_LATEST is True
+    assert configured.TRAIN.VAL_START_EPOCH == 31
+    assert configured.TRAIN.VAL_SCHEDULE == []
+    assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
+    assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
+    assert configured.TRAIN.SAVE_BEST is True
+    assert configured.TRAIN.BEST_LOADER == "train"
+    assert configured.TRAIN.BEST_METRIC == (
+        "Redetect/identity_hardest_gap_mean")
+    assert configured.TRAIN.BEST_METRIC_MODE == "max"
+    assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is False
+    assert configured.MODEL.INIT_CHECKPOINT.endswith(
+        "precision_recovery_merged_v45_20260722/checkpoints/train/"
+        "pet_track/felt_pet_track/PETTrack_best.pth.tar")
+
+
+def test_proposal_identity_stage_report_is_unambiguous(capsys):
+    from lib.models.pet_track.pet_track import _print_stage_report
+
+    _print_stage_report(None, edict({
+        "TRAIN": edict({
+            "EXPERT_PHASE": "recovery",
+            "PROPOSAL_IDENTITY_ONLY": True,
+        }),
+    }))
+
+    report = capsys.readouterr().out
+    assert "proposal_identity" in report
+    assert "reliability" not in report
+
+
 def test_supervisor_uses_precision_specialist_v44_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
