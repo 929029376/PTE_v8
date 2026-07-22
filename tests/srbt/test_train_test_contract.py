@@ -1002,29 +1002,29 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
 
 
-def test_canonical_precision_strategy_trains_only_owner_two():
+def test_canonical_motion_strategy_trains_only_owner_one_in_long_rollouts():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
 
     configured = deepcopy(cfg)
     update_config_from_file("experiments/pet_track/felt_pet_track.yaml", configured)
 
-    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 2400
-    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 608
-    assert configured.TRAIN.BATCH_SIZE == 32
+    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 1600
+    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 400
+    assert configured.TRAIN.BATCH_SIZE == 8
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
         "precision_recovery_merged_v45_20260722/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_best.pth.tar")
-    assert configured.TRAIN.STAGE == "specialize"
-    assert configured.TRAIN.EXPERT_PHASE == "specialize"
-    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [2]
+    assert configured.TRAIN.STAGE == "pursuit"
+    assert configured.TRAIN.EXPERT_PHASE == "pursuit"
+    assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1]
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
-    assert configured.DATA.PURSUIT.ENABLE is False
+    assert configured.DATA.PURSUIT.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
-    assert configured.DATA.PURSUIT.WINDOW_LENGTH == 4
+    assert configured.DATA.PURSUIT.WINDOW_LENGTH == 16
     assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
     assert configured.DATA.PURSUIT.TRANSITION_PROBABILITY == pytest.approx(0.0)
     assert configured.DATA.PURSUIT.REAPPEAR_PROBABILITY == pytest.approx(0.0)
@@ -1034,12 +1034,12 @@ def test_canonical_precision_strategy_trains_only_owner_two():
         2.5)
     assert configured.DATA.SEARCH.PRECISION_SCALE_MULTIPLIER == pytest.approx(
         1.75)
-    assert configured.TRAIN.MIN_EPOCH == 10
-    assert configured.TRAIN.EPOCH == 60
+    assert configured.TRAIN.MIN_EPOCH == 4
+    assert configured.TRAIN.EPOCH == 20
     assert configured.TRAIN.REFINE_MAX_EPOCH == 12
     assert configured.TRAIN.LR == 0.00001
-    assert configured.TRAIN.PURSUIT_LR == pytest.approx(0.0001)
-    assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(0.0)
+    assert configured.TRAIN.PURSUIT_LR == pytest.approx(0.00005)
+    assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(1.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_WEIGHT == pytest.approx(0.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_MARGIN == pytest.approx(0.2)
     assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
@@ -1058,12 +1058,12 @@ def test_canonical_precision_strategy_trains_only_owner_two():
     assert "SMALL_TARGET_DENSE_GEOMETRY_WEIGHT" not in configured.TRAIN
     assert configured.TRAIN.SMALL_TARGET_SOFT_BOX_TEMPERATURE == pytest.approx(
         0.2)
-    assert configured.TRAIN.LR_DROP_EPOCH == 45
+    assert configured.TRAIN.LR_DROP_EPOCH == 14
     assert configured.TRAIN.REBASE_SCHEDULER_ON_RESUME is True
     assert configured.TRAIN.REFINE_TAIL_LR == 0.000001
     assert configured.TRAIN.REFINE_MEMORY_LR == 0.0000005
-    assert configured.TRAIN.VAL_START_EPOCH == 61
-    assert configured.TRAIN.VAL_SCHEDULE == []
+    assert configured.TRAIN.VAL_START_EPOCH == 2
+    assert configured.TRAIN.VAL_SCHEDULE == [[2, 20, 2]]
     assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert configured.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_TRAIN_IOU_THRESHOLD == pytest.approx(
@@ -1091,8 +1091,8 @@ def test_canonical_precision_strategy_trains_only_owner_two():
     assert configured.TRAIN.SAVE_EPOCHS == []
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is True
-    assert configured.TRAIN.BEST_LOADER == "train"
-    assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_2"
+    assert configured.TRAIN.BEST_LOADER == "val"
+    assert configured.TRAIN.BEST_METRIC == "Expert/train_iou_1"
     assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
     assert configured.TRAIN.SPECIALIST_MIN_DELTA == 0.02
@@ -1220,19 +1220,19 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_proposal_identity_v47_run_directory():
+def test_supervisor_uses_isolated_motion_closed_loop_v48_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "proposal_identity_ranked_v47_20260722" in supervisor
+    assert "motion_closed_loop_v48_20260722" in supervisor
     assert "proposal_identity_v46_20260722" not in supervisor
     assert "precision_specialist_v44_20260722" not in supervisor
     assert "discrimination_ranking_v43_20260722" not in supervisor
     assert "causal_discrimination_v42_20260721" not in supervisor
-    assert "--config felt_pet_track_proposal_identity" in supervisor
-    assert "CONFIG_NAME=\"felt_pet_track_proposal_identity\"" in supervisor
+    assert "--config felt_pet_track" in supervisor
+    assert "CONFIG_NAME=\"felt_pet_track\"" in supervisor
     assert "dart_duration_v40b_20260721/logs && exec" not in supervisor
     assert "dart_duration_v40_20260721" not in supervisor
     assert "dart_reliability_v39_20260721" not in supervisor
@@ -1260,7 +1260,7 @@ def test_supervisor_uses_isolated_proposal_identity_v47_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "proposal_identity_ranked_v47_20260722/logs && exec") == 2
+        "motion_closed_loop_v48_20260722/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():
