@@ -1192,20 +1192,17 @@ def test_proposal_identity_config_is_reappearance_only_and_isolated():
     assert configured.TRAIN.LR == pytest.approx(5e-5)
     assert configured.TRAIN.LR_DROP_EPOCH == 24
     assert configured.TRAIN.LOAD_LATEST is False
-    assert configured.TRAIN.VAL_START_EPOCH == 1
-    assert configured.TRAIN.VAL_SCHEDULE == [[1, 30, 1]]
+    assert configured.TRAIN.VAL_START_EPOCH > configured.TRAIN.EPOCH
+    assert configured.TRAIN.VAL_SCHEDULE == []
     assert configured.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
-    assert configured.TRAIN.SAVE_BEST is True
-    assert configured.TRAIN.BEST_LOADER == "val"
-    assert configured.TRAIN.BEST_METRIC == (
-        "Redetect/identity_hardest_gap_mean")
-    assert configured.TRAIN.BEST_METRIC_MODE == "max"
+    assert configured.TRAIN.SAVE_BEST is False
     assert configured.TRAIN.RECOVERY_LOSS.RANKING_WEIGHT == pytest.approx(2.0)
     assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is False
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "precision_recovery_merged_v45_20260722/checkpoints/train/"
-        "pet_track/felt_pet_track/PETTrack_best.pth.tar")
+        "activator_challenge_labels_v58_20260723/checkpoints/train/"
+        "pet_track/felt_pet_track/"
+        "PETTrack_activator_ep0020_accepted.pth.tar")
 
 
 def test_proposal_identity_stage_report_is_unambiguous(capsys):
@@ -1223,13 +1220,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_challenge_dispatch_v58_run_directory():
+def test_supervisor_uses_isolated_proposal_identity_v59_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "activator_challenge_labels_v58_20260723" in supervisor
+    assert "proposal_identity_coverage_v59_20260723" in supervisor
+    assert "activator_challenge_labels_v58_20260723" not in supervisor
     assert "activator_dispatch_continuation_v57_20260723" not in supervisor
     assert "activator_dispatch_v56_20260723" not in supervisor
     assert "visibility_exclusive_loop_v55_20260723" not in supervisor
@@ -1244,8 +1242,8 @@ def test_supervisor_uses_isolated_challenge_dispatch_v58_run_directory():
     assert "precision_specialist_v44_20260722" not in supervisor
     assert "discrimination_ranking_v43_20260722" not in supervisor
     assert "causal_discrimination_v42_20260721" not in supervisor
-    assert "--config felt_pet_track" in supervisor
-    assert "CONFIG_NAME=\"felt_pet_track\"" in supervisor
+    assert "--config felt_pet_track_proposal_identity" in supervisor
+    assert "CONFIG_NAME=\"felt_pet_track_proposal_identity\"" in supervisor
     assert "dart_duration_v40b_20260721/logs && exec" not in supervisor
     assert "dart_duration_v40_20260721" not in supervisor
     assert "dart_reliability_v39_20260721" not in supervisor
@@ -1273,7 +1271,7 @@ def test_supervisor_uses_isolated_challenge_dispatch_v58_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "activator_challenge_labels_v58_20260723/logs && exec") == 2
+        "proposal_identity_coverage_v59_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

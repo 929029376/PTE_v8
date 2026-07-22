@@ -52,7 +52,7 @@ MODEL:
   PRETRAINED_BASELINE_CKPT: "pretrained_networks/AMTTrack_ep0098.pth.tar"
   PRETRAINED_SRBT_CKPT: ""
   PRETRAINED_EXPERT_CKPT: ""
-  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/precision_recovery_merged_v45_20260722/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
+  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/activator_challenge_labels_v58_20260723/checkpoints/train/pet_track/felt_pet_track/PETTrack_activator_ep0020_accepted.pth.tar"
   EXPERT:
     ENABLE: true
     DEFAULT: generalist
@@ -183,9 +183,8 @@ TRAIN:
     DECAY_RATE: 0.1
   VAL_EPOCH_INTERVAL: 1
   VAL_LAST_EPOCHS: 0
-  VAL_START_EPOCH: 1
-  VAL_SCHEDULE:
-    - [1, 30, 1]
+  VAL_START_EPOCH: 31
+  VAL_SCHEDULE: []
   SEQUENCE_VAL_ENABLE: false
   SEQUENCE_VAL_SCHEDULE: []
   SEQUENCE_VAL_TRAIN_IOU_THRESHOLD: 0.0
@@ -194,7 +193,7 @@ TRAIN:
   SAVE_EPOCHS: []
   SAVE_LATEST_EACH_EPOCH: true
   SAVE_FINAL_CHECKPOINT: false
-  SAVE_BEST: true
+  SAVE_BEST: false
   BEST_LOADER: val
   BEST_METRIC: Redetect/identity_hardest_gap_mean
   BEST_METRIC_MODE: max
