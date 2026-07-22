@@ -352,6 +352,118 @@ def test_pursuit_episode_types_are_exactly_stratified_by_index():
     assert types.count("visible") == 50
 
 
+def test_pursuit_episode_type_follows_the_active_specialist_contract():
+    sampler = object.__new__(TrackingSampler)
+    sampler.pursuit_transition_probability = 0.0
+    sampler.pursuit_reappear_probability = 0.0
+
+    assert sampler._pursuit_episode_type_for_index(
+        0, training_expert_id=1) == "visible"
+    assert sampler._pursuit_episode_type_for_index(
+        0, training_expert_id=2) == "visible"
+    assert sampler._pursuit_episode_type_for_index(
+        0, training_expert_id=3) == "reappearance"
+    assert sampler._pursuit_episode_type_for_index(
+        1, training_expert_id=3) == "disappearance"
+    assert sampler._pursuit_episode_type_for_index(
+        0, training_expert_id=4) == "visible"
+
+
+def test_pursuit_sampling_keeps_compound_frames_for_each_matching_expert():
+    class ProbeStop(Exception):
+        pass
+
+    class Dataset:
+        @staticmethod
+        def is_video_sequence():
+            return True
+
+    sampler = object.__new__(TrackingSampler)
+    sampler.datasets = [Dataset()]
+    sampler.p_datasets = [1.0]
+    sampler.frame_sample_mode = "causal"
+    sampler.pursuit_enabled = True
+    sampler.srbt_enabled = False
+    sampler.num_search_frames = 4
+    sampler.num_template_frames = 2
+    sampler.max_gap = 20
+    visible = torch.ones(12, dtype=torch.uint8)
+    info = {
+        "bbox": torch.ones(12, 4),
+        "valid": torch.ones(12, dtype=torch.uint8),
+        "visible": visible.clone(),
+        "absent": visible.clone(),
+    }
+    labels = {
+        name: torch.zeros(12, dtype=torch.bool)
+        for name in (
+            "small_target", "motion", "low_light", "recovery",
+            "ambiguity", "deformation", "absent",
+        )
+    }
+    labels["small_target"][4] = True
+    labels["motion"][4] = True
+    captured = {}
+    sampler.sample_seq_from_dataset = lambda *_args: (0, visible, info)
+    sampler._expert_attribute_labels = lambda *_args: labels
+
+    def capture_eligibility(*_args, eligible_frames=None, **_kwargs):
+        captured["eligible"] = eligible_frames.clone()
+        raise ProbeStop
+
+    sampler._sample_pursuit_causal_frame_ids = capture_eligibility
+
+    with pytest.raises(ProbeStop):
+        sampler.getitem(
+            training_expert_id=2, pursuit_episode_type="visible")
+
+    assert bool(captured["eligible"][4])
+
+
+def test_pursuit_sampling_fails_after_a_bounded_number_of_attempts(monkeypatch):
+    class Dataset:
+        @staticmethod
+        def is_video_sequence():
+            return True
+
+    sampler = object.__new__(TrackingSampler)
+    sampler.datasets = [Dataset()]
+    sampler.p_datasets = [1.0]
+    sampler.frame_sample_mode = "causal"
+    sampler.pursuit_enabled = True
+    sampler.srbt_enabled = False
+    sampler.num_search_frames = 4
+    sampler.num_template_frames = 2
+    sampler.max_gap = 20
+    sampler.max_sampling_attempts = 3
+    visible = torch.ones(12, dtype=torch.uint8)
+    info = {
+        "bbox": torch.ones(12, 4),
+        "valid": torch.ones(12, dtype=torch.uint8),
+        "visible": visible.clone(),
+        "absent": visible.clone(),
+    }
+    sampler.sample_seq_from_dataset = lambda *_args: (0, visible, info)
+    sampler._sample_pursuit_causal_frame_ids = (
+        lambda *_args, **_kwargs: (None, None, None))
+    choices = 0
+
+    def count_choices(*_args, **_kwargs):
+        nonlocal choices
+        choices += 1
+        if choices > sampler.max_sampling_attempts:
+            raise AssertionError("pursuit sampler retried without a bound")
+        return [sampler.datasets[0]]
+
+    monkeypatch.setattr(
+        "lib.train.data.sampler.random.choices", count_choices)
+
+    with pytest.raises(RuntimeError, match="3 sampling attempts"):
+        sampler.getitem(pursuit_episode_type="visible")
+
+    assert choices == sampler.max_sampling_attempts
+
+
 def test_pursuit_validation_uses_the_same_contiguous_sampler_contract():
     class Dataset:
         def __len__(self):

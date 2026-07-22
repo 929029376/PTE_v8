@@ -7,6 +7,7 @@ from lib.train.data.felt_challenges import (
     CHALLENGE_NAMES,
     DISCRIMINATION,
     EXPERT_CHALLENGE_NAMES,
+    VISIBILITY,
     exclusive_specialist_supervision_mask,
     expert_supervision_mask,
 )
@@ -87,6 +88,7 @@ class TrackingSampler(torch.utils.data.Dataset):
             pursuit_cfg, "TRANSITION_PROBABILITY", 0.5))
         self.pursuit_reappear_probability = float(getattr(
             pursuit_cfg, "REAPPEAR_PROBABILITY", 0.25))
+        self.max_sampling_attempts = 1000
         if not 0.0 <= self.pursuit_transition_probability <= 1.0:
             raise ValueError(
                 "DATA.PURSUIT.TRANSITION_PROBABILITY must be in [0, 1]")
@@ -337,7 +339,12 @@ class TrackingSampler(torch.utils.data.Dataset):
         template_frame_ids, search_frame_ids = examples[event_type]
         return template_frame_ids, search_frame_ids, event_type
 
-    def _pursuit_episode_type_for_index(self, index):
+    def _pursuit_episode_type_for_index(
+            self, index, training_expert_id=None):
+        if training_expert_id == VISIBILITY:
+            return "reappearance" if int(index) % 2 == 0 else "disappearance"
+        if training_expert_id is not None:
+            return "visible"
         slot = (int(index) % 100) / 100.0
         if slot < self.pursuit_reappear_probability:
             return "reappearance"
@@ -567,7 +574,8 @@ class TrackingSampler(torch.utils.data.Dataset):
             pursuit_enabled = bool(getattr(
                 self, "pursuit_enabled", False))
             pursuit_episode_type = (
-                self._pursuit_episode_type_for_index(index)
+                self._pursuit_episode_type_for_index(
+                    index, training_expert_id=training_expert_id)
                 if pursuit_enabled else None)
             if pursuit_enabled:
                 batch_data = self.getitem(
@@ -584,7 +592,17 @@ class TrackingSampler(torch.utils.data.Dataset):
             TensorDict - dict containing all the data blocks
         """
         valid = False
+        attempts = 0
+        max_attempts = max(1, int(getattr(
+            self, "max_sampling_attempts", 1000)))
         while not valid:
+            attempts += 1
+            if self.pursuit_enabled and attempts > max_attempts:
+                raise RuntimeError(
+                    "pursuit sampler failed after "
+                    f"{max_attempts} sampling attempts "
+                    f"(expert={training_expert_id}, "
+                    f"episode={pursuit_episode_type})")
             dataset = random.choices(self.datasets, self.p_datasets)[0]
             is_video_dataset = dataset.is_video_sequence()
             seq_id, visible, seq_info_dict = self.sample_seq_from_dataset(
@@ -605,7 +623,7 @@ class TrackingSampler(torch.utils.data.Dataset):
                             labels = self._expert_attribute_labels(
                                 dataset, seq_id, seq_info_dict)
                             eligible_frames = (
-                                exclusive_specialist_supervision_mask(labels)[
+                                expert_supervision_mask(labels)[
                                     :, training_expert_id]
                             )
                             if training_expert_id == DISCRIMINATION:
