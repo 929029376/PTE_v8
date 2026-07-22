@@ -996,7 +996,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
         "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
-    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
+    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
     assert configured.MODEL.REDETECT.EVENT_DENSITY_KERNEL_SIZE == 25
     assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is False
     assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
@@ -1005,6 +1005,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
 def test_canonical_motion_strategy_trains_only_owner_one_in_long_rollouts():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
+    from lib.train.train_script import _validate_pursuit_stage
 
     configured = deepcopy(cfg)
     update_config_from_file("experiments/pet_track/felt_pet_track.yaml", configured)
@@ -1023,7 +1024,7 @@ def test_canonical_motion_strategy_trains_only_owner_one_in_long_rollouts():
     assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1]
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
     assert configured.DATA.PURSUIT.ENABLE is True
-    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
+    assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
     assert configured.DATA.PURSUIT.WINDOW_LENGTH == 16
     assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
     assert configured.DATA.PURSUIT.TRANSITION_PROBABILITY == pytest.approx(0.0)
@@ -1044,6 +1045,7 @@ def test_canonical_motion_strategy_trains_only_owner_one_in_long_rollouts():
     assert configured.TRAIN.DISCRIMINATION_RANKING_MARGIN == pytest.approx(0.2)
     assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
     assert configured.TRAIN.ACTIVATOR_ADVANTAGE_MARGIN == pytest.approx(0.02)
+    _validate_pursuit_stage(configured)
     assert configured.TRAIN.ACTIVATOR_POS_WEIGHT == [4.0, 5.0, 1.5, 2.5]
     assert configured.TRAIN.SMALL_TARGET_ADAPTER_LR == pytest.approx(0.0)
     assert "SMALL_TARGET_CHANNEL_LR" not in configured.TRAIN
