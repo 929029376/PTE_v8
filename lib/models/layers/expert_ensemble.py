@@ -1,6 +1,7 @@
 """Deterministic reliability ensemble for independent tracking experts."""
 
 from dataclasses import dataclass
+from itertools import combinations
 
 import torch
 from torch import nn
@@ -112,6 +113,18 @@ def _pairwise_iou_xywh(boxes, eps=1e-6):
     return intersection / union.clamp_min(eps)
 
 
+def _has_pairwise_cluster(pairwise_iou, threshold, minimum_size=3):
+    count = pairwise_iou.shape[0]
+    for size in range(count, minimum_size - 1, -1):
+        for ids in combinations(range(count), size):
+            submatrix = pairwise_iou[list(ids)][:, list(ids)]
+            off_diagonal = ~torch.eye(
+                size, dtype=torch.bool, device=pairwise_iou.device)
+            if bool((submatrix[off_diagonal] >= threshold).all()):
+                return True
+    return False
+
+
 def _temporal_consistency(boxes, last_box, eps=1e-6):
     if last_box is None:
         return torch.ones(
@@ -136,7 +149,7 @@ def _temporal_consistency(boxes, last_box, eps=1e-6):
 def fuse_expert_predictions(
         boxes, response_peaks, response_psr, last_box,
         localization_validity=None,
-        reject_consensus=0.15,
+        cluster_iou=0.50, reject_consensus=0.15,
         specialist_margin=1.05, minimum_quality=0.10):
     """Select one expert box, falling back to the exact generalist box."""
     boxes = torch.as_tensor(boxes).float()
@@ -178,7 +191,8 @@ def fuse_expert_predictions(
 
     eligible = torch.ones(
         expert_count, dtype=torch.bool, device=boxes.device)
-    eligible &= consensus >= float(reject_consensus)
+    if _has_pairwise_cluster(pairwise_iou, float(cluster_iou)):
+        eligible &= consensus >= float(reject_consensus)
     eligible[0] = True
     ranked_quality = quality.masked_fill(~eligible, float("-inf"))
     best_id = int(ranked_quality.argmax().item())
