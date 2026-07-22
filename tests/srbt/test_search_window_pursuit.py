@@ -369,12 +369,12 @@ def test_pursuit_episode_type_follows_the_active_specialist_contract():
         0, training_expert_id=4) == "visible"
 
 
-@pytest.mark.parametrize(("training", "expected"), [
-    (True, False),
-    (False, True),
+@pytest.mark.parametrize(("training", "expected", "minimum_eligible"), [
+    (True, False, 4),
+    (False, True, None),
 ])
 def test_pursuit_sampling_separates_training_and_validation_masks(
-        training, expected):
+        training, expected, minimum_eligible):
     class ProbeStop(Exception):
         pass
 
@@ -413,8 +413,10 @@ def test_pursuit_sampling_separates_training_and_validation_masks(
     sampler.sample_seq_from_dataset = lambda *_args: (0, visible, info)
     sampler._expert_attribute_labels = lambda *_args: labels
 
-    def capture_eligibility(*_args, eligible_frames=None, **_kwargs):
+    def capture_eligibility(
+            *_args, eligible_frames=None, minimum_eligible=None, **_kwargs):
         captured["eligible"] = eligible_frames.clone()
+        captured["minimum_eligible"] = minimum_eligible
         raise ProbeStop
 
     sampler._sample_pursuit_causal_frame_ids = capture_eligibility
@@ -424,6 +426,7 @@ def test_pursuit_sampling_separates_training_and_validation_masks(
             training_expert_id=2, pursuit_episode_type="visible")
 
     assert bool(captured["eligible"][4]) is expected
+    assert captured["minimum_eligible"] == minimum_eligible
 
 
 def test_pursuit_sampling_fails_after_a_bounded_number_of_attempts(monkeypatch):

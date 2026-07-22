@@ -354,7 +354,8 @@ class TrackingSampler(torch.utils.data.Dataset):
 
     def _sample_pursuit_causal_frame_ids(
             self, visible, seq_info_dict, episode_type=None,
-            eligible_frames=None, required_frames=None, minimum_required=0):
+            eligible_frames=None, required_frames=None, minimum_required=0,
+            minimum_eligible=None):
         """Sample a strict contiguous episode, including official absent frames."""
         frame_count = len(seq_info_dict["bbox"])
         window = int(self.num_search_frames)
@@ -370,7 +371,14 @@ class TrackingSampler(torch.utils.data.Dataset):
         presence = torch.as_tensor(visible, dtype=torch.bool).reshape(-1)
         eligible = None
         required = None
-        minimum_eligible = max(2, window // 2)
+        minimum_eligible = (
+            max(2, window // 2)
+            if minimum_eligible is None
+            else int(minimum_eligible)
+        )
+        if minimum_eligible < 0 or minimum_eligible > window:
+            raise ValueError(
+                "minimum eligible pursuit frames must be within the window")
         if eligible_frames is not None:
             eligible = torch.as_tensor(
                 eligible_frames, dtype=torch.bool).reshape(-1)
@@ -618,6 +626,7 @@ class TrackingSampler(torch.utils.data.Dataset):
                     # Sample test and train frames in a causal manner, i.e. search_frame_ids > template_frame_ids
                     if self.pursuit_enabled:
                         eligible_frames = None
+                        minimum_eligible = None
                         required_frames = None
                         minimum_required = 0
                         if training_expert_id is not None:
@@ -630,6 +639,8 @@ class TrackingSampler(torch.utils.data.Dataset):
                             )
                             eligible_frames = supervision_mask(labels)[
                                 :, training_expert_id]
+                            if self.training:
+                                minimum_eligible = self.num_search_frames
                             if training_expert_id == DISCRIMINATION:
                                 required_frames = (
                                     labels["ambiguity"] & eligible_frames)
@@ -640,7 +651,8 @@ class TrackingSampler(torch.utils.data.Dataset):
                                 visible, seq_info_dict, pursuit_episode_type,
                                 eligible_frames=eligible_frames,
                                 required_frames=required_frames,
-                                minimum_required=minimum_required)
+                                minimum_required=minimum_required,
+                                minimum_eligible=minimum_eligible)
                         if search_frame_ids is None:
                             continue
                         if training_expert_id is not None:
