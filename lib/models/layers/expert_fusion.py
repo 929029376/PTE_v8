@@ -142,12 +142,17 @@ class TemplateBridgeFusion(nn.Module):
         fused = rgb_tokens + event_tokens
         if not context or "template_tokens" not in context:
             return fused
-        template_tokens = context["template_tokens"].mean(dim=1, keepdim=True)
+        template_tokens = context["template_tokens"]
         search_state = self.search_proj(self.search_norm(fused))
         template_state = self.template_proj(self.template_norm(template_tokens))
-        bridge_state = torch.tanh(search_state * template_state)
+        matched_template = F.scaled_dot_product_attention(
+            search_state.unsqueeze(1),
+            template_state.unsqueeze(1),
+            template_state.unsqueeze(1),
+        ).squeeze(1)
+        bridge_state = torch.tanh(search_state * matched_template)
         gate = torch.sigmoid(self.bridge_gate(torch.cat([
-            fused, template_state.expand_as(fused)
+            fused, matched_template
         ], dim=-1)))
         return fused + gate * self.bridge_out(bridge_state)
 

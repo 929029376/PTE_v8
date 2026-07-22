@@ -107,6 +107,32 @@ def test_expert_bank_uses_distinct_rgb_event_fusion_mechanisms():
     assert tuple(bank.experts) == SHARED_EXPERT_NAMES
 
 
+def test_discrimination_fusion_preserves_template_token_identity():
+    fusion = expert_fusion_module.TemplateBridgeFusion(embed_dim=4)
+    with torch.no_grad():
+        for projection in (
+                fusion.search_proj, fusion.template_proj, fusion.bridge_out):
+            projection.weight.copy_(torch.eye(4))
+            projection.bias.zero_()
+        fusion.bridge_gate.weight.zero_()
+        fusion.bridge_gate.bias.zero_()
+
+    rgb = torch.tensor([[[1.0, -1.0, 0.0, 0.0]]])
+    event = torch.zeros_like(rgb)
+    horizontal = torch.tensor([[[
+        1.0, -1.0, 0.0, 0.0], [-1.0, 1.0, 0.0, 0.0]]])
+    vertical = torch.tensor([[[
+        0.0, 0.0, 1.0, -1.0], [0.0, 0.0, -1.0, 1.0]]])
+
+    assert torch.allclose(horizontal.mean(dim=1), vertical.mean(dim=1))
+    horizontal_output = fusion(
+        rgb, event, context={"template_tokens": horizontal})
+    vertical_output = fusion(
+        rgb, event, context={"template_tokens": vertical})
+
+    assert not torch.allclose(horizontal_output, vertical_output)
+
+
 def test_motion_fusion_uses_only_valid_causal_event_history():
     torch.manual_seed(7)
     fusion = expert_fusion_module.MotionFusion(embed_dim=8).eval()
