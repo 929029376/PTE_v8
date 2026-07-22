@@ -992,8 +992,8 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "activator_dispatch_v56_20260723/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_activator_ep0020_accepted.pth.tar")
+        "visibility_exclusive_loop_v55_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_visibility_owner3_ep0020_accepted.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -1002,7 +1002,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
 
 
-def test_canonical_dispatch_continuation_trains_only_activator_without_validation():
+def test_canonical_challenge_dispatch_trains_only_activator_without_validation():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
 
@@ -1018,13 +1018,12 @@ def test_canonical_dispatch_continuation_trains_only_activator_without_validatio
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "activator_dispatch_v56_20260723/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_activator_ep0020_accepted.pth.tar")
+        "visibility_exclusive_loop_v55_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_visibility_owner3_ep0020_accepted.pth.tar")
     assert configured.TRAIN.STAGE == "dispatch"
     assert configured.TRAIN.EXPERT_PHASE == "dispatch"
     assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1, 2, 3, 4]
-    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(1e-5)
-    assert configured.TRAIN.LR_DROP_EPOCH > configured.TRAIN.EPOCH
+    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(1e-4)
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
     assert configured.DATA.PURSUIT.ENABLE is False
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -1046,7 +1045,7 @@ def test_canonical_dispatch_continuation_trains_only_activator_without_validatio
     assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(0.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_WEIGHT == pytest.approx(2.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_MARGIN == pytest.approx(0.2)
-    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.00001)
+    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
     assert configured.TRAIN.ACTIVATOR_ADVANTAGE_MARGIN == pytest.approx(0.02)
     assert configured.TRAIN.ACTIVATOR_POS_WEIGHT == [4.0, 5.0, 1.5, 2.5]
     assert configured.TRAIN.SMALL_TARGET_ADAPTER_LR == pytest.approx(0.0)
@@ -1062,7 +1061,7 @@ def test_canonical_dispatch_continuation_trains_only_activator_without_validatio
     assert "SMALL_TARGET_DENSE_GEOMETRY_WEIGHT" not in configured.TRAIN
     assert configured.TRAIN.SMALL_TARGET_SOFT_BOX_TEMPERATURE == pytest.approx(
         0.2)
-    assert configured.TRAIN.LR_DROP_EPOCH == 100
+    assert configured.TRAIN.LR_DROP_EPOCH == 14
     assert configured.TRAIN.REBASE_SCHEDULER_ON_RESUME is True
     assert configured.TRAIN.REFINE_TAIL_LR == 0.000001
     assert configured.TRAIN.REFINE_MEMORY_LR == 0.0000005
@@ -1224,13 +1223,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_activator_dispatch_v57_run_directory():
+def test_supervisor_uses_isolated_challenge_dispatch_v58_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "activator_dispatch_continuation_v57_20260723" in supervisor
+    assert "activator_challenge_labels_v58_20260723" in supervisor
+    assert "activator_dispatch_continuation_v57_20260723" not in supervisor
     assert "activator_dispatch_v56_20260723" not in supervisor
     assert "visibility_exclusive_loop_v55_20260723" not in supervisor
     assert "precision_exclusive_loop_v54_20260723" not in supervisor
@@ -1273,7 +1273,7 @@ def test_supervisor_uses_isolated_activator_dispatch_v57_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "activator_dispatch_continuation_v57_20260723/logs && exec") == 2
+        "activator_challenge_labels_v58_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

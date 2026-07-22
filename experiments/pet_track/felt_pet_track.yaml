@@ -52,7 +52,7 @@ MODEL:
   PRETRAINED_BASELINE_CKPT: "pretrained_networks/AMTTrack_ep0098.pth.tar"
   PRETRAINED_SRBT_CKPT: ""
   PRETRAINED_EXPERT_CKPT: ""
-  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/activator_dispatch_v56_20260723/checkpoints/train/pet_track/felt_pet_track/PETTrack_activator_ep0020_accepted.pth.tar"
+  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/visibility_exclusive_loop_v55_20260723/checkpoints/train/pet_track/felt_pet_track/PETTrack_visibility_owner3_ep0020_accepted.pth.tar"
   EXPERT:
     ENABLE: true
     DEFAULT: generalist
@@ -150,11 +150,11 @@ TRAIN:
   MOTION_DISPLACEMENT_WEIGHT: 0.0
   DISCRIMINATION_RANKING_WEIGHT: 2.0
   DISCRIMINATION_RANKING_MARGIN: 0.2
-  ACTIVATOR_LR: 0.00001
+  ACTIVATOR_LR: 0.0001
   ACTIVATOR_ADVANTAGE_MARGIN: 0.02
   ACTIVATOR_POS_WEIGHT: [4.0, 5.0, 1.5, 2.5]
   SMALL_TARGET_ADAPTER_LR: 0.0
-  LR_DROP_EPOCH: 100
+  LR_DROP_EPOCH: 14
   REFINE_TAIL_LR: 0.000001
   REFINE_MEMORY_LR: 0.0000005
   REFINE_SEQUENCE_VAL_SCHEDULE:

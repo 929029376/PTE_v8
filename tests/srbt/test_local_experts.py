@@ -808,7 +808,7 @@ def test_visibility_expert_does_not_use_proposal_advantage(monkeypatch):
     assert status["Loss/expert_advantage_weighted"] == pytest.approx(0.0)
 
 
-def test_dispatch_targets_keep_multilabel_eligibility_but_require_utility():
+def test_dispatch_targets_follow_multilabel_challenge_eligibility_directly():
     actor = object.__new__(PETTrackActor)
     actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
     actor.expert_phase = "dispatch"
@@ -851,11 +851,11 @@ def test_dispatch_targets_keep_multilabel_eligibility_but_require_utility():
     loss.backward()
 
     assert torch.equal(targets, torch.tensor([
-        [True, False, False, False],
+        [True, True, False, False],
         [False, False, True, False],
     ]))
     assert status["Activation/positive_motion_fm"] == 1
-    assert status["Activation/positive_precision_refiner"] == 0
+    assert status["Activation/positive_precision_refiner"] == 1
     assert status["Activation/positive_visibility_foc_ov"] == 1
     assert status["Activation/positive_discrimination_bi"] == 0
     assert status["Activation/predicted_count"] == 8
@@ -866,7 +866,7 @@ def test_dispatch_targets_keep_multilabel_eligibility_but_require_utility():
     assert status["Activation/precision_visibility_foc_ov"] == pytest.approx(
         0.5)
     assert status["Activation/recall_visibility_foc_ov"] == pytest.approx(1.0)
-    assert status["Activation/macro_f1"] == pytest.approx(1.0 / 3.0)
+    assert status["Activation/macro_f1"] == pytest.approx(0.5)
     assert logits.grad is not None
     assert logits.grad.abs().sum() > 0.0
 

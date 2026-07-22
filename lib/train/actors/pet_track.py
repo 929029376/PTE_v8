@@ -1267,20 +1267,13 @@ class PETTrackActor(PETTrackBaseActor):
 
     def _dispatch_targets(self, pred_dict, gt_dict):
         logits = pred_dict.get("expert_activation_logits")
-        expert_outputs = pred_dict.get("expert_outputs")
-        if logits is None or not expert_outputs:
-            raise RuntimeError(
-                "dispatch training requires activation logits and all expert outputs")
+        if logits is None:
+            raise RuntimeError("dispatch training requires activation logits")
         model = self.net.module if hasattr(self.net, "module") else self.net
         expert_names = tuple(model.expert_names)
         if logits.ndim != 2 or logits.shape[1] != len(expert_names) - 1:
             raise ValueError(
                 "expert activation logits must provide one value per specialist")
-        missing = [name for name in expert_names if name not in expert_outputs]
-        if missing:
-            raise RuntimeError(
-                "dispatch training is missing expert outputs: "
-                + ", ".join(missing))
 
         challenge_labels = gt_dict.get("challenge_labels")
         if challenge_labels is None:
@@ -1307,27 +1300,10 @@ class PETTrackActor(PETTrackBaseActor):
             raise RuntimeError(
                 "dispatch training requires official presence annotations")
 
-        target_xyxy = box_xywh_to_xyxy(
-            gt_dict["search_anno"][-1].to(
-                device=logits.device, dtype=logits.dtype)
-        ).clamp(0.0, 1.0)
-
-        def aligned_iou(output):
-            boxes = output["pred_boxes"][:, 0].detach()
-            predicted_xyxy = box_cxcywh_to_xyxy(boxes).clamp(0.0, 1.0)
-            return box_iou(predicted_xyxy, target_xyxy)[0]
-
-        generalist_iou = aligned_iou(expert_outputs[expert_names[0]])
-        targets = torch.zeros_like(logits, dtype=torch.bool)
-        for expert_id, name in enumerate(expert_names[1:], start=1):
-            specialist_target = eligible[:, expert_id]
-            if expert_id == VISIBILITY_EXPERT_ID:
-                targets[:, expert_id - 1] = specialist_target
-                continue
-            specialist_iou = aligned_iou(expert_outputs[name])
-            useful = specialist_iou >= (
-                generalist_iou + self.activation_advantage_margin)
-            targets[:, expert_id - 1] = specialist_target & present & useful
+        targets = eligible[:, 1:].clone()
+        for expert_id in range(1, len(expert_names)):
+            if expert_id != VISIBILITY_EXPERT_ID:
+                targets[:, expert_id - 1] &= present
         return targets
 
     def _compute_dispatch_loss(self, pred_dict, gt_dict, return_status=True):
