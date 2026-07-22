@@ -14,7 +14,6 @@ from lib.utils.box_ops import (
 from lib.utils.heapmap_utils import generate_heatmap
 from lib.train.data.felt_challenges import (
     CHALLENGE_NAMES,
-    exclusive_specialist_supervision_mask,
     expert_supervision_mask,
 )
 from lib.models.layers.expert_ensemble import normalized_response_psr
@@ -204,12 +203,12 @@ class PETTrackActor(PETTrackBaseActor):
             name: challenge_labels[:, index]
             for index, name in enumerate(CHALLENGE_NAMES)
         }
-        eligible = exclusive_specialist_supervision_mask(attributes).to(device)
+        eligible = expert_supervision_mask(attributes).to(device)
         selected = eligible.gather(1, training_expert_ids[:, None]).squeeze(1)
         if not bool(selected.all()):
             raise ValueError(
-                "training expert is not eligible for exclusive frame "
-                "challenge supervision")
+                "training expert is not eligible for frame challenge "
+                "supervision")
         return training_expert_ids
 
     # ------------------------------------------------------------------ #
@@ -518,7 +517,7 @@ class PETTrackActor(PETTrackBaseActor):
             name: challenge_labels[..., index].reshape(-1)
             for index, name in enumerate(CHALLENGE_NAMES)
         }
-        eligible = exclusive_specialist_supervision_mask(attributes)[
+        eligible = expert_supervision_mask(attributes)[
             :, specialist_id].reshape(batch_size, frame_count)
         if not bool(eligible.any(dim=1).all()):
             raise ValueError(

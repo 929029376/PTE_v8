@@ -585,7 +585,7 @@ def test_specialize_phase_accepts_challenge_labels_from_training_loader():
         actor.net.kwargs["training_expert_ids"], torch.tensor([2, 2, 2]))
 
 
-def test_specialize_phase_rejects_compound_challenge_labels():
+def test_specialize_phase_accepts_compound_challenge_labels():
     actor = object.__new__(PETTrackActor)
     actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
     actor.expert_enabled = True
@@ -597,9 +597,10 @@ def test_specialize_phase_rejects_compound_challenge_labels():
         ]),
     }
 
-    with pytest.raises(ValueError, match="not eligible for exclusive"):
-        actor._validated_training_expert_ids(
-            data, batch_size=1, device=torch.device("cpu"))
+    expert_ids = actor._validated_training_expert_ids(
+        data, batch_size=1, device=torch.device("cpu"))
+
+    assert torch.equal(expert_ids, torch.tensor([2]))
 
 
 def test_specialize_phase_rejects_expert_not_eligible_for_challenge_labels():

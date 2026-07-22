@@ -1022,7 +1022,7 @@ def test_causal_specialist_forward_keeps_motion_gradient_and_freezes_controller(
     assert model.search_window_controller.bias.grad is None
 
 
-def test_causal_specialist_context_excludes_compound_frames_from_loss():
+def test_causal_specialist_context_keeps_compound_frames_in_loss():
     actor = object.__new__(PETTrackActor)
     actor.expert_enabled = True
     actor.cfg = SimpleNamespace(
@@ -1046,7 +1046,7 @@ def test_causal_specialist_context_excludes_compound_frames_from_loss():
             device=torch.device("cpu")))
 
     assert specialist_id == 1
-    assert eligible.tolist() == [[True, False, True]]
+    assert eligible.tolist() == [[True, True, True]]
     assert normalized_labels.shape == (
         1, 3, len(pet_track_actor_module.CHALLENGE_NAMES))
 
