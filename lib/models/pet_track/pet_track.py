@@ -695,6 +695,8 @@ class PETTrack(nn.Module):
                 continue
             parent_id = self.expert_names.index(parent)
             selected = activation_mask[:, parent_id]
+            if not bool(selected.any()):
+                continue
             upstream_boxes = torch.where(
                 selected[:, None, None],
                 expert_outputs[parent]["pred_boxes"],
@@ -715,6 +717,36 @@ class PETTrack(nn.Module):
                 self._selected_upstream_output(
                     name, expert_outputs, activation_mask),
             )
+
+    def compose_compound_expert_outputs(
+            self, expert_outputs, activation_mask):
+        """Compose active specialists while keeping the full chain differentiable."""
+        if self.default_expert not in expert_outputs:
+            raise ValueError("compound composition requires the generalist")
+        composed = dict(expert_outputs)
+        chain = (
+            self.motion_expert_name,
+            self.discrimination_expert_name,
+            self.precision_refiner_name,
+        )
+        for name in chain:
+            if name is None or name not in composed:
+                continue
+            expert_id = self.expert_names.index(name)
+            if not bool(activation_mask[:, expert_id].any()):
+                continue
+            direct_output = dict(composed[name])
+            direct_output["pred_boxes"] = direct_output.get(
+                "direct_pred_boxes", direct_output["pred_boxes"])
+            upstream_output = self._selected_upstream_output(
+                name, composed, activation_mask)
+            composed[name] = self._condition_expert_output(
+                name,
+                direct_output,
+                upstream_output,
+                detach_upstream=False,
+            )
+        return composed
 
     def _head_for_expert(self, name):
         if name == self.default_expert:
@@ -753,14 +785,17 @@ class PETTrack(nn.Module):
                     'size_map': size_map, 'offset_map': offset_map}
         raise NotImplementedError
 
-    def _condition_expert_output(self, name, direct_output, upstream_output):
+    def _condition_expert_output(
+            self, name, direct_output, upstream_output,
+            detach_upstream=True):
         if name not in self.proposal_adapters:
             return direct_output
         output = dict(direct_output)
         direct_boxes = output["pred_boxes"]
         upstream_boxes = upstream_output["pred_boxes"]
         corrected_boxes, gate = self.proposal_adapters[name](
-            direct_boxes, upstream_boxes, output["score_map"])
+            direct_boxes, upstream_boxes, output["score_map"],
+            detach_upstream=detach_upstream)
         output.update({
             "pred_boxes": corrected_boxes,
             "direct_pred_boxes": direct_boxes,

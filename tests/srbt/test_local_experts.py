@@ -67,6 +67,104 @@ def test_proposal_box_adapter_detaches_upstream_but_trains_correction():
     assert adapter.output.bias.grad is not None
 
 
+def test_proposal_box_adapter_keeps_upstream_gradient_for_compound_training():
+    adapter = expert_fusion_module.ProposalBoxAdapter()
+    with torch.no_grad():
+        adapter.output.bias.fill_(0.5)
+    direct = torch.tensor(
+        [[[0.5, 0.4, 0.2, 0.1]]], requires_grad=True)
+    upstream = torch.tensor(
+        [[[0.7, 0.6, 0.3, 0.2]]], requires_grad=True)
+    score_map = torch.rand(1, 1, 4, 4)
+
+    corrected, _ = adapter(
+        direct, upstream, score_map, detach_upstream=False)
+    corrected.sum().backward()
+
+    assert direct.grad is not None
+    assert upstream.grad is not None
+    assert upstream.grad.abs().sum() > 0.0
+
+
+def test_compound_terminal_loss_backpropagates_through_active_expert_chain():
+    model = _expert_model()
+    for name in (
+            "motion_fm", "discrimination_bi", "precision_refiner"):
+        with torch.no_grad():
+            model.proposal_adapters[name].output.bias.fill_(0.5)
+
+    direct_boxes = {
+        "generalist": torch.tensor(
+            [[[0.20, 0.20, 0.20, 0.20]]], requires_grad=True),
+        "motion_fm": torch.tensor(
+            [[[0.35, 0.30, 0.18, 0.18]]], requires_grad=True),
+        "discrimination_bi": torch.tensor(
+            [[[0.45, 0.40, 0.16, 0.16]]], requires_grad=True),
+        "precision_refiner": torch.tensor(
+            [[[0.55, 0.50, 0.14, 0.14]]], requires_grad=True),
+    }
+    outputs = {
+        name: {
+            "pred_boxes": boxes,
+            "score_map": boxes[:, :1, :1].reshape(1, 1, 1, 1).expand(
+                1, 1, 4, 4),
+        }
+        for name, boxes in direct_boxes.items()
+    }
+    active_mask = torch.tensor([[
+        True, True, True, False, True,
+    ]])
+
+    composed = model.compose_compound_expert_outputs(
+        outputs, active_mask)
+    composed["precision_refiner"]["pred_boxes"].sum().backward()
+
+    assert direct_boxes["precision_refiner"].grad is not None
+    assert direct_boxes["discrimination_bi"].grad is not None
+    assert direct_boxes["motion_fm"].grad is not None
+    assert direct_boxes["discrimination_bi"].grad.abs().sum() > 0.0
+    assert direct_boxes["motion_fm"].grad.abs().sum() > 0.0
+
+
+def test_compound_chain_skips_specialists_not_named_by_frame_labels():
+    model = _expert_model()
+    for name in (
+            "motion_fm", "discrimination_bi", "precision_refiner"):
+        with torch.no_grad():
+            model.proposal_adapters[name].output.bias.fill_(0.5)
+
+    direct_boxes = {
+        "generalist": torch.tensor(
+            [[[0.20, 0.20, 0.20, 0.20]]], requires_grad=True),
+        "motion_fm": torch.tensor(
+            [[[0.35, 0.30, 0.18, 0.18]]], requires_grad=True),
+        "discrimination_bi": torch.tensor(
+            [[[0.45, 0.40, 0.16, 0.16]]], requires_grad=True),
+        "precision_refiner": torch.tensor(
+            [[[0.55, 0.50, 0.14, 0.14]]], requires_grad=True),
+    }
+    outputs = {
+        name: {
+            "pred_boxes": boxes,
+            "score_map": boxes[:, :1, :1].reshape(1, 1, 1, 1).expand(
+                1, 1, 4, 4),
+        }
+        for name, boxes in direct_boxes.items()
+    }
+    frame_target_mask = torch.tensor([[
+        False, True, True, False, False,
+    ]])
+
+    composed = model.compose_compound_expert_outputs(
+        outputs, frame_target_mask)
+    composed["precision_refiner"]["pred_boxes"].sum().backward()
+
+    assert direct_boxes["precision_refiner"].grad is not None
+    assert direct_boxes["motion_fm"].grad is not None
+    assert direct_boxes["motion_fm"].grad.abs().sum() > 0.0
+    assert direct_boxes["discrimination_bi"].grad is None
+
+
 def test_proposal_box_adapter_rejects_incompatible_boxes():
     adapter = expert_fusion_module.ProposalBoxAdapter()
 

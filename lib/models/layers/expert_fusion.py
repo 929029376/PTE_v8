@@ -223,7 +223,7 @@ class VisibilityRecoveryFusion(ModalityGateFusion):
 
 
 class ProposalBoxAdapter(nn.Module):
-    """Let one expert softly correct a detached upstream box proposal."""
+    """Let one expert softly correct an upstream box proposal."""
 
     def __init__(self, hidden_dim=32):
         super().__init__()
@@ -235,7 +235,8 @@ class ProposalBoxAdapter(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def forward(self, direct_boxes, upstream_boxes, score_map):
+    def forward(self, direct_boxes, upstream_boxes, score_map,
+                detach_upstream=True):
         if (
                 direct_boxes.ndim != 3
                 or direct_boxes.shape[-1] != 4
@@ -245,7 +246,11 @@ class ProposalBoxAdapter(nn.Module):
         if score_map.ndim < 2 or score_map.shape[0] != direct_boxes.shape[0]:
             raise ValueError("score_map batch must match box batch")
 
-        upstream = upstream_boxes.detach()
+        upstream = (
+            upstream_boxes.detach()
+            if detach_upstream
+            else upstream_boxes
+        )
         peak = score_map.flatten(1).amax(dim=1, keepdim=True)
         peak = peak[:, None, :].expand(-1, direct_boxes.shape[1], -1)
         features = torch.cat([

@@ -963,6 +963,10 @@ class PETTrackActor(PETTrackBaseActor):
                         raise RuntimeError(
                             "pursuit activation is missing expert outputs: "
                             + ", ".join(missing_active))
+                    if compound_training:
+                        expert_outputs = (
+                            model.compose_compound_expert_outputs(
+                                expert_outputs, frame_target_mask))
                     ordered = [
                         expert_outputs.get(name, generalist)
                         for name in model.expert_names]

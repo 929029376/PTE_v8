@@ -828,12 +828,18 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
             super().__init__()
             self.search_window_controller = CapturingController()
             self.inference_kwargs = []
+            self.composition_calls = 0
 
         def _encode_runtime_templates(
                 self, static_zi, static_ze, dynamic_zi, dynamic_ze):
             batch_size = static_zi.shape[0]
             token = static_zi.new_zeros(batch_size, 1, 1)
             return token, token, token, token
+
+        def compose_compound_expert_outputs(
+                self, expert_outputs, active_mask):
+            self.composition_calls += 1
+            return expert_outputs
 
         def inference(self, **kwargs):
             self.inference_kwargs.append(dict(kwargs))
@@ -929,6 +935,7 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
         and "active_expert_names" not in call
         for call in model.inference_kwargs
     )
+    assert model.composition_calls == 2
     assert output["compound_target_mask"][0, 0].tolist() == [
         False, True, True, False, False]
     assert output["compound_target_mask"][0, 1].tolist() == [
