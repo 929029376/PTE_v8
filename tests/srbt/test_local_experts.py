@@ -1364,6 +1364,7 @@ def test_compound_loss_backpropagates_only_to_frame_relevant_specialists(
         }],
         "compound_image_targets": torch.full((2, 1, 4), 0.25),
         "compound_present": torch.ones(2, 1, dtype=torch.bool),
+        "pursuit_current_inside": [torch.ones(2, dtype=torch.bool)],
         "compound_presence_logits": [presence_logits],
     }
 
@@ -1383,6 +1384,84 @@ def test_compound_loss_backpropagates_only_to_frame_relevant_specialists(
     assert status["Compound/train_count_4"] == 0
     assert status["Loss/compound_specialists"] > 0.0
     assert status["Loss/compound_presence"] > 0.0
+
+
+def test_compound_localization_ignores_targets_outside_search_crop(
+        monkeypatch):
+    def fake_localization_loss(
+            self, pred_dict, gt_dict, return_status=True):
+        relevant = torch.as_tensor(
+            gt_dict["search_absent"][-1],
+            device=pred_dict["pred_boxes"].device,
+            dtype=torch.bool,
+        )
+        loss = pred_dict["pred_boxes"][relevant].sum()
+        status = {"IoU": 0.5}
+        return (loss, status) if return_status else loss
+
+    monkeypatch.setattr(
+        PETTrackBaseActor, "compute_losses", fake_localization_loss)
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.expert_phase = "compound"
+    actor.presence_loss_weight = 1.0
+    actor.presence_focal_gamma = 2.0
+    parameters = {
+        name: torch.tensor(
+            [0.1 * (index + 1), 0.9],
+            requires_grad=True,
+        )
+        for index, name in enumerate(EXPERT_NAMES)
+    }
+
+    def output(name):
+        value = parameters[name]
+        return {
+            "pred_boxes": value[:, None, None].expand(2, 1, 4),
+            "score_map": value[:, None, None, None].expand(2, 1, 2, 2),
+        }
+
+    target_mask = torch.tensor([
+        [[False, True, True, False, False]],
+        [[False, True, True, False, False]],
+    ])
+    image_boxes = torch.stack([
+        parameters[name][:, None].expand(2, 4)
+        for name in EXPERT_NAMES
+    ], dim=1).unsqueeze(1)
+    predictions = {
+        "compound_expert_outputs": [{
+            name: output(name) for name in EXPERT_NAMES
+        }],
+        "compound_target_mask": target_mask,
+        "compound_local_targets": torch.full((2, 1, 4), 0.25),
+        "compound_image_boxes": image_boxes,
+        "compound_expert_image_boxes": [{
+            name: parameters[name][:, None].expand(2, 4)
+            for name in EXPERT_NAMES
+        }],
+        "compound_image_targets": torch.full((2, 1, 4), 0.25),
+        "compound_present": torch.ones(2, 1, dtype=torch.bool),
+        "pursuit_current_inside": [
+            torch.tensor([True, False], dtype=torch.bool),
+        ],
+        "compound_presence_logits": [torch.zeros(2, 2)],
+    }
+
+    loss, status = actor._compute_compound_loss(predictions)
+    loss.backward()
+
+    for name in ("motion_fm", "precision_refiner"):
+        assert parameters[name].grad[0].abs() > 0.0
+        assert parameters[name].grad[1] == 0.0
+    assert status["Compound/train_count_1"] == 1
+    assert status["Compound/train_count_2"] == 1
+    assert status["Compound/in_crop_rate"] == pytest.approx(0.5)
+    assert status["Compound/out_of_crop_count"] == 1
+    assert (
+        status["Compound/joint_iou"]
+        < status["Compound/joint_iou_in_crop"]
+    )
 
 
 def test_compound_terminal_follows_the_declared_expert_chain():

@@ -1539,10 +1539,12 @@ class PETTrackActor(PETTrackBaseActor):
             "compound_expert_image_boxes")
         image_targets = predictions.get("compound_image_targets")
         present = predictions.get("compound_present")
+        current_inside = predictions.get("pursuit_current_inside")
         presence_logits = predictions.get("compound_presence_logits")
         if any(value is None for value in (
                 expert_outputs, target_mask, local_targets, image_boxes,
-                expert_image_boxes, image_targets, present, presence_logits)):
+                expert_image_boxes, image_targets, present, current_inside,
+                presence_logits)):
             raise RuntimeError(
                 "compound training requires causal specialist diagnostics")
         if not expert_outputs:
@@ -1589,6 +1591,13 @@ class PETTrackActor(PETTrackBaseActor):
             present, device=device, dtype=torch.bool)
         if present.shape != (batch_size, steps):
             raise ValueError("compound presence must have shape (B,S)")
+        if isinstance(current_inside, (list, tuple)):
+            current_inside = torch.stack(current_inside, dim=1)
+        current_inside = torch.as_tensor(
+            current_inside, device=device, dtype=torch.bool)
+        if current_inside.shape != (batch_size, steps):
+            raise ValueError(
+                "compound current-inside mask must have shape (B,S)")
         if len(presence_logits) != steps:
             raise ValueError(
                 "compound presence logits must provide one item per step")
@@ -1608,7 +1617,8 @@ class PETTrackActor(PETTrackBaseActor):
             loss_weights = []
             for step, outputs in enumerate(expert_outputs):
                 eligible = (
-                    target_mask[:, step, expert_id]
+                    current_inside[:, step]
+                    & target_mask[:, step, expert_id]
                     & present[:, step]
                 )
                 count = int(eligible.sum())
@@ -1638,10 +1648,15 @@ class PETTrackActor(PETTrackBaseActor):
                 per_expert_losses.append(
                     torch.stack(weighted_losses).sum()
                     / torch.stack(loss_weights).sum().clamp_min(1.0))
-        if not per_expert_losses:
-            raise RuntimeError(
-                "compound training produced no eligible specialist loss")
-        specialist_loss = torch.stack(per_expert_losses).mean()
+        if per_expert_losses:
+            specialist_loss = torch.stack(per_expert_losses).mean()
+        else:
+            specialist_loss = sum(
+                output["pred_boxes"].sum()
+                for outputs in expert_outputs
+                for name, output in outputs.items()
+                if name != model.expert_names[0]
+            ) * 0.0
 
         visibility_mask = target_mask[..., VISIBILITY_EXPERT_ID]
         stacked_presence_logits = torch.stack(
@@ -1672,13 +1687,14 @@ class PETTrackActor(PETTrackBaseActor):
                 batch_size, steps)
         joint_losses = []
         joint_iou_rows = []
+        joint_iou_in_crop_rows = []
         for step, outputs in enumerate(expert_outputs):
             for expert_id, expert_name in enumerate(
                     model.expert_names[1:], start=1):
-                joint_mask = (
+                metric_mask = (
                     present[:, step]
                     & terminal_ids[:, step].eq(expert_id))
-                if not bool(joint_mask.any()):
+                if not bool(metric_mask.any()):
                     continue
                 if expert_name not in outputs:
                     raise RuntimeError(
@@ -1690,22 +1706,32 @@ class PETTrackActor(PETTrackBaseActor):
                     pred_cxcywh[:, 2:],
                 ), dim=-1)
                 target_xywh = local_targets[:, step]
+                joint_iou_rows.append(self._aligned_iou_xywh(
+                    pred_xywh[metric_mask], target_xywh[metric_mask]))
+                loss_mask = metric_mask & current_inside[:, step]
+                if not bool(loss_mask.any()):
+                    continue
                 iou = self._aligned_iou_xywh(
-                    pred_xywh[joint_mask], target_xywh[joint_mask])
-                joint_iou_rows.append(iou)
+                    pred_xywh[loss_mask], target_xywh[loss_mask])
+                joint_iou_in_crop_rows.append(iou)
                 joint_losses.append(
                     1.0 - iou
                     + F.smooth_l1_loss(
-                        pred_xywh[joint_mask],
-                        target_xywh[joint_mask],
+                        pred_xywh[loss_mask],
+                        target_xywh[loss_mask],
                         reduction="none",
                     ).sum(dim=-1))
         if joint_losses:
             joint_loss = torch.cat(joint_losses).mean()
-            mean_joint_iou = torch.cat(joint_iou_rows).mean()
         else:
             joint_loss = specialist_loss * 0.0
+        if joint_iou_rows:
+            mean_joint_iou = torch.cat(joint_iou_rows).mean()
+        else:
             mean_joint_iou = joint_loss.detach()
+        mean_joint_iou_in_crop = (
+            torch.cat(joint_iou_in_crop_rows).mean()
+            if joint_iou_in_crop_rows else joint_loss.detach() * 0.0)
 
         motion_loss = specialist_loss * 0.0
         motion_pair_count = 0
@@ -1714,6 +1740,8 @@ class PETTrackActor(PETTrackBaseActor):
                 target_mask[:, 1:, MOTION_EXPERT_ID]
                 & target_mask[:, :-1, MOTION_EXPERT_ID]
                 & present[:, 1:] & present[:, :-1]
+                & current_inside[:, 1:]
+                & current_inside[:, :-1]
             )
             motion_name = model.expert_names[MOTION_EXPERT_ID]
             motion_losses = []
@@ -1768,6 +1796,7 @@ class PETTrackActor(PETTrackBaseActor):
             ranking_mask = (
                 target_mask[:, step, DISCRIMINATION_EXPERT_ID]
                 & present[:, step])
+            ranking_mask &= current_inside[:, step]
             if ambiguity_mask is not None:
                 ranking_mask &= ambiguity_mask[:, step]
             count = int(ranking_mask.sum())
@@ -1827,6 +1856,8 @@ class PETTrackActor(PETTrackBaseActor):
                 ).mean()
         else:
             generalist_iou = loss.detach() * 0.0
+        present_count = int(present.sum())
+        in_crop_count = int((present & current_inside).sum())
         status = {
             "Loss/compound_specialists": float(specialist_loss.detach()),
             "Loss/compound_joint": float(joint_loss.detach()),
@@ -1842,6 +1873,11 @@ class PETTrackActor(PETTrackBaseActor):
             "Compound/target_specialists": float(
                 target_count.to(dtype).mean()),
             "Compound/joint_iou": float(mean_joint_iou.detach()),
+            "Compound/joint_iou_in_crop": float(
+                mean_joint_iou_in_crop.detach()),
+            "Compound/in_crop_rate": (
+                in_crop_count / present_count if present_count else 0.0),
+            "Compound/out_of_crop_count": present_count - in_crop_count,
             "Compound/generalist_iou": float(generalist_iou.detach()),
             "Compound/iou_delta": float(
                 (mean_joint_iou - generalist_iou).detach()),
