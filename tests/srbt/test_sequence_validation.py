@@ -1624,7 +1624,7 @@ def test_compound_training_disables_all_validation():
     assert experiment["TRAIN"]["MIN_EPOCH"] == 4
     assert experiment["TRAIN"]["EPOCH"] == 30
     assert experiment["TRAIN"]["REFINE_MAX_EPOCH"] == 12
-    assert experiment["TRAIN"]["LOAD_LATEST"] is False
+    assert experiment["TRAIN"]["LOAD_LATEST"] is True
     assert experiment["TRAIN"]["VAL_START_EPOCH"] == 31
     assert experiment["TRAIN"]["VAL_SCHEDULE"] == []
     assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == []

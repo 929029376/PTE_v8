@@ -992,7 +992,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "compound_sparse_subbatch_v63_20260723/checkpoints/train/pet_track/"
+        "compound_differentiable_chain_v64_20260723/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_latest.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
@@ -1015,9 +1015,9 @@ def test_canonical_compound_stage_trains_specialists_without_validation():
     assert configured.DATA.VAL.SAMPLE_PER_EPOCH % configured.TRAIN.BATCH_SIZE == 0
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
-    assert configured.TRAIN.LOAD_LATEST is False
+    assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "compound_sparse_subbatch_v63_20260723/checkpoints/train/pet_track/"
+        "compound_differentiable_chain_v64_20260723/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_latest.pth.tar")
     assert configured.TRAIN.STAGE == "compound"
     assert configured.TRAIN.EXPERT_PHASE == "compound"
