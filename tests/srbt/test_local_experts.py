@@ -493,6 +493,44 @@ def test_shared_forward_head_returns_only_shared_expert_outputs():
     assert output["expert_outputs"]["generalist"]["score_map"].shape[-2:] == (2, 2)
 
 
+def test_shared_forward_head_runs_experts_only_for_masked_rows():
+    model = _expert_model().eval()
+    seen_batch_sizes = {}
+    handles = []
+
+    def capture(name):
+        def hook(module, args):
+            seen_batch_sizes.setdefault(name, []).append(args[0].shape[0])
+        return hook
+
+    for name, module in model.expert_fusion.experts.items():
+        handles.append(module.register_forward_pre_hook(capture(name)))
+    try:
+        active_mask = torch.tensor([
+            [False, True, False, False, False],
+            [False, False, False, False, True],
+            [False, False, False, True, False],
+        ])
+        output = model.forward_head(
+            torch.randn(3, 12, 8),
+            active_expert_mask=active_mask,
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert seen_batch_sizes == {
+        "generalist": [3],
+        "motion_fm": [2],
+        "visibility_foc_ov": [1],
+        "discrimination_bi": [1],
+    }
+    assert all(
+        expert_output["pred_boxes"].shape == (3, 1, 4)
+        for expert_output in output["expert_outputs"].values()
+    )
+
+
 def test_shared_experts_keep_direct_boxes_and_use_fixed_soft_dependencies():
     model = _expert_model()
 

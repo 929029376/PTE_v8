@@ -837,7 +837,7 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
 
         def inference(self, **kwargs):
             self.inference_kwargs.append(dict(kwargs))
-            active = kwargs["active_expert_names"]
+            active_mask = kwargs["active_expert_mask"]
             assert "auto_activate" not in kwargs
             batch_size = kwargs["xi"].shape[0]
 
@@ -853,7 +853,9 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
                 "g": 0.2, "m": 0.4, "p": 0.6, "v": 0.7, "d": 0.8}
             outputs = {"g": output(centers["g"])}
             outputs.update({
-                name: output(centers[name]) for name in active
+                name: output(centers[name])
+                for expert_id, name in enumerate(self.expert_names)
+                if expert_id > 0 and bool(active_mask[:, expert_id].any())
             })
             presence_logits = kwargs["xi"].new_tensor(
                 [[0.0, 1.0]]).expand(batch_size, -1)
@@ -915,9 +917,18 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
     output = actor._forward_pursuit(data)
 
     assert [
-        call["active_expert_names"] for call in model.inference_kwargs
-    ] == [("m", "p"), ("m", "d")]
-    assert all("auto_activate" not in call for call in model.inference_kwargs)
+        call["active_expert_mask"].tolist()
+        for call in model.inference_kwargs
+    ] == [[
+        [False, True, True, False, False],
+    ], [
+        [False, True, False, False, True],
+    ]]
+    assert all(
+        "auto_activate" not in call
+        and "active_expert_names" not in call
+        for call in model.inference_kwargs
+    )
     assert output["compound_target_mask"][0, 0].tolist() == [
         False, True, True, False, False]
     assert output["compound_target_mask"][0, 1].tolist() == [

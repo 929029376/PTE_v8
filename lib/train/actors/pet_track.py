@@ -897,13 +897,8 @@ class PETTrackActor(PETTrackBaseActor):
                         inference_kwargs["small_template_features"] = (
                             small_template_features)
                     if compound_training:
-                        required_names = tuple(
-                            name for expert_id, name in enumerate(
-                                model.expert_names)
-                            if expert_id > 0
-                            and bool(frame_target_mask[:, expert_id].any())
-                        )
-                        inference_kwargs["active_expert_names"] = required_names
+                        inference_kwargs["active_expert_mask"] = (
+                            frame_target_mask)
                     elif specialist_id is not None:
                         inference_kwargs["active_expert_names"] = (
                             specialist_name,)
@@ -920,12 +915,22 @@ class PETTrackActor(PETTrackBaseActor):
                         raise RuntimeError(
                             "pursuit training requires the generalist output")
                     if compound_training:
-                        active_mask = torch.zeros(
-                            search.shape[0], len(model.expert_names),
+                        active_mask = output.get("expert_activation_mask")
+                        if active_mask is None:
+                            active_mask = frame_target_mask.clone()
+                            active_mask[:, 0] = True
+                        expected_shape = (
+                            search.shape[0], len(model.expert_names))
+                        if tuple(active_mask.shape) != expected_shape:
+                            raise RuntimeError(
+                                "compound sparse activation requires a valid "
+                                "expert_activation_mask")
+                        active_mask = active_mask.to(
                             device=search.device, dtype=torch.bool)
-                        for expert_id, name in enumerate(model.expert_names):
-                            if name in expert_outputs:
-                                active_mask[:, expert_id] = True
+                        if not bool(active_mask[:, 0].all()):
+                            raise RuntimeError(
+                                "the generalist must be active for every "
+                                "compound row")
                     elif specialist_id is not None:
                         active_mask = torch.zeros(
                             search.shape[0], len(model.expert_names),

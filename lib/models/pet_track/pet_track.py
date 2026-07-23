@@ -588,6 +588,83 @@ class PETTrack(nn.Module):
                 pending.append(parent)
         return tuple(name for name in self.expert_names if name in requested)
 
+    def _resolve_active_expert_mask(
+            self, active_expert_mask, batch_size, device):
+        active = torch.as_tensor(
+            active_expert_mask, device=device, dtype=torch.bool)
+        expected_shape = (batch_size, len(self.expert_names))
+        if tuple(active.shape) != expected_shape:
+            raise ValueError(
+                f"active_expert_mask must have shape {expected_shape}")
+        active = active.clone()
+        active[:, self.expert_names.index(self.default_expert)] = True
+        changed = True
+        while changed:
+            previous = active.clone()
+            for expert_id, name in enumerate(self.expert_names):
+                parent = self.proposal_parents.get(name)
+                if parent is None:
+                    continue
+                parent_id = self.expert_names.index(parent)
+                active[:, parent_id] |= active[:, expert_id]
+            changed = not torch.equal(active, previous)
+        return active
+
+    @staticmethod
+    def _select_batch(value, indices, batch_size):
+        if torch.is_tensor(value):
+            if value.ndim > 0 and value.shape[0] == batch_size:
+                return value.index_select(0, indices)
+            return value
+        if isinstance(value, dict):
+            return {
+                key: PETTrack._select_batch(item, indices, batch_size)
+                for key, item in value.items()
+            }
+        if isinstance(value, tuple):
+            return tuple(
+                PETTrack._select_batch(item, indices, batch_size)
+                for item in value
+            )
+        if isinstance(value, list):
+            return [
+                PETTrack._select_batch(item, indices, batch_size)
+                for item in value
+            ]
+        return value
+
+    @staticmethod
+    def _scatter_expert_output(
+            selected_output, fallback_output, indices, batch_size):
+        output = {}
+        for key, selected in selected_output.items():
+            if isinstance(selected, dict):
+                fallback = fallback_output.get(key, {})
+                output[key] = PETTrack._scatter_expert_output(
+                    selected,
+                    fallback if isinstance(fallback, dict) else {},
+                    indices,
+                    batch_size,
+                )
+                continue
+            if not torch.is_tensor(selected) or selected.ndim == 0 \
+                    or selected.shape[0] != indices.numel():
+                output[key] = selected
+                continue
+            fallback = fallback_output.get(key)
+            if fallback is None and key in (
+                    "direct_pred_boxes", "upstream_pred_boxes"):
+                fallback = fallback_output.get("pred_boxes")
+            if fallback is not None and (
+                    tuple(fallback.shape[1:]) == tuple(selected.shape[1:])):
+                base = fallback.detach().to(selected)
+            else:
+                base = selected.new_zeros(
+                    (batch_size, *selected.shape[1:]))
+            output[key] = torch.index_copy(
+                base, 0, indices, selected)
+        return output
+
     def _activation_mask(self, specialist_mask):
         if specialist_mask.ndim != 2 \
                 or specialist_mask.shape[1] != len(self.specialist_names):
@@ -736,8 +813,49 @@ class PETTrack(nn.Module):
         cache[name] = output
         return output
 
+    def _forward_masked_shared_expert(
+            self, name, rgb, event, context, gt_score_map, cache,
+            active_mask, motion_context=None):
+        expert_id = self.expert_names.index(name)
+        indices = active_mask[:, expert_id].nonzero(
+            as_tuple=False).flatten()
+        if indices.numel() == 0:
+            return None
+        batch_size = rgb.shape[0]
+        selected_context = self._select_batch(
+            context, indices, batch_size)
+        selected_motion = self._select_batch(
+            motion_context, indices, batch_size)
+        selected_score = self._select_batch(
+            gt_score_map, indices, batch_size)
+        fused = self._fuse_expert_search(
+            name,
+            rgb.index_select(0, indices),
+            event.index_select(0, indices),
+            context=selected_context,
+            motion_context=selected_motion,
+        )
+        selected_output = self._forward_box_head(
+            fused, selected_score, expert_name=name)
+        parent = self.proposal_parents.get(name)
+        if parent in cache:
+            selected_output = self._condition_expert_output(
+                name,
+                selected_output,
+                self._select_batch(cache[parent], indices, batch_size),
+            )
+        output = self._scatter_expert_output(
+            selected_output,
+            cache[self.default_expert],
+            indices,
+            batch_size,
+        )
+        cache[name] = output
+        return output
+
     def forward_head(self, cat_feature, gt_score_map=None,
                      training_expert_ids=None, active_expert_names=None,
+                     active_expert_mask=None,
                      auto_activate=False, return_activation_logits=False,
                      motion_context=None):
         search = cat_feature[:, -self.feat_len_s * 2:]
@@ -747,7 +865,8 @@ class PETTrack(nn.Module):
             return self._forward_box_head(rgb + event, gt_score_map)
 
         if training_expert_ids is not None:
-            if active_expert_names is not None or auto_activate:
+            if active_expert_names is not None \
+                    or active_expert_mask is not None or auto_activate:
                 raise ValueError(
                     "training and inference expert activation are mutually exclusive")
             name = self._training_expert(
@@ -765,6 +884,13 @@ class PETTrack(nn.Module):
         expert_outputs = {}
         activation_logits = None
         activation_mask = None
+        if active_expert_mask is not None:
+            if active_expert_names is not None or auto_activate:
+                raise ValueError(
+                    "per-row, explicit, and automatic expert activation "
+                    "are mutually exclusive")
+            activation_mask = self._resolve_active_expert_mask(
+                active_expert_mask, rgb.shape[0], rgb.device)
         if auto_activate or return_activation_logits:
             generalist = self._forward_shared_expert(
                 self.default_expert, rgb, event, context,
@@ -779,6 +905,10 @@ class PETTrack(nn.Module):
             active_experts = tuple(
                 name for expert_id, name in enumerate(self.expert_names)
                 if bool(activation_mask[:, expert_id].any()))
+        elif active_expert_mask is not None:
+            active_experts = tuple(
+                name for expert_id, name in enumerate(self.expert_names)
+                if bool(activation_mask[:, expert_id].any()))
         else:
             active_experts = self._resolve_active_experts(active_expert_names)
         for name in active_experts:
@@ -790,6 +920,12 @@ class PETTrack(nn.Module):
                     motion_context=motion_context)
                 expert_outputs[name] = self._forward_box_head(
                     fused, gt_score_map, expert_name=name)
+            elif active_expert_mask is not None \
+                    and name != self.default_expert:
+                self._forward_masked_shared_expert(
+                    name, rgb, event, context, gt_score_map,
+                    expert_outputs, activation_mask,
+                    motion_context=motion_context)
             else:
                 self._forward_shared_expert(
                     name, rgb, event, context, gt_score_map, expert_outputs,
@@ -807,7 +943,8 @@ class PETTrack(nn.Module):
 
     def _forward_amt_core(self, zi, ze, xi, xe, encoded_templates=None,
                           training_expert_ids=None,
-                          active_expert_names=None, auto_activate=False,
+                          active_expert_names=None, active_expert_mask=None,
+                          auto_activate=False,
                           return_activation_logits=False,
                           motion_context=None, **kwargs):
         if encoded_templates is None:
@@ -818,6 +955,8 @@ class PETTrack(nn.Module):
         head_kwargs = {"training_expert_ids": training_expert_ids}
         if active_expert_names is not None:
             head_kwargs["active_expert_names"] = active_expert_names
+        if active_expert_mask is not None:
+            head_kwargs["active_expert_mask"] = active_expert_mask
         if auto_activate:
             head_kwargs["auto_activate"] = True
         if return_activation_logits:
@@ -837,6 +976,7 @@ class PETTrack(nn.Module):
                       encoded_templates=None,
                       training_expert_ids=None,
                       active_expert_names=None,
+                      active_expert_mask=None,
                       auto_activate=False,
                       return_activation_logits=False,
                       motion_context=None,
@@ -849,6 +989,8 @@ class PETTrack(nn.Module):
         head_kwargs = {"training_expert_ids": training_expert_ids}
         if active_expert_names is not None:
             head_kwargs["active_expert_names"] = active_expert_names
+        if active_expert_mask is not None:
+            head_kwargs["active_expert_mask"] = active_expert_mask
         if auto_activate:
             head_kwargs["auto_activate"] = True
         if return_activation_logits:
@@ -969,15 +1111,30 @@ class PETTrack(nn.Module):
 
     def inference(self, static_zi, static_ze, dynamic_zi, dynamic_ze, xi, xe,
                   small_template_features=None, active_expert_names=None,
+                  active_expert_mask=None,
                   auto_activate=False, return_activation_logits=False,
                   motion_context=None):
-        if auto_activate and active_expert_names is not None:
+        activation_modes = sum((
+            active_expert_names is not None,
+            active_expert_mask is not None,
+            bool(auto_activate),
+        ))
+        if activation_modes > 1:
             raise ValueError(
-                "explicit and automatic expert activation are mutually exclusive")
-        active_experts = (
-            None if auto_activate
-            else self._resolve_active_experts(active_expert_names)
-        )
+                "per-row, explicit, and automatic expert activation "
+                "are mutually exclusive")
+        resolved_mask = None
+        if active_expert_mask is not None:
+            resolved_mask = self._resolve_active_expert_mask(
+                active_expert_mask, xi.shape[0], xi.device)
+            active_experts = tuple(
+                name for expert_id, name in enumerate(self.expert_names)
+                if bool(resolved_mask[:, expert_id].any()))
+        else:
+            active_experts = (
+                None if auto_activate
+                else self._resolve_active_experts(active_expert_names)
+            )
         raw_static_zi = static_zi
         raw_static_ze = static_ze
         precision_is_active = (
@@ -998,7 +1155,9 @@ class PETTrack(nn.Module):
             out = self._forward_srbt(
                 static_zi, static_ze, xi, xe,
                 encoded_templates=encoded_templates,
-                active_expert_names=active_experts,
+                active_expert_names=(
+                    active_experts if resolved_mask is None else None),
+                active_expert_mask=resolved_mask,
                 auto_activate=auto_activate,
                 return_activation_logits=return_activation_logits,
                 motion_context=motion_context)
@@ -1006,7 +1165,9 @@ class PETTrack(nn.Module):
             out = self._forward_amt_core(
                 static_zi, static_ze, xi, xe,
                 encoded_templates=encoded_templates,
-                active_expert_names=active_experts,
+                active_expert_names=(
+                    active_experts if resolved_mask is None else None),
+                active_expert_mask=resolved_mask,
                 auto_activate=auto_activate,
                 return_activation_logits=return_activation_logits,
                 motion_context=motion_context)
@@ -1020,18 +1181,48 @@ class PETTrack(nn.Module):
         shared_outputs = out.get("expert_outputs")
         if shared_outputs is None:
             raise RuntimeError("shared inference did not return expert outputs")
-        if small_template_features is None:
+        precision_indices = None
+        if resolved_mask is not None:
+            precision_id = self.expert_names.index(
+                self.precision_refiner_name)
+            precision_indices = resolved_mask[:, precision_id].nonzero(
+                as_tuple=False).flatten()
+        if precision_indices is None:
+            selected_static_zi = raw_static_zi
+            selected_static_ze = raw_static_ze
+            selected_template_features = small_template_features
+            selected_xi = xi
+            selected_xe = xe
+        else:
+            batch_size = xi.shape[0]
+            selected_static_zi = self._select_batch(
+                raw_static_zi, precision_indices, batch_size)
+            selected_static_ze = self._select_batch(
+                raw_static_ze, precision_indices, batch_size)
+            selected_template_features = self._select_batch(
+                small_template_features, precision_indices, batch_size)
+            selected_xi = xi.index_select(0, precision_indices)
+            selected_xe = xe.index_select(0, precision_indices)
+        if selected_template_features is None:
             small_output = self.small_target_expert(
-                raw_static_zi, raw_static_ze, xi, xe)
+                selected_static_zi, selected_static_ze,
+                selected_xi, selected_xe)
         else:
             small_output = self.small_target_expert.track_with_template(
-                small_template_features, xi, xe)
+                selected_template_features, selected_xi, selected_xe)
         if auto_activate:
             upstream_output = self._selected_upstream_output(
                 self.precision_refiner_name,
                 shared_outputs,
                 out["expert_activation_mask"],
             )
+        elif precision_indices is not None:
+            parent_name = self.proposal_parents.get(
+                self.precision_refiner_name)
+            upstream_output = shared_outputs.get(parent_name)
+            if upstream_output is not None:
+                upstream_output = self._select_batch(
+                    upstream_output, precision_indices, xi.shape[0])
         else:
             parent_name = self.proposal_parents.get(
                 self.precision_refiner_name)
@@ -1045,7 +1236,12 @@ class PETTrack(nn.Module):
         small_output["reliability_predictions"] = self._candidate_reliability(
             small_output["score_map"],
             small_output["pred_boxes"],
-            out["presence_score"],
+            (
+                out["presence_score"]
+                if precision_indices is None
+                else out["presence_score"].index_select(
+                    0, precision_indices)
+            ),
         )
         small_output["collaboration_predictions"] = (
             self._candidate_collaboration(
@@ -1053,6 +1249,13 @@ class PETTrack(nn.Module):
                 small_output["pred_boxes"],
             )
         )
+        if precision_indices is not None:
+            small_output = self._scatter_expert_output(
+                small_output,
+                shared_outputs[self.default_expert],
+                precision_indices,
+                xi.shape[0],
+            )
         active_experts = tuple(
             name for name in self.expert_names
             if name in shared_outputs or name == self.precision_refiner_name

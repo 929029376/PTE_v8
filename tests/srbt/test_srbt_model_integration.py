@@ -423,6 +423,66 @@ def test_inference_reuses_cached_independent_template_features(monkeypatch):
     assert "precision_refiner" in output["expert_outputs"]
 
 
+def test_per_row_inference_runs_precision_only_for_selected_rows(monkeypatch):
+    model = _model(expert_enabled=True).eval()
+    batch_size = 3
+    static_zi = torch.randn(batch_size, 3, 16, 16)
+    static_ze = torch.randn(batch_size, 3, 16, 16)
+    cached = model.small_target_expert.encode_template(static_zi, static_ze)
+    calls = []
+    cached_forward = model.small_target_expert.track_with_template
+
+    def counted_cached(template_features, search_rgb, search_event):
+        calls.append(search_rgb.shape[0])
+        assert all(
+            value.shape[0] == 1
+            for value in (
+                template_features[0],
+                template_features[1],
+                *template_features[2],
+            )
+        )
+        return cached_forward(
+            template_features, search_rgb, search_event)
+
+    monkeypatch.setattr(
+        model.small_target_expert, "track_with_template", counted_cached)
+    active_mask = torch.tensor([
+        [False, True, False, False, False],
+        [False, False, True, False, False],
+        [False, False, False, True, False],
+    ])
+    with torch.no_grad():
+        output = model.inference(
+            static_zi,
+            static_ze,
+            torch.randn(batch_size, 1, 3, 16, 16),
+            torch.randn(batch_size, 1, 3, 16, 16),
+            torch.randn(batch_size, 1, 3, 16, 16),
+            torch.randn(batch_size, 1, 3, 16, 16),
+            small_template_features=cached,
+            active_expert_mask=active_mask,
+        )
+
+    assert calls == [1]
+    assert output["expert_activation_mask"].tolist() == [
+        [True, True, False, False, False],
+        [True, True, True, False, True],
+        [True, False, False, True, False],
+    ]
+    precision = output["expert_outputs"]["precision_refiner"]
+    generalist = output["expert_outputs"]["generalist"]
+    assert precision["pred_boxes"].shape == (batch_size, 1, 4)
+    assert precision["reliability_predictions"][
+        "localization_validity_logits"].shape[0] == batch_size
+    assert precision["collaboration_predictions"]["logits"].shape[0] \
+        == batch_size
+    torch.testing.assert_close(
+        precision["pred_boxes"][[0, 2]],
+        generalist["pred_boxes"][[0, 2]],
+    )
+
+
 def test_sparse_inference_runs_only_motion_and_required_generalist(monkeypatch):
     model = _model(expert_enabled=True).eval()
     calls = {name: 0 for name in model.shared_expert_names}
