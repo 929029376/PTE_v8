@@ -1386,7 +1386,7 @@ def test_compound_loss_backpropagates_only_to_frame_relevant_specialists(
     assert status["Loss/compound_presence"] > 0.0
 
 
-def test_compound_localization_ignores_targets_outside_search_crop(
+def test_compound_localization_trains_controller_before_crop_failure(
         monkeypatch):
     def fake_localization_loss(
             self, pred_dict, gt_dict, return_status=True):
@@ -1447,7 +1447,7 @@ def test_compound_localization_ignores_targets_outside_search_crop(
         ],
         "pursuit_predictions": [SimpleNamespace(
             next_box=torch.tensor([
-                [0.25, 0.25, 0.20, 0.20],
+                [0.10, 0.10, 0.20, 0.20],
                 [0.10, 0.10, 0.20, 0.20],
             ], requires_grad=True),
             inside_logit=torch.zeros(2, requires_grad=True),
@@ -1468,14 +1468,14 @@ def test_compound_localization_ignores_targets_outside_search_crop(
     for name in ("motion_fm", "precision_refiner"):
         assert parameters[name].grad[0].abs() > 0.0
         assert parameters[name].grad[1] == 0.0
-    assert predictions["pursuit_predictions"][0].next_box.grad[0].abs().sum() == 0.0
+    assert predictions["pursuit_predictions"][0].next_box.grad[0].abs().sum() > 0.0
     assert predictions["pursuit_predictions"][0].next_box.grad[1].abs().sum() > 0.0
     assert status["Compound/train_count_1"] == 1
     assert status["Compound/train_count_2"] == 1
     assert status["Compound/in_crop_rate"] == pytest.approx(0.5)
     assert status["Compound/out_of_crop_count"] == 1
-    assert status["Compound/pursuit_out_of_crop_count"] == 1
-    assert status["Loss/compound_pursuit_out_of_crop"] > 0.0
+    assert status["Compound/pursuit_count"] == 2
+    assert status["Loss/compound_pursuit"] > 0.0
     assert (
         status["Compound/joint_iou"]
         < status["Compound/joint_iou_in_crop"]
