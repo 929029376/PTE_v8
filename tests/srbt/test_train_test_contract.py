@@ -1239,9 +1239,9 @@ def test_final_inference_config_enables_accepted_behavior_contract():
     )
 
     accepted = (
-        "/root/fnvme/PTE_v8_runs/proposal_identity_coverage_v59_20260723/"
-        "checkpoints/train/pet_track/felt_pet_track_proposal_identity/"
-        "PETTrack_identity_ep0030_accepted.pth.tar"
+        "/root/fnvme/PTE_v8_runs/compound_search_recovery_v66_20260723/"
+        "checkpoints/train/pet_track/felt_pet_track/"
+        "PETTrack_best.pth.tar"
     )
     assert configured.MODEL.INIT_CHECKPOINT == accepted
     assert configured.TEST.CHECKPOINT == accepted
@@ -1253,6 +1253,11 @@ def test_final_inference_config_enables_accepted_behavior_contract():
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is True
     assert configured.MODEL.SRBT.ENABLE is True
     assert configured.MODEL.REDETECT.EVENT_PROPOSAL_INFERENCE is True
+    assert configured.MODEL.SRBT.CONTROLLER.THETA_OBSERVABLE == 0.70
+    assert configured.MODEL.SRBT.CONTROLLER.THETA_LOCALIZED == 0.63
+    assert configured.MODEL.SRBT.CONTROLLER.THETA_RECOVER == 0.44
+    assert configured.MODEL.REDETECT.IDENTITY_THRESHOLD == 0.44
+    assert configured.MODEL.REDETECT.ACCEPTANCE_THRESHOLD == 0.50
 
 
 def test_proposal_identity_stage_report_is_unambiguous(capsys):
