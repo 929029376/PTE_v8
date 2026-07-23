@@ -983,7 +983,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.EXPERT.ACTIVATION_THRESHOLD == pytest.approx(0.5)
     assert configured.MODEL.EXPERT.MAX_ACTIVE_SPECIALISTS == 2
     assert configured.MODEL.EXPERT.ACTIVATOR_TRAINED is True
-    assert configured.MODEL.EXPERT.USE_ACTIVATION_INFERENCE is False
+    assert configured.MODEL.EXPERT.USE_ACTIVATION_INFERENCE is True
     assert "MAX_ACTIVE" not in configured.MODEL.EXPERT
     assert "ROUTER_HIDDEN_DIM" not in configured.MODEL.EXPERT
     assert "TEMPORAL_MOMENTUM" not in configured.MODEL.EXPERT
@@ -992,8 +992,9 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "visibility_exclusive_loop_v55_20260723/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_visibility_owner3_ep0020_accepted.pth.tar")
+        "proposal_identity_coverage_v59_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track_proposal_identity/"
+        "PETTrack_identity_ep0030_accepted.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -1002,30 +1003,30 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
 
 
-def test_canonical_challenge_dispatch_trains_only_activator_without_validation():
+def test_canonical_compound_stage_trains_only_activator_without_validation():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
 
     configured = deepcopy(cfg)
     update_config_from_file("experiments/pet_track/felt_pet_track.yaml", configured)
 
-    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 1800
-    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 420
-    assert configured.DATA.VAL.SAMPLE_PER_EPOCH % (
-        5 * configured.TRAIN.BATCH_SIZE) == 0
-    assert configured.TRAIN.BATCH_SIZE == 12
+    assert configured.DATA.TRAIN.SAMPLE_PER_EPOCH == 640
+    assert configured.DATA.VAL.SAMPLE_PER_EPOCH == 416
+    assert configured.TRAIN.BATCH_SIZE == 8
+    assert configured.DATA.VAL.SAMPLE_PER_EPOCH % configured.TRAIN.BATCH_SIZE == 0
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
-    assert configured.TRAIN.LOAD_LATEST is True
+    assert configured.TRAIN.LOAD_LATEST is False
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "visibility_exclusive_loop_v55_20260723/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_visibility_owner3_ep0020_accepted.pth.tar")
-    assert configured.TRAIN.STAGE == "dispatch"
-    assert configured.TRAIN.EXPERT_PHASE == "dispatch"
+        "proposal_identity_coverage_v59_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track_proposal_identity/"
+        "PETTrack_identity_ep0030_accepted.pth.tar")
+    assert configured.TRAIN.STAGE == "compound"
+    assert configured.TRAIN.EXPERT_PHASE == "compound"
     assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1, 2, 3, 4]
-    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(1e-4)
+    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(5e-5)
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
-    assert configured.DATA.PURSUIT.ENABLE is False
+    assert configured.DATA.PURSUIT.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
     assert configured.DATA.PURSUIT.WINDOW_LENGTH == 16
     assert configured.DATA.PURSUIT.CANVAS_SIZE == 352
@@ -1045,7 +1046,7 @@ def test_canonical_challenge_dispatch_trains_only_activator_without_validation()
     assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(0.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_WEIGHT == pytest.approx(2.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_MARGIN == pytest.approx(0.2)
-    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.0001)
+    assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.00005)
     assert configured.TRAIN.ACTIVATOR_ADVANTAGE_MARGIN == pytest.approx(0.02)
     assert configured.TRAIN.ACTIVATOR_POS_WEIGHT == [4.0, 5.0, 1.5, 2.5]
     assert configured.TRAIN.SMALL_TARGET_ADAPTER_LR == pytest.approx(0.0)
@@ -1095,7 +1096,7 @@ def test_canonical_challenge_dispatch_trains_only_activator_without_validation()
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is False
     assert configured.TRAIN.BEST_LOADER == "train"
-    assert configured.TRAIN.BEST_METRIC == "Activation/macro_f1"
+    assert configured.TRAIN.BEST_METRIC == "Compound/top2_recall"
     assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
     assert configured.TRAIN.SPECIALIST_MIN_DELTA == 0.02
@@ -1247,13 +1248,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_proposal_identity_v59_run_directory():
+def test_supervisor_uses_isolated_compound_v60_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "proposal_identity_coverage_v59_20260723" in supervisor
+    assert "compound_activation_v60_20260723" in supervisor
+    assert "proposal_identity_coverage_v59_20260723" not in supervisor
     assert "activator_challenge_labels_v58_20260723" not in supervisor
     assert "activator_dispatch_continuation_v57_20260723" not in supervisor
     assert "activator_dispatch_v56_20260723" not in supervisor
@@ -1269,8 +1271,8 @@ def test_supervisor_uses_isolated_proposal_identity_v59_run_directory():
     assert "precision_specialist_v44_20260722" not in supervisor
     assert "discrimination_ranking_v43_20260722" not in supervisor
     assert "causal_discrimination_v42_20260721" not in supervisor
-    assert "--config felt_pet_track_proposal_identity" in supervisor
-    assert "CONFIG_NAME=\"felt_pet_track_proposal_identity\"" in supervisor
+    assert "--config felt_pet_track" in supervisor
+    assert "CONFIG_NAME=\"felt_pet_track\"" in supervisor
     assert "dart_duration_v40b_20260721/logs && exec" not in supervisor
     assert "dart_duration_v40_20260721" not in supervisor
     assert "dart_reliability_v39_20260721" not in supervisor
@@ -1298,7 +1300,7 @@ def test_supervisor_uses_isolated_proposal_identity_v59_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "proposal_identity_coverage_v59_20260723/logs && exec") == 2
+        "compound_activation_v60_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

@@ -63,7 +63,7 @@ def _load_refine_gate_reference(cfg):
 def _validate_pursuit_stage(cfg):
     phase = str(getattr(
         cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
-    if phase != "pursuit":
+    if phase not in {"pursuit", "compound"}:
         return
     controller_cfg = getattr(cfg.MODEL, "SEARCH_CONTROLLER", None)
     pursuit_cfg = getattr(cfg.DATA, "PURSUIT", None)
@@ -83,9 +83,16 @@ def _validate_pursuit_stage(cfg):
         errors.append("DATA.PURSUIT.CANVAS_SIZE must cover the search input")
     if bool(getattr(controller_cfg, "USE_INFERENCE", False)):
         errors.append("MODEL.SEARCH_CONTROLLER.USE_INFERENCE must stay false while training")
+    expert_cfg = getattr(cfg.MODEL, "EXPERT", None)
+    if phase == "compound":
+        if not bool(getattr(expert_cfg, "USE_ACTIVATION_INFERENCE", False)):
+            errors.append(
+                "MODEL.EXPERT.USE_ACTIVATION_INFERENCE must be true")
+        if not bool(getattr(expert_cfg, "ACTIVATOR_TRAINED", False)):
+            errors.append("MODEL.EXPERT.ACTIVATOR_TRAINED must be true")
     if errors:
         raise RuntimeError(
-            "Invalid pursuit stage: " + "; ".join(errors))
+            f"Invalid {phase} stage: " + "; ".join(errors))
 
 
 def run(settings):

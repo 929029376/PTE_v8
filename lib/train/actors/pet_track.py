@@ -107,11 +107,12 @@ class PETTrackActor(PETTrackBaseActor):
             raise ValueError(
                 "DART_DECODER_ONLY and PROPOSAL_IDENTITY_ONLY are mutually exclusive")
         if self.expert_phase not in {
-                "specialize", "refine", "recovery", "pursuit", "dispatch"}:
+                "specialize", "refine", "recovery", "pursuit", "dispatch",
+                "compound"}:
             raise ValueError(
                 "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, "
-                "pursuit, or dispatch")
-        if self.expert_phase == "dispatch":
+                "pursuit, dispatch, or compound")
+        if self.expert_phase in {"dispatch", "compound"}:
             specialist_count = max(
                 len(getattr(expert_cfg, "NAMES", ())) - 1, 0)
             if (len(self.activation_pos_weight) != specialist_count
@@ -124,7 +125,7 @@ class PETTrackActor(PETTrackBaseActor):
             "srbt" if self.srbt_enabled else "base")
         self.active_losses = (
             {"activation"}
-            if self.expert_phase == "dispatch"
+            if self.expert_phase in {"dispatch", "compound"}
             else
             {"pursuit"}
             if self.expert_phase == "pursuit"
@@ -142,7 +143,8 @@ class PETTrackActor(PETTrackBaseActor):
     # ------------------------------------------------------------------ #
     def train(self, mode=True):
         sparse_phases = {"specialize", "refine", "pursuit"}
-        if self.expert_phase not in sparse_phases | {"dispatch", "recovery"}:
+        if self.expert_phase not in sparse_phases | {
+                "dispatch", "compound", "recovery"}:
             return super().train(mode)
         self.net.eval()
         model = self.net.module if hasattr(self.net, "module") else self.net
@@ -155,7 +157,7 @@ class PETTrackActor(PETTrackBaseActor):
                                     for parameter in parameters)):
                         module.train(True)
             return
-        if self.expert_phase == "dispatch":
+        if self.expert_phase in {"dispatch", "compound"}:
             model.expert_activator.train(mode)
             return
         if getattr(self, "dart_decoder_only", False):
@@ -399,7 +401,7 @@ class PETTrackActor(PETTrackBaseActor):
     def forward_pass(self, data):
         """Forward pass for baseline localization plus causal SRBT outputs."""
         expert_phase = getattr(self, "expert_phase", "specialize")
-        if expert_phase == "pursuit":
+        if expert_phase in {"pursuit", "compound"}:
             return self._forward_pursuit(data)
         zi = data['template_images'].permute(1, 0, 2, 3, 4)
         ze = data['template_event_images'].permute(1, 0, 2, 3, 4)
@@ -547,6 +549,36 @@ class PETTrackActor(PETTrackBaseActor):
                 "each pursuit episode must contain eligible specialist frames")
         return specialist_id, eligible, challenge_labels
 
+    def _compound_challenge_context(
+            self, data, batch_size, frame_count, device):
+        challenge_labels = data.get("pursuit_challenge_labels")
+        if challenge_labels is None:
+            raise RuntimeError(
+                "compound training requires frame challenge labels")
+        challenge_labels = torch.as_tensor(
+            challenge_labels, device=device, dtype=torch.bool)
+        expected = (batch_size, frame_count, len(CHALLENGE_NAMES))
+        if challenge_labels.shape == (
+                frame_count, len(CHALLENGE_NAMES), batch_size):
+            challenge_labels = challenge_labels.permute(2, 0, 1)
+        elif challenge_labels.shape == (
+                frame_count, batch_size, len(CHALLENGE_NAMES)):
+            challenge_labels = challenge_labels.permute(1, 0, 2)
+        if challenge_labels.shape != expected:
+            raise ValueError(
+                "pursuit_challenge_labels must describe every batch frame")
+        attributes = {
+            name: challenge_labels[..., index].reshape(-1)
+            for index, name in enumerate(CHALLENGE_NAMES)
+        }
+        specialist_count = expert_supervision_mask(attributes)[
+            :, 1:].sum(dim=1).reshape(batch_size, frame_count)
+        if not bool((specialist_count >= 2).all()):
+            raise ValueError(
+                "compound training requires at least two distinct specialists "
+                "for every frame")
+        return challenge_labels
+
     @staticmethod
     def _aligned_iou_xywh(first, second):
         first_max = first[:, :2] + first[:, 2:]
@@ -624,6 +656,8 @@ class PETTrackActor(PETTrackBaseActor):
 
     def _forward_pursuit(self, data):
         """Unroll controller or one specialist over prediction-driven crops."""
+        compound_training = getattr(
+            self, "expert_phase", "pursuit") == "compound"
         model = self.net.module if hasattr(self.net, "module") else self.net
         controller = getattr(model, "search_window_controller", None)
         if controller is None:
@@ -659,6 +693,11 @@ class PETTrackActor(PETTrackBaseActor):
             self._pursuit_specialist_context(
                 data, model, frames.shape[0], frames.shape[1], frames.device)
         )
+        compound_challenge_labels = (
+            self._compound_challenge_context(
+                data, frames.shape[0], frames.shape[1], frames.device)
+            if compound_training else None
+        )
         specialist_name = (
             model.expert_names[specialist_id]
             if specialist_id is not None else None)
@@ -681,10 +720,17 @@ class PETTrackActor(PETTrackBaseActor):
         specialist_discrimination_present = []
         specialist_image_boxes = []
         specialist_image_targets = []
+        compound_activation_logits = []
+        compound_activation_masks = []
+        compound_selected_iou = []
+        compound_generalist_iou = []
         expert_cfg = getattr(
             getattr(self.cfg, "MODEL", None), "EXPERT", None)
         use_activation = bool(getattr(
             expert_cfg, "USE_ACTIVATION_INFERENCE", False))
+        if compound_training and not use_activation:
+            raise RuntimeError(
+                "compound training requires automatic expert activation")
         if specialist_id is not None and use_activation:
             raise RuntimeError(
                 "causal specialist pursuit uses the declared expert directly")
@@ -702,10 +748,11 @@ class PETTrackActor(PETTrackBaseActor):
                 self.settings, "center_jitter_factor", {}).get(
                     "search", 0.0)) * motion_center_jitter_multiplier
         model.eval()
-        controller.train(was_training and specialist_id is None)
+        controller.train(
+            was_training and specialist_id is None and not compound_training)
         try:
             encoded_templates = None
-            if specialist_id is not None and hasattr(
+            if (specialist_id is not None or compound_training) and hasattr(
                     model, "_encode_runtime_templates"):
                 with torch.no_grad():
                     encoded_templates = model._encode_runtime_templates(
@@ -720,6 +767,14 @@ class PETTrackActor(PETTrackBaseActor):
                         "precision pursuit requires small_target_expert")
                 small_template_features = small_target_expert.encode_template(
                     zi[:, 0], ze[:, 0])
+            elif compound_training:
+                small_target_expert = getattr(
+                    model, "small_target_expert", None)
+                if small_target_expert is not None:
+                    with torch.no_grad():
+                        small_template_features = (
+                            small_target_expert.encode_template(
+                                zi[:, 0], ze[:, 0]))
             for frame_index in range(frames.shape[1] - 1):
                 crop_anchor = planned_anchor
                 if motion_center_jitter > 0.0:
@@ -775,7 +830,8 @@ class PETTrackActor(PETTrackBaseActor):
                     "box_delta": relative_box_motion(
                         planned_anchor, previous_observation),
                 }
-                with torch.set_grad_enabled(specialist_id is not None):
+                with torch.set_grad_enabled(
+                        specialist_id is not None or compound_training):
                     if encoded_templates is None:
                         runtime_templates = (
                             zi[:, 0], ze[:, 0], zi[:, 1:], ze[:, 1:])
@@ -796,6 +852,8 @@ class PETTrackActor(PETTrackBaseActor):
                             specialist_name,)
                     elif use_activation:
                         inference_kwargs["auto_activate"] = True
+                        inference_kwargs["return_activation_logits"] = (
+                            compound_training)
                     output = model.inference(**inference_kwargs)
                     expert_outputs = output.get("expert_outputs")
                     if not expert_outputs:
@@ -900,6 +958,19 @@ class PETTrackActor(PETTrackBaseActor):
                     search_factor) & present[:, frame_index]
                 current_quality = self._aligned_iou_xywh(
                     observation, annotations[:, frame_index])
+                if compound_training:
+                    activation_logits = output.get(
+                        "expert_activation_logits")
+                    if activation_logits is None:
+                        raise RuntimeError(
+                            "compound training requires activation logits")
+                    compound_activation_logits.append(activation_logits)
+                    compound_activation_masks.append(active_mask)
+                    compound_selected_iou.append(current_quality.detach())
+                    compound_generalist_iou.append(
+                        self._aligned_iou_xywh(
+                            expert_boxes[:, 0],
+                            annotations[:, frame_index]).detach())
                 if specialist_id is not None:
                     region_xy = crop_region[:, :2]
                     region_wh = crop_region[:, 2:]
@@ -939,7 +1010,7 @@ class PETTrackActor(PETTrackBaseActor):
                 previous_event_search = event_search.detach()
         finally:
             model.train(was_training)
-        return {
+        result = {
             "pursuit_predictions": predictions,
             "pursuit_targets": targets,
             "pursuit_current_inside": current_inside_values,
@@ -955,6 +1026,20 @@ class PETTrackActor(PETTrackBaseActor):
             "pursuit_specialist_image_boxes": specialist_image_boxes,
             "pursuit_specialist_image_targets": specialist_image_targets,
         }
+        if compound_training:
+            result.update({
+                "compound_activation_logits": torch.stack(
+                    compound_activation_logits, dim=1),
+                "compound_activation_mask": torch.stack(
+                    compound_activation_masks, dim=1),
+                "compound_challenge_labels": compound_challenge_labels,
+                "compound_present": present,
+                "compound_selected_iou": torch.stack(
+                    compound_selected_iou, dim=1),
+                "compound_generalist_iou": torch.stack(
+                    compound_generalist_iou, dim=1),
+            })
+        return result
 
     # helpers for the CE logic (kept local)
     def _gen_mask_cond(self, bs, device, gt_bbox):
@@ -980,6 +1065,9 @@ class PETTrackActor(PETTrackBaseActor):
         if self.expert_phase == "dispatch":
             return self._compute_dispatch_loss(
                 pred_dict, gt_dict, return_status=return_status)
+        if self.expert_phase == "compound":
+            return self._compute_compound_loss(
+                pred_dict, return_status=return_status)
         if self.expert_phase == "pursuit":
             return self._compute_pursuit_losses(
                 pred_dict, return_status=return_status)
@@ -1157,7 +1245,7 @@ class PETTrackActor(PETTrackBaseActor):
         status.setdefault("DART/decoder_acc", 0.0)
         status["Expert/phase_id"] = {
             "specialize": 0, "refine": 1, "recovery": 2, "pursuit": 3,
-            "dispatch": 4,
+            "dispatch": 4, "compound": 5,
         }[self.expert_phase]
         status.setdefault("Redetect/count", 0)
         status["Loss/total"] = loss.item()
@@ -1342,6 +1430,114 @@ class PETTrackActor(PETTrackBaseActor):
             status[f"Activation/f1_{name}"] = float(f1)
             expert_f1.append(f1)
         status["Activation/macro_f1"] = float(torch.stack(expert_f1).mean())
+        return loss, status
+
+    def _compute_compound_loss(self, predictions, return_status=True):
+        logits = predictions.get("compound_activation_logits")
+        active_mask = predictions.get("compound_activation_mask")
+        challenge_labels = predictions.get("compound_challenge_labels")
+        present = predictions.get("compound_present")
+        selected_iou = predictions.get("compound_selected_iou")
+        generalist_iou = predictions.get("compound_generalist_iou")
+        if any(value is None for value in (
+                logits, active_mask, challenge_labels, present,
+                selected_iou, generalist_iou)):
+            raise RuntimeError(
+                "compound training requires causal activation diagnostics")
+        logits = logits.float()
+        if logits.ndim != 3:
+            raise ValueError(
+                "compound activation logits must have shape (B,S,E-1)")
+        batch_size, steps, specialist_count = logits.shape
+        model = self.net.module if hasattr(self.net, "module") else self.net
+        if specialist_count != len(model.expert_names) - 1:
+            raise ValueError(
+                "compound activation logits must cover every specialist")
+        active_mask = torch.as_tensor(
+            active_mask, device=logits.device, dtype=torch.bool)
+        if active_mask.shape != (
+                batch_size, steps, len(model.expert_names)):
+            raise ValueError(
+                "compound activation mask must have shape (B,S,E)")
+        challenge_labels = torch.as_tensor(
+            challenge_labels, device=logits.device, dtype=torch.bool)
+        if (challenge_labels.ndim != 3
+                or challenge_labels.shape[0] != batch_size
+                or challenge_labels.shape[1] < steps
+                or challenge_labels.shape[2] != len(CHALLENGE_NAMES)):
+            raise ValueError(
+                "compound challenge labels must have shape (B,T,C)")
+        present = torch.as_tensor(
+            present, device=logits.device, dtype=torch.bool)
+        if present.ndim != 2 or present.shape[0] != batch_size \
+                or present.shape[1] < steps:
+            raise ValueError("compound presence must have shape (B,T)")
+
+        current_labels = challenge_labels[:, :steps]
+        attributes = {
+            name: current_labels[..., index].reshape(-1)
+            for index, name in enumerate(CHALLENGE_NAMES)
+        }
+        targets = expert_supervision_mask(attributes).to(
+            logits.device)[:, 1:].reshape(
+                batch_size, steps, specialist_count)
+        current_present = present[:, :steps]
+        for expert_id in range(1, len(model.expert_names)):
+            if expert_id != VISIBILITY_EXPERT_ID:
+                targets[..., expert_id - 1] &= current_present
+        target_count = targets.sum(dim=-1)
+        if not bool((target_count >= 2).all()):
+            raise ValueError(
+                "compound loss requires at least two target specialists per step")
+
+        pos_weight = logits.new_tensor(self.activation_pos_weight)
+        loss = F.binary_cross_entropy_with_logits(
+            logits, targets.to(logits.dtype), pos_weight=pos_weight)
+        if not return_status:
+            return loss
+
+        selected = active_mask[..., 1:]
+        selected_count = selected.sum(dim=-1)
+        max_specialists = int(getattr(
+            getattr(model, "expert_activator", None),
+            "max_specialists", specialist_count,
+        ))
+        if bool((selected_count > max_specialists).any()):
+            raise ValueError(
+                f"compound activation may select at most "
+                f"{max_specialists} specialists")
+        top2_recall = (
+            (selected & targets).float().sum()
+            / targets.float().sum().clamp_min(1.0)
+        )
+        selected_iou = torch.as_tensor(
+            selected_iou, device=logits.device, dtype=logits.dtype)
+        generalist_iou = torch.as_tensor(
+            generalist_iou, device=logits.device, dtype=logits.dtype)
+        if selected_iou.shape != (batch_size, steps) \
+                or generalist_iou.shape != (batch_size, steps):
+            raise ValueError("compound IoU diagnostics must have shape (B,S)")
+        visible_weight = current_present.to(logits.dtype)
+        visible_count = visible_weight.sum().clamp_min(1.0)
+        status = {
+            "Loss/activation": float(loss.detach()),
+            "Loss/total": float(loss.detach()),
+            "Compound/target_specialists": float(
+                target_count.float().mean()),
+            "Compound/active_specialists": float(
+                selected_count.float().mean()),
+            "Compound/top2_recall": float(top2_recall.detach()),
+            "Compound/selected_iou": float(
+                ((selected_iou * visible_weight).sum()
+                 / visible_count).detach()),
+            "Compound/generalist_iou": float(
+                ((generalist_iou * visible_weight).sum()
+                 / visible_count).detach()),
+            "Compound/iou_delta": float(
+                (((selected_iou - generalist_iou) * visible_weight).sum()
+                 / visible_count).detach()),
+            "Expert/phase_id": 5,
+        }
         return loss, status
 
     def _compute_pursuit_losses(self, predictions, return_status=True):

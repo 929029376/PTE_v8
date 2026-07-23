@@ -259,6 +259,34 @@ def test_dispatch_trains_only_the_expert_activator():
     }
 
 
+def test_compound_trains_only_the_expert_activator():
+    model = TinyStudent()
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "compound"
+    cfg.TRAIN.ACTIVATOR_LR = 2e-4
+
+    groups = _optimizer_groups(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    assert trainable
+    assert all(name.startswith("expert_activator.") for name in trainable)
+    assert [group["name"] for group in groups] == ["expert_activator"]
+    assert groups[0]["lr"] == 2e-4
+    assert all(
+        not parameter.requires_grad
+        for module in (
+            model.backbone,
+            model.expert_fusion,
+            model.expert_heads,
+            model.search_window_controller,
+        )
+        for parameter in module.parameters()
+    )
+
+
 def test_recovery_decoder_only_owns_exactly_duration_decoder_parameters():
     model = TinyStudent()
     cfg = _cfg()

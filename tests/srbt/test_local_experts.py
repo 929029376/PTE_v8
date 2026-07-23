@@ -1173,6 +1173,71 @@ def test_dispatch_loss_uses_configured_positive_class_weights(monkeypatch):
     torch.testing.assert_close(loss, expected)
 
 
+def test_compound_loss_preserves_multilabel_targets_and_top2_coverage():
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
+    actor.expert_phase = "compound"
+    actor.activation_pos_weight = (1.0, 1.0, 1.0, 1.0)
+    logits = torch.tensor([
+        [[4.0, 4.0, -4.0, -4.0], [-4.0, 4.0, 4.0, -4.0]],
+    ], requires_grad=True)
+    active = torch.tensor([
+        [[True, True, True, False, False],
+         [True, False, True, True, False]],
+    ])
+    labels = torch.zeros(
+        1, 3, len(CHALLENGE_NAMES), dtype=torch.bool)
+    labels[0, 0, CHALLENGE_NAMES.index("motion")] = True
+    labels[0, 0, CHALLENGE_NAMES.index("small_target")] = True
+    labels[0, 1, CHALLENGE_NAMES.index("small_target")] = True
+    labels[0, 1, CHALLENGE_NAMES.index("recovery")] = True
+    predictions = {
+        "compound_activation_logits": logits,
+        "compound_activation_mask": active,
+        "compound_challenge_labels": labels,
+        "compound_present": torch.ones(1, 3, dtype=torch.bool),
+        "compound_selected_iou": torch.tensor([[0.60, 0.65]]),
+        "compound_generalist_iou": torch.tensor([[0.45, 0.50]]),
+    }
+
+    loss, status = actor._compute_compound_loss(predictions)
+    loss.backward()
+
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0
+    assert status["Compound/target_specialists"] == pytest.approx(2.0)
+    assert status["Compound/active_specialists"] == pytest.approx(2.0)
+    assert status["Compound/top2_recall"] == pytest.approx(1.0)
+    assert status["Compound/selected_iou"] == pytest.approx(0.625)
+    assert status["Compound/generalist_iou"] == pytest.approx(0.475)
+
+
+def test_compound_loss_rejects_more_than_configured_active_specialists():
+    actor = object.__new__(PETTrackActor)
+    actor.net = SimpleNamespace(
+        expert_names=list(EXPERT_NAMES),
+        expert_activator=SimpleNamespace(max_specialists=2),
+    )
+    actor.expert_phase = "compound"
+    actor.activation_pos_weight = (1.0, 1.0, 1.0, 1.0)
+    labels = torch.zeros(
+        1, 2, len(CHALLENGE_NAMES), dtype=torch.bool)
+    labels[0, 0, CHALLENGE_NAMES.index("motion")] = True
+    labels[0, 0, CHALLENGE_NAMES.index("small_target")] = True
+    predictions = {
+        "compound_activation_logits": torch.zeros(1, 1, 4),
+        "compound_activation_mask": torch.tensor(
+            [[[True, True, True, True, False]]]),
+        "compound_challenge_labels": labels,
+        "compound_present": torch.ones(1, 2, dtype=torch.bool),
+        "compound_selected_iou": torch.tensor([[0.5]]),
+        "compound_generalist_iou": torch.tensor([[0.5]]),
+    }
+
+    with pytest.raises(ValueError, match="at most 2 specialists"):
+        actor._compute_compound_loss(predictions)
+
+
 @pytest.mark.parametrize("expert_id", [1, 2, 4])
 def test_specialist_advantage_requires_frozen_upstream_box(
         monkeypatch, expert_id):

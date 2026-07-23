@@ -89,6 +89,27 @@ def test_compound_frame_is_reserved_for_dispatch_not_specialization():
     assert labels.tolist() == [True, True, True, False, False, False, False]
 
 
+def test_compound_stage_requires_two_distinct_specialists_per_frame():
+    sampler_module = importlib.import_module("lib.train.data.sampler")
+    sampler = object.__new__(sampler_module.TrackingSampler)
+    labels = {
+        name: torch.zeros(4, dtype=torch.bool)
+        for name in (
+            "small_target", "motion", "low_light", "recovery",
+            "ambiguity", "deformation", "absent",
+        )
+    }
+    labels["motion"][[0, 1, 3]] = True
+    labels["small_target"][[1, 3]] = True
+    labels["low_light"][2] = True
+    labels["ambiguity"][2] = True
+    labels["recovery"][3] = True
+
+    compound = sampler._compound_frame_mask(labels)
+
+    assert compound.tolist() == [False, True, False, True]
+
+
 def test_specialize_keeps_multiple_labels_owned_by_one_specialist():
     sampler_module = importlib.import_module("lib.train.data.sampler")
     sampler = object.__new__(sampler_module.TrackingSampler)

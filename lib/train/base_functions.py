@@ -99,7 +99,7 @@ def build_dataloaders(cfg, settings):
     settings.num_search = (
         int(getattr(cfg.DATA.PURSUIT, "WINDOW_LENGTH", 8))
         if str(getattr(cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
-        == "pursuit"
+        in {"pursuit", "compound"}
         else getattr(cfg.DATA.SEARCH, "NUMBER", 1)
     )
     sampler_mode = getattr(cfg.DATA, "SAMPLER_MODE", "causal")
@@ -197,10 +197,11 @@ def _optimizer_groups(net, cfg):
     expert_phase = str(getattr(
         cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
     if expert_phase not in {
-            "specialize", "refine", "recovery", "pursuit", "dispatch"}:
+            "specialize", "refine", "recovery", "pursuit", "dispatch",
+            "compound"}:
         raise ValueError(
             "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, pursuit, "
-            "or dispatch")
+            "dispatch, or compound")
     expert_fusion = getattr(model, "expert_fusion", None)
     expert_heads = getattr(model, "expert_heads", None)
     specialist_expert_ids = tuple(int(expert_id) for expert_id in getattr(
@@ -395,11 +396,12 @@ def _optimizer_groups(net, cfg):
                 for parameter in proposal_adapters[
                         pursuit_specialist_name].parameters():
                     parameter.requires_grad_(True)
-    elif expert_phase == "dispatch":
+    elif expert_phase in {"dispatch", "compound"}:
         activator = getattr(model, "expert_activator", None)
         if activator is None:
             raise ValueError(
-                "TRAIN.EXPERT_PHASE=dispatch requires MODEL.EXPERT.ENABLE=true")
+                f"TRAIN.EXPERT_PHASE={expert_phase} requires "
+                "MODEL.EXPERT.ENABLE=true")
         for parameter in model.parameters():
             parameter.requires_grad_(False)
         for parameter in activator.parameters():
@@ -426,7 +428,7 @@ def _optimizer_groups(net, cfg):
             "param_count": sum(p.numel() for p in params),
         })
 
-    if expert_phase == "dispatch":
+    if expert_phase in {"dispatch", "compound"}:
         add_group(
             "expert_activator",
             float(getattr(cfg.TRAIN, "ACTIVATOR_LR", lr)),

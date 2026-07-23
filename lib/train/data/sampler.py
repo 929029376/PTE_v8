@@ -79,9 +79,10 @@ class TrackingSampler(torch.utils.data.Dataset):
         train_cfg = getattr(cfg, "TRAIN", None)
         self.expert_phase = str(getattr(
             train_cfg, "EXPERT_PHASE", "specialize")).lower()
+        self.compound_training = self.expert_phase == "compound"
         pursuit_cfg = getattr(data_cfg, "PURSUIT", None)
         self.pursuit_enabled = (
-            self.expert_phase == "pursuit"
+            self.expert_phase in {"pursuit", "compound"}
             and bool(getattr(pursuit_cfg, "ENABLE", False))
         )
         self.pursuit_transition_probability = float(getattr(
@@ -105,10 +106,9 @@ class TrackingSampler(torch.utils.data.Dataset):
             raise ValueError(
                 "TRAIN.SPECIALIST_EXPERT_IDS must contain unique IDs in [1, 4]")
         self.training_expert_ids = (
+            (0,) if self.compound_training else
             (0,) + configured_expert_ids
-            if self.expert_phase == "dispatch"
-            else configured_expert_ids
-        )
+            if self.expert_phase == "dispatch" else configured_expert_ids)
         self.causal_specialist_pursuit = (
             self.expert_phase == "pursuit"
             and len(self.training_expert_ids) == 1
@@ -137,9 +137,9 @@ class TrackingSampler(torch.utils.data.Dataset):
             if self.expert_phase == "specialize" else ()
         )
         self.precise_expert_sampling = (
-            (self.training or self.expert_phase == "dispatch"
+            (self.training or self.expert_phase in {"dispatch", "compound"}
              or self.causal_specialist_pursuit)
-            and (self.expert_phase in {"specialize", "dispatch"}
+            and (self.expert_phase in {"specialize", "dispatch", "compound"}
                  or self.causal_specialist_pursuit)
             and bool(getattr(challenge_cfg, "ENABLE", False))
             and bool(getattr(challenge_cfg, "PRECISE", False))
@@ -483,6 +483,11 @@ class TrackingSampler(torch.utils.data.Dataset):
             dataset, seq_id, seq_info_dict)
         return torch.stack([labels[name][frame_id] for name in CHALLENGE_NAMES])
 
+    @staticmethod
+    def _compound_frame_mask(labels):
+        specialists = expert_supervision_mask(labels)[:, 1:]
+        return specialists.sum(dim=1) >= 2
+
     def _expert_candidate_groups(
             self, dataset, seq_id, seq_info_dict, training_expert_id):
         labels = self._expert_attribute_labels(
@@ -578,7 +583,9 @@ class TrackingSampler(torch.utils.data.Dataset):
         else:
             training_expert_id = (
                 self.training_expert_for_index(index)
-                if self.precise_expert_sampling else None
+                if self.precise_expert_sampling
+                and not bool(getattr(
+                    self, "compound_training", False)) else None
             )
             pursuit_enabled = bool(getattr(
                 self, "pursuit_enabled", False))
@@ -600,6 +607,8 @@ class TrackingSampler(torch.utils.data.Dataset):
         returns:
             TensorDict - dict containing all the data blocks
         """
+        compound_training = bool(getattr(
+            self, "compound_training", False))
         valid = False
         attempts = 0
         max_attempts = max(1, int(getattr(
@@ -629,7 +638,12 @@ class TrackingSampler(torch.utils.data.Dataset):
                         minimum_eligible = None
                         required_frames = None
                         minimum_required = 0
-                        if training_expert_id is not None:
+                        if compound_training:
+                            labels = self._expert_attribute_labels(
+                                dataset, seq_id, seq_info_dict)
+                            eligible_frames = self._compound_frame_mask(labels)
+                            minimum_eligible = self.num_search_frames
+                        elif training_expert_id is not None:
                             labels = self._expert_attribute_labels(
                                 dataset, seq_id, seq_info_dict)
                             supervision_mask = (
@@ -655,7 +669,13 @@ class TrackingSampler(torch.utils.data.Dataset):
                                 minimum_eligible=minimum_eligible)
                         if search_frame_ids is None:
                             continue
-                        if training_expert_id is not None:
+                        if compound_training:
+                            challenge_labels = torch.stack([
+                                self._frame_challenge_labels(
+                                    dataset, seq_id, seq_info_dict, frame_id)
+                                for frame_id in search_frame_ids
+                            ])
+                        elif training_expert_id is not None:
                             sampled_training_expert_id = training_expert_id
                             challenge_labels = torch.stack([
                                 self._frame_challenge_labels(
@@ -753,6 +773,10 @@ class TrackingSampler(torch.utils.data.Dataset):
                         data['pursuit_challenge_labels'] = challenge_labels
                     else:
                         data['challenge_labels'] = challenge_labels
+                elif compound_training:
+                    data['exclusive_specialist_supervision'] = torch.tensor(
+                        False, dtype=torch.bool)
+                    data['pursuit_challenge_labels'] = challenge_labels
                 if self.srbt_enabled:
                     data.update({
                         'redetect_search_images': list(search_aps_frame_list),

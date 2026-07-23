@@ -1605,7 +1605,7 @@ def test_refine_best_uses_stage1_checkpoint_reference():
     assert saved == ["best_stage2"]
 
 
-def test_dispatch_training_disables_all_validation():
+def test_compound_training_disables_all_validation():
     assert default_cfg.TRAIN.SEQUENCE_VAL_ENABLE is False
     assert default_cfg.TRAIN.SEQUENCE_VAL_SCHEDULE == []
     assert default_cfg.TRAIN.BEST_LOADER == "val"
@@ -1616,15 +1616,15 @@ def test_dispatch_training_disables_all_validation():
         .read_text(encoding="utf-8")
     )
 
-    assert experiment["TRAIN"]["EXPERT_PHASE"] == "dispatch"
+    assert experiment["TRAIN"]["EXPERT_PHASE"] == "compound"
     assert experiment["TRAIN"]["SPECIALIST_EXPERT_IDS"] == [1, 2, 3, 4]
-    assert experiment["DATA"]["PURSUIT"]["ENABLE"] is False
+    assert experiment["DATA"]["PURSUIT"]["ENABLE"] is True
     assert experiment["DATA"]["PURSUIT"]["WINDOW_LENGTH"] == 16
     assert experiment["TRAIN"]["SEQUENCE_VAL_ENABLE"] is False
     assert experiment["TRAIN"]["MIN_EPOCH"] == 4
     assert experiment["TRAIN"]["EPOCH"] == 20
     assert experiment["TRAIN"]["REFINE_MAX_EPOCH"] == 12
-    assert experiment["TRAIN"]["LOAD_LATEST"] is True
+    assert experiment["TRAIN"]["LOAD_LATEST"] is False
     assert experiment["TRAIN"]["VAL_START_EPOCH"] == 21
     assert experiment["TRAIN"]["VAL_SCHEDULE"] == []
     assert experiment["TRAIN"]["SEQUENCE_VAL_SCHEDULE"] == []
@@ -1643,9 +1643,9 @@ def test_dispatch_training_disables_all_validation():
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
     assert experiment["TRAIN"]["BEST_LOADER"] == "train"
-    assert experiment["TRAIN"]["BEST_METRIC"] == "Activation/macro_f1"
+    assert experiment["TRAIN"]["BEST_METRIC"] == "Compound/top2_recall"
     assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
-    assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is False
+    assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is True
 
 
 def test_sequence_val_best_disables_incompatible_batch_val_loader():
