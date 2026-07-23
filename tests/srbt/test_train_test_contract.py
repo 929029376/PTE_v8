@@ -1167,6 +1167,18 @@ def test_recovery_stage_report_names_all_active_dart_losses(capsys):
     assert "identity" in report
 
 
+def test_compound_stage_report_names_activation_loss(capsys):
+    from lib.models.pet_track.pet_track import _print_stage_report
+
+    _print_stage_report(None, edict({
+        "TRAIN": edict({"EXPERT_PHASE": "compound"}),
+    }))
+
+    report = capsys.readouterr().out
+    assert "activation" in report
+    assert "invalid_configuration" not in report
+
+
 def test_proposal_identity_config_is_reappearance_only_and_isolated():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file

@@ -1524,6 +1524,7 @@ def _print_stage_report(model, cfg):
             "recovery": ["presence", "reliability", "redetect", "identity"],
             "pursuit": ["pursuit"],
             "dispatch": ["activation"],
+            "compound": ["activation"],
         }.get(expert_phase, ["invalid_configuration"])
     print("PETTrack stage report")
     print("  Train/expert_phase:", expert_phase)
