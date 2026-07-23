@@ -1643,7 +1643,7 @@ def test_compound_training_disables_all_validation():
     assert experiment["TRAIN"]["VISIBILITY_REFERENCE_RGB_FALSE_ACCEPT_RATE"] == 1.0
     assert experiment["TRAIN"]["GENERALIST_MAX_DROP"] == pytest.approx(0.005)
     assert experiment["TRAIN"]["BEST_LOADER"] == "train"
-    assert experiment["TRAIN"]["BEST_METRIC"] == "Compound/iou_delta"
+    assert experiment["TRAIN"]["BEST_METRIC"] == "Compound/joint_iou"
     assert experiment["MODEL"]["EXPERT"]["ACTIVATOR_TRAINED"] is True
     assert experiment["MODEL"]["EXPERT"]["USE_ACTIVATION_INFERENCE"] is True
     assert experiment["MODEL"]["EXPERT"]["COLLABORATION_TRAINED"] is False

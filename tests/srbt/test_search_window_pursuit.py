@@ -804,6 +804,132 @@ def test_pursuit_uses_per_row_sparse_activation_with_fixed_expert_slots():
     )
 
 
+def test_compound_forward_uses_multilabel_experts_without_activation():
+    class CapturingController(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.current_boxes = []
+
+        def forward(self, **kwargs):
+            current_box = kwargs["current_box"]
+            self.current_boxes.append(current_box.detach().clone())
+            return SimpleNamespace(
+                next_box=current_box,
+                inside_logit=current_box[:, 0] * 0.0,
+                quality_logit=current_box[:, 0] * 0.0,
+            )
+
+    class CompoundExperts(torch.nn.Module):
+        expert_names = ["g", "m", "p", "v", "d"]
+        precision_refiner_name = "p"
+        small_target_expert = None
+
+        def __init__(self):
+            super().__init__()
+            self.search_window_controller = CapturingController()
+            self.inference_kwargs = []
+
+        def _encode_runtime_templates(
+                self, static_zi, static_ze, dynamic_zi, dynamic_ze):
+            batch_size = static_zi.shape[0]
+            token = static_zi.new_zeros(batch_size, 1, 1)
+            return token, token, token, token
+
+        def inference(self, **kwargs):
+            self.inference_kwargs.append(dict(kwargs))
+            active = kwargs["active_expert_names"]
+            assert "auto_activate" not in kwargs
+            batch_size = kwargs["xi"].shape[0]
+
+            def output(center):
+                box = kwargs["xi"].new_tensor(
+                    [center, 0.5, 0.2, 0.2]
+                ).reshape(1, 1, 4).expand(batch_size, -1, -1)
+                score = kwargs["xi"].new_full(
+                    (batch_size, 1, 4, 4), center)
+                return {"pred_boxes": box, "score_map": score}
+
+            centers = {
+                "g": 0.2, "m": 0.4, "p": 0.6, "v": 0.7, "d": 0.8}
+            outputs = {"g": output(centers["g"])}
+            outputs.update({
+                name: output(centers[name]) for name in active
+            })
+            presence_logits = kwargs["xi"].new_tensor(
+                [[0.0, 1.0]]).expand(batch_size, -1)
+            return {
+                "expert_outputs": outputs,
+                "presence_predictions": {"logits": presence_logits},
+                "presence_score": presence_logits.softmax(dim=-1)[:, 1],
+            }
+
+    model = CompoundExperts()
+    actor = object.__new__(PETTrackActor)
+    actor.net = model
+    actor.expert_enabled = True
+    actor.expert_phase = "compound"
+    actor.settings = SimpleNamespace(
+        search_area_factor={"search": 2.0},
+        center_jitter_factor={"search": 0.0},
+        motion_center_jitter_multiplier=1.0,
+    )
+    actor.cfg = SimpleNamespace(
+        MODEL=SimpleNamespace(EXPERT=SimpleNamespace(
+            ACTIVATOR_TRAINED=True,
+            USE_ACTIVATION_INFERENCE=True,
+        )),
+        DATA=SimpleNamespace(SEARCH=SimpleNamespace(SIZE=8, FACTOR=2.0)),
+        TRAIN=SimpleNamespace(SPECIALIST_EXPERT_IDS=[1, 2, 3, 4]),
+    )
+    frames = torch.zeros(3, 1, 3, 8, 8)
+    boxes = torch.tensor([
+        [[0.40, 0.40, 0.10, 0.10]],
+        [[0.45, 0.40, 0.10, 0.10]],
+        [[0.50, 0.40, 0.10, 0.10]],
+    ])
+    labels = torch.zeros(
+        1, 3, len(pet_track_actor_module.CHALLENGE_NAMES),
+        dtype=torch.bool)
+    labels[:, 0, pet_track_actor_module.CHALLENGE_NAMES.index(
+        "motion")] = True
+    labels[:, 0, pet_track_actor_module.CHALLENGE_NAMES.index(
+        "small_target")] = True
+    labels[:, 1, pet_track_actor_module.CHALLENGE_NAMES.index(
+        "motion")] = True
+    labels[:, 1, pet_track_actor_module.CHALLENGE_NAMES.index(
+        "ambiguity")] = True
+    labels[:, 2, pet_track_actor_module.CHALLENGE_NAMES.index(
+        "motion")] = True
+    labels[:, 2, pet_track_actor_module.CHALLENGE_NAMES.index(
+        "small_target")] = True
+    data = {
+        "template_images": torch.zeros(2, 1, 3, 4, 4),
+        "template_event_images": torch.zeros(2, 1, 3, 4, 4),
+        "pursuit_search_images": frames,
+        "pursuit_search_event_images": frames,
+        "pursuit_search_anno": boxes,
+        "pursuit_search_present": torch.ones(3, 1, dtype=torch.uint8),
+        "pursuit_challenge_labels": labels,
+    }
+
+    output = actor._forward_pursuit(data)
+
+    assert [
+        call["active_expert_names"] for call in model.inference_kwargs
+    ] == [("m", "p"), ("m", "d")]
+    assert all("auto_activate" not in call for call in model.inference_kwargs)
+    assert output["compound_target_mask"][0, 0].tolist() == [
+        False, True, True, False, False]
+    assert output["compound_target_mask"][0, 1].tolist() == [
+        False, True, False, False, True]
+    torch.testing.assert_close(
+        model.search_window_controller.current_boxes[0],
+        output["compound_expert_image_boxes"][0]["p"].detach())
+    torch.testing.assert_close(
+        model.search_window_controller.current_boxes[1],
+        output["compound_expert_image_boxes"][1]["d"].detach())
+
+
 def test_tracker_prefers_planned_search_state_only_in_local_tracking_modes():
     tracker = object.__new__(InferenceTracker)
     tracker.state = [10.0, 10.0, 5.0, 5.0]

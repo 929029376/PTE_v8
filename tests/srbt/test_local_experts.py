@@ -1173,58 +1173,92 @@ def test_dispatch_loss_uses_configured_positive_class_weights(monkeypatch):
     torch.testing.assert_close(loss, expected)
 
 
-def test_compound_loss_trains_final_localization_and_generalist_advantage():
+def test_compound_loss_backpropagates_only_to_frame_relevant_specialists(
+        monkeypatch):
+    def fake_localization_loss(
+            self, pred_dict, gt_dict, return_status=True):
+        relevant = torch.as_tensor(
+            gt_dict["search_absent"][-1],
+            device=pred_dict["pred_boxes"].device,
+            dtype=torch.bool,
+        )
+        loss = pred_dict["pred_boxes"][relevant].sum()
+        status = {"IoU": 0.5}
+        return (loss, status) if return_status else loss
+
+    monkeypatch.setattr(
+        PETTrackBaseActor, "compute_losses", fake_localization_loss)
     actor = object.__new__(PETTrackActor)
     actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
     actor.expert_phase = "compound"
-    actor.collaboration_temperature = 0.25
-    actor.collaboration_localization_weight = 2.0
-    actor.collaboration_calibration_weight = 1.0
-    actor.collaboration_advantage_weight = 1.0
-    actor.collaboration_advantage_margin = 0.05
-    logits = torch.tensor([[
-        [0.0, 5.0, 3.0, -5.0, -5.0],
-        [0.0, -5.0, 3.0, 5.0, -5.0],
-    ]], requires_grad=True)
-    active = torch.tensor([
-        [[True, True, True, False, False],
-         [True, False, True, True, False]],
-    ])
-    targets = torch.tensor([[
-        [0.40, 0.40, 0.20, 0.20],
-        [0.50, 0.50, 0.20, 0.20],
+    actor.presence_loss_weight = 1.0
+    actor.presence_focal_gamma = 2.0
+    parameters = {
+        name: torch.tensor(0.1 * (index + 1), requires_grad=True)
+        for index, name in enumerate(EXPERT_NAMES)
+    }
+
+    def output(name):
+        value = parameters[name]
+        boxes = value.expand(2, 1, 4)
+        scores = value.expand(2, 1, 2, 2)
+        return {"pred_boxes": boxes, "score_map": scores}
+
+    target_mask = torch.tensor([[
+        [False, True, True, False, False],
+    ], [
+        [False, False, True, True, False],
     ]])
-    boxes = torch.tensor([[
-        [[0.30, 0.30, 0.20, 0.20],
-         [0.39, 0.39, 0.20, 0.20],
-         [0.38, 0.38, 0.20, 0.20],
-         [0.30, 0.30, 0.20, 0.20],
-         [0.30, 0.30, 0.20, 0.20]],
-        [[0.40, 0.40, 0.20, 0.20],
-         [0.40, 0.40, 0.20, 0.20],
-         [0.48, 0.48, 0.20, 0.20],
-         [0.49, 0.49, 0.20, 0.20],
-         [0.40, 0.40, 0.20, 0.20]],
-    ]])
+    image_boxes = torch.stack([
+        parameters[name].expand(2, 4)
+        for name in EXPERT_NAMES
+    ], dim=1).unsqueeze(1)
+    presence_logits = torch.tensor(
+        [[0.2, -0.2], [-0.2, 0.2]], requires_grad=True)
     predictions = {
-        "compound_candidate_logits": logits,
-        "compound_candidate_mask": active,
-        "compound_candidate_boxes": boxes,
-        "compound_targets": targets,
-        "compound_present": torch.ones(1, 2, dtype=torch.bool),
+        "compound_expert_outputs": [{
+            name: output(name) for name in EXPERT_NAMES
+        }],
+        "compound_target_mask": target_mask,
+        "compound_local_targets": torch.full((2, 1, 4), 0.25),
+        "compound_image_boxes": image_boxes,
+        "compound_expert_image_boxes": [{
+            name: parameters[name].expand(2, 4)
+            for name in EXPERT_NAMES
+        }],
+        "compound_image_targets": torch.full((2, 1, 4), 0.25),
+        "compound_present": torch.ones(2, 1, dtype=torch.bool),
+        "compound_presence_logits": [presence_logits],
     }
 
     loss, status = actor._compute_compound_loss(predictions)
     loss.backward()
 
-    assert logits.grad is not None
-    assert logits.grad.abs().sum() > 0
+    assert parameters["generalist"].grad is None
+    assert parameters["motion_fm"].grad is not None
+    assert parameters["precision_refiner"].grad is not None
+    assert parameters["visibility_foc_ov"].grad is not None
+    assert parameters["discrimination_bi"].grad is None
+    assert presence_logits.grad is not None
     assert status["Compound/target_specialists"] == pytest.approx(2.0)
-    assert status["Compound/selected_iou"] > status[
-        "Compound/generalist_iou"]
-    assert status["Compound/iou_delta"] > 0.0
-    assert status["Loss/collaboration_localization"] > 0.0
-    assert status["Loss/collaboration_calibration"] > 0.0
+    assert status["Compound/train_count_1"] == 1
+    assert status["Compound/train_count_2"] == 2
+    assert status["Compound/train_count_3"] == 1
+    assert status["Compound/train_count_4"] == 0
+    assert status["Loss/compound_specialists"] > 0.0
+    assert status["Loss/compound_presence"] > 0.0
+
+
+def test_compound_terminal_follows_the_declared_expert_chain():
+    target_mask = torch.tensor([
+        [False, True, True, False, False],
+        [False, True, False, False, True],
+        [False, True, True, True, True],
+    ])
+
+    terminal = PETTrackActor._compound_terminal_expert_ids(target_mask)
+
+    assert terminal.tolist() == [2, 4, 2]
 
 
 @pytest.mark.parametrize("expert_id", [1, 2, 4])

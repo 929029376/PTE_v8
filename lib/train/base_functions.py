@@ -407,16 +407,28 @@ def _optimizer_groups(net, cfg):
         for parameter in activator.parameters():
             parameter.requires_grad_(True)
     elif expert_phase == "compound":
-        collaboration_gate = getattr(
-            model, "expert_collaboration_gate", None)
-        if collaboration_gate is None:
+        if expert_fusion is None or expert_heads is None:
             raise ValueError(
                 "TRAIN.EXPERT_PHASE=compound requires "
                 "MODEL.EXPERT.ENABLE=true")
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        for parameter in collaboration_gate.parameters():
-            parameter.requires_grad_(True)
+        default_expert = getattr(model, "default_expert", "generalist")
+        for name, expert in expert_fusion.experts.items():
+            if name != default_expert:
+                for parameter in expert.parameters():
+                    parameter.requires_grad_(True)
+        for name, parameter in expert_fusion.residual_scale_logits.items():
+            if name != default_expert:
+                parameter.requires_grad_(True)
+        for module in (
+                expert_heads,
+                getattr(model, "proposal_adapters", None),
+                getattr(model, "small_target_expert", None),
+                getattr(model, "visibility_gate", None)):
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
     lr = cfg.TRAIN.LR
     wd = cfg.TRAIN.WEIGHT_DECAY
     used = set()
@@ -446,9 +458,13 @@ def _optimizer_groups(net, cfg):
             lambda name: name.startswith("expert_activator."))
     elif expert_phase == "compound":
         add_group(
-            "expert_collaboration_gate",
-            float(getattr(cfg.TRAIN, "COLLABORATION_LR", lr)),
-            lambda name: name.startswith("expert_collaboration_gate."))
+            "compound_specialists",
+            lr * float(getattr(
+                cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0)),
+            lambda name: name.startswith((
+                "expert_fusion.", "expert_heads.",
+                "proposal_adapters.", "small_target_expert.",
+                "visibility_gate.")))
     elif expert_phase == "pursuit":
         if pursuit_specialist_name is None:
             add_group(

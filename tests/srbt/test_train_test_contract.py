@@ -1003,7 +1003,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.TRAIN.PROPOSAL_IDENTITY_ONLY is False
 
 
-def test_canonical_compound_stage_trains_collaboration_without_validation():
+def test_canonical_compound_stage_trains_specialists_without_validation():
     from copy import deepcopy
     from lib.config.pet_track.config import cfg, update_config_from_file
 
@@ -1024,16 +1024,13 @@ def test_canonical_compound_stage_trains_collaboration_without_validation():
     assert configured.TRAIN.STAGE == "compound"
     assert configured.TRAIN.EXPERT_PHASE == "compound"
     assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1, 2, 3, 4]
-    assert configured.TRAIN.COLLABORATION_LR == pytest.approx(1e-4)
-    assert configured.TRAIN.COLLABORATION_TEMPERATURE == pytest.approx(0.25)
-    assert configured.TRAIN.COLLABORATION_LOCALIZATION_WEIGHT == pytest.approx(
-        2.0)
-    assert configured.TRAIN.COLLABORATION_CALIBRATION_WEIGHT == pytest.approx(
-        1.0)
-    assert configured.TRAIN.COLLABORATION_ADVANTAGE_WEIGHT == pytest.approx(
-        1.0)
-    assert configured.TRAIN.COLLABORATION_ADVANTAGE_MARGIN == pytest.approx(
-        0.05)
+    assert configured.TRAIN.EXPERT_LR_MULTIPLIER == pytest.approx(5.0)
+    assert "COLLABORATION_LR" not in configured.TRAIN
+    assert "COLLABORATION_TEMPERATURE" not in configured.TRAIN
+    assert "COLLABORATION_LOCALIZATION_WEIGHT" not in configured.TRAIN
+    assert "COLLABORATION_CALIBRATION_WEIGHT" not in configured.TRAIN
+    assert "COLLABORATION_ADVANTAGE_WEIGHT" not in configured.TRAIN
+    assert "COLLABORATION_ADVANTAGE_MARGIN" not in configured.TRAIN
     assert configured.TRAIN.SPECIALIST_EXPERT_SCHEDULE == []
     assert configured.DATA.PURSUIT.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -1052,7 +1049,7 @@ def test_canonical_compound_stage_trains_collaboration_without_validation():
     assert configured.TRAIN.REFINE_MAX_EPOCH == 12
     assert configured.TRAIN.LR == 0.00001
     assert configured.TRAIN.RECOVERY_LR == pytest.approx(0.00001)
-    assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(0.0)
+    assert configured.TRAIN.MOTION_DISPLACEMENT_WEIGHT == pytest.approx(1.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_WEIGHT == pytest.approx(2.0)
     assert configured.TRAIN.DISCRIMINATION_RANKING_MARGIN == pytest.approx(0.2)
     assert configured.TRAIN.ACTIVATOR_LR == pytest.approx(0.00005)
@@ -1105,7 +1102,7 @@ def test_canonical_compound_stage_trains_collaboration_without_validation():
     assert configured.TRAIN.SAVE_LATEST_EACH_EPOCH is True
     assert configured.TRAIN.SAVE_BEST is True
     assert configured.TRAIN.BEST_LOADER == "train"
-    assert configured.TRAIN.BEST_METRIC == "Compound/iou_delta"
+    assert configured.TRAIN.BEST_METRIC == "Compound/joint_iou"
     assert configured.MODEL.EXPERT.COLLABORATION_TRAINED is False
     assert configured.TRAIN.SPECIALIST_GATE_ENABLE is False
     assert configured.TRAIN.SPECIALIST_MIN_COUNT == 100
@@ -1177,7 +1174,7 @@ def test_recovery_stage_report_names_all_active_dart_losses(capsys):
     assert "identity" in report
 
 
-def test_compound_stage_report_names_collaboration_losses(capsys):
+def test_compound_stage_report_names_specialist_losses(capsys):
     from lib.models.pet_track.pet_track import _print_stage_report
 
     _print_stage_report(None, edict({
@@ -1185,7 +1182,11 @@ def test_compound_stage_report_names_collaboration_losses(capsys):
     }))
 
     report = capsys.readouterr().out
-    assert "collaboration" in report
+    assert "specialist_localization" in report
+    assert "joint_chain" in report
+    assert "motion_displacement" in report
+    assert "discrimination_ranking" in report
+    assert "collaboration" not in report
     assert "activation" not in report
     assert "invalid_configuration" not in report
 
@@ -1271,13 +1272,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_compound_v61_run_directory():
+def test_supervisor_uses_isolated_compound_v62_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "compound_collaboration_v61_20260723" in supervisor
+    assert "compound_specialists_v62_20260723" in supervisor
+    assert "compound_collaboration_v61_20260723" not in supervisor
     assert "compound_activation_v60_20260723" not in supervisor
     assert "proposal_identity_coverage_v59_20260723" not in supervisor
     assert "activator_challenge_labels_v58_20260723" not in supervisor
@@ -1324,7 +1326,7 @@ def test_supervisor_uses_isolated_compound_v61_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "compound_collaboration_v61_20260723/logs && exec") == 2
+        "compound_specialists_v62_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

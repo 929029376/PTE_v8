@@ -259,11 +259,10 @@ def test_dispatch_trains_only_the_expert_activator():
     assert [group["name"] for group in groups] == ["expert_activator"]
 
 
-def test_compound_trains_only_the_candidate_collaboration_gate():
+def test_compound_trains_specialist_paths_without_activator_or_gate():
     model = TinyStudent()
     cfg = _cfg()
     cfg.TRAIN.EXPERT_PHASE = "compound"
-    cfg.TRAIN.COLLABORATION_LR = 2e-4
 
     groups = _optimizer_groups(model, cfg)
 
@@ -272,21 +271,38 @@ def test_compound_trains_only_the_candidate_collaboration_gate():
         if parameter.requires_grad
     }
     assert trainable
-    assert all(
-        name.startswith("expert_collaboration_gate.")
+    allowed_prefixes = (
+        "expert_fusion.experts.",
+        "expert_fusion.residual_scale_logits.",
+        "expert_heads.",
+        "proposal_adapters.",
+        "small_target_expert.",
+        "visibility_gate.",
+    )
+    assert all(name.startswith(allowed_prefixes) for name in trainable)
+    assert not any(
+        name.startswith((
+            "expert_fusion.experts.generalist.",
+            "expert_fusion.residual_scale_logits.generalist",
+            "expert_activator.",
+            "expert_collaboration_gate.",
+            "backbone.",
+            "memory.",
+            "box_head.",
+            "localization_validity_gate.",
+            "duration_evidence_decoder.",
+            "rgb_identity_verifier.",
+            "redetect_expert.",
+            "search_window_controller.",
+        ))
         for name in trainable
     )
-    assert not any(
-        parameter.requires_grad
-        for parameter in model.expert_activator.parameters()
-    )
-    assert [group["name"] for group in groups] == [
-        "expert_collaboration_gate"
-    ]
-    assert groups[0]["lr"] == pytest.approx(2e-4)
+    assert [group["name"] for group in groups] == ["compound_specialists"]
+    assert groups[0]["lr"] == pytest.approx(5e-4)
     assert {id(parameter) for parameter in groups[0]["params"]} == {
         id(parameter)
-        for parameter in model.expert_collaboration_gate.parameters()
+        for parameter in model.parameters()
+        if parameter.requires_grad
     }
 
 
