@@ -804,7 +804,8 @@ def test_pursuit_uses_per_row_sparse_activation_with_fixed_expert_slots():
     )
 
 
-def test_compound_forward_uses_multilabel_experts_without_activation():
+def test_compound_forward_uses_multilabel_experts_without_activation(
+        monkeypatch):
     class CapturingController(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -813,10 +814,12 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
         def forward(self, **kwargs):
             current_box = kwargs["current_box"]
             self.current_boxes.append(current_box.detach().clone())
+            next_box = current_box.clone()
+            next_box[:, 0] += 0.1
             return SimpleNamespace(
-                next_box=current_box,
-                inside_logit=current_box[:, 0] * 0.0,
-                quality_logit=current_box[:, 0] * 0.0,
+                next_box=next_box,
+                inside_logit=next_box[:, 0] * 0.0,
+                quality_logit=next_box[:, 0] * 0.0,
             )
 
     class CompoundExperts(torch.nn.Module):
@@ -871,6 +874,15 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
                 "presence_score": presence_logits.softmax(dim=-1)[:, 1],
             }
 
+    captured_anchors = []
+    real_crop = dynamic_search_crop
+
+    def capture_crop(images, anchor_boxes, search_factor, output_size):
+        captured_anchors.append(anchor_boxes.detach().clone())
+        return real_crop(images, anchor_boxes, search_factor, output_size)
+
+    monkeypatch.setattr(
+        pet_track_actor_module, "dynamic_search_crop", capture_crop)
     model = CompoundExperts()
     actor = object.__new__(PETTrackActor)
     actor.net = model
@@ -946,6 +958,12 @@ def test_compound_forward_uses_multilabel_experts_without_activation():
     torch.testing.assert_close(
         model.search_window_controller.current_boxes[1],
         output["compound_expert_image_boxes"][1]["d"].detach())
+    expected_next_box = (
+        model.search_window_controller.current_boxes[0].clone())
+    expected_next_box[:, 0] += 0.1
+    torch.testing.assert_close(
+        output["pursuit_predictions"][0].next_box, expected_next_box)
+    torch.testing.assert_close(captured_anchors[2], expected_next_box)
 
 
 def test_tracker_prefers_planned_search_state_only_in_local_tracking_modes():

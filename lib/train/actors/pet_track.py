@@ -1028,7 +1028,7 @@ class PETTrackActor(PETTrackBaseActor):
                     event_center=event_center.detach(),
                     event_confidence=event_confidence.detach(),
                 )
-                if specialist_id is not None or compound_training:
+                if specialist_id is not None:
                     # Specialist stages must close the loop with the same
                     # candidate that receives their localization loss.
                     prediction.next_box = observation.detach()
