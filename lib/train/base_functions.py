@@ -396,7 +396,7 @@ def _optimizer_groups(net, cfg):
                 for parameter in proposal_adapters[
                         pursuit_specialist_name].parameters():
                     parameter.requires_grad_(True)
-    elif expert_phase in {"dispatch", "compound"}:
+    elif expert_phase == "dispatch":
         activator = getattr(model, "expert_activator", None)
         if activator is None:
             raise ValueError(
@@ -405,6 +405,17 @@ def _optimizer_groups(net, cfg):
         for parameter in model.parameters():
             parameter.requires_grad_(False)
         for parameter in activator.parameters():
+            parameter.requires_grad_(True)
+    elif expert_phase == "compound":
+        collaboration_gate = getattr(
+            model, "expert_collaboration_gate", None)
+        if collaboration_gate is None:
+            raise ValueError(
+                "TRAIN.EXPERT_PHASE=compound requires "
+                "MODEL.EXPERT.ENABLE=true")
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in collaboration_gate.parameters():
             parameter.requires_grad_(True)
     lr = cfg.TRAIN.LR
     wd = cfg.TRAIN.WEIGHT_DECAY
@@ -428,11 +439,16 @@ def _optimizer_groups(net, cfg):
             "param_count": sum(p.numel() for p in params),
         })
 
-    if expert_phase in {"dispatch", "compound"}:
+    if expert_phase == "dispatch":
         add_group(
             "expert_activator",
             float(getattr(cfg.TRAIN, "ACTIVATOR_LR", lr)),
             lambda name: name.startswith("expert_activator."))
+    elif expert_phase == "compound":
+        add_group(
+            "expert_collaboration_gate",
+            float(getattr(cfg.TRAIN, "COLLABORATION_LR", lr)),
+            lambda name: name.startswith("expert_collaboration_gate."))
     elif expert_phase == "pursuit":
         if pursuit_specialist_name is None:
             add_group(

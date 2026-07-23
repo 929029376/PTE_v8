@@ -5,6 +5,7 @@ from lib.models.layers.expert_ensemble import (
     ExpertActivator,
     fuse_expert_predictions,
     normalized_response_psr,
+    select_expert_weights,
 )
 
 
@@ -106,6 +107,35 @@ def test_localization_validity_ranks_candidates_before_response_quality():
 
     assert result.retained_ids == (1,)
     assert torch.equal(result.box, boxes[1])
+
+
+def test_straight_through_selection_matches_test_fallback_rule():
+    quality = torch.tensor(
+        [[0.60, 0.62, 0.90], [0.60, 0.70, 0.20]],
+        requires_grad=True,
+    )
+    eligible = torch.tensor([
+        [True, True, False],
+        [True, True, True],
+    ])
+
+    weights, selected = select_expert_weights(
+        quality,
+        eligible=eligible,
+        specialist_margin=1.05,
+        minimum_quality=0.10,
+        temperature=0.25,
+        straight_through=True,
+    )
+
+    assert selected.tolist() == [0, 1]
+    torch.testing.assert_close(
+        weights.detach(),
+        torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+    )
+    weights[:, 1].sum().backward()
+    assert quality.grad is not None
+    assert quality.grad.abs().sum() > 0
 
 
 def test_zero_quality_falls_back_to_generalist():

@@ -485,7 +485,7 @@ def test_track_commits_final_refined_motion_event_once(monkeypatch):
     assert tracker.state == trusted_state
 
 
-def test_tracker_uses_all_experts_without_hidden_selector_history():
+def test_tracker_uses_trained_collaboration_without_hidden_selector_history():
     class Thor:
         def begin_frame(self):
             return torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)
@@ -504,11 +504,15 @@ def test_tracker_uses_all_experts_without_hidden_selector_history():
                         score,
                     ),
                     "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2]]]),
+                    "collaboration_predictions": {
+                        "score": torch.tensor([collaboration_score]),
+                    },
                 }
-                for name, score in zip(
+                for name, score, collaboration_score in zip(
                     ("generalist", "motion_fm", "precision_refiner",
                      "visibility_foc_ov", "discrimination_bi"),
                     (0.5, 0.6, 0.7, 0.8, 0.9),
+                    (0.2, 0.95, 0.4, 0.3, 0.5),
                 )
             }
             return {
@@ -526,6 +530,7 @@ def test_tracker_uses_all_experts_without_hidden_selector_history():
     tracker.output_window = torch.ones(1, 1, 2, 2)
     tracker.params = SimpleNamespace(search_size=32)
     tracker.map_box_back = lambda box, factor, reference: box
+    tracker.collaboration_trained = True
     search = torch.zeros(1, 3, 32, 32)
 
     candidate = tracker._run_local_candidate(
@@ -535,7 +540,7 @@ def test_tracker_uses_all_experts_without_hidden_selector_history():
     assert len(tracker.network.calls) == 1
     assert "previous_expert_probabilities" not in tracker.network.calls[0]
     assert tracker.network.calls[0]["small_template_features"] is None
-    assert candidate["retained_expert_ids"] == (4,)
+    assert candidate["retained_expert_ids"] == (1,)
     assert candidate["ensemble_weights"].shape == (5,)
     assert int(torch.count_nonzero(candidate["ensemble_weights"])) == 1
     assert len(candidate["expert_states"]) == 5

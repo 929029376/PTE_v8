@@ -33,12 +33,13 @@ from lib.utils.box_ops import box_xyxy_to_cxcywh
 
 
 class PETTrack(nn.Module):
-    ARCHITECTURE_VERSION = 30
+    ARCHITECTURE_VERSION = 31
     _PET_STATE_PREFIXES = (
         "visibility_gate.", "rgb_identity_verifier.", "redetect_expert.",
         "small_target_expert.", "proposal_adapters.",
         "search_window_controller.", "expert_activator.",
-        "localization_validity_gate.", "duration_evidence_decoder.")
+        "expert_collaboration_gate.", "localization_validity_gate.",
+        "duration_evidence_decoder.")
 
     def __init__(self, transformer, memory, box_head, cfg,
                  aux_loss=False, head_type="CORNER"):
@@ -133,6 +134,9 @@ class PETTrack(nn.Module):
                 max_specialists=int(getattr(
                     expert_cfg, "MAX_ACTIVE_SPECIALISTS", 2)),
             )
+            self.expert_collaboration_gate = LocalizationValidityGate(
+                hidden_dim=int(getattr(
+                    expert_cfg, "COLLABORATION_HIDDEN_DIM", 32)))
         else:
             self.expert_names = ["generalist"]
             self.shared_expert_names = list(self.expert_names)
@@ -146,6 +150,7 @@ class PETTrack(nn.Module):
             self.motion_expert_name = None
             self.discrimination_expert_name = None
             self.expert_activator = None
+            self.expert_collaboration_gate = None
 
         srbt_cfg = getattr(cfg.MODEL, "SRBT", None)
         self.srbt_enabled = bool(getattr(srbt_cfg, "ENABLE", False)) if srbt_cfg is not None else False
@@ -396,6 +401,14 @@ class PETTrack(nn.Module):
                 observability, localization_score),
         }
 
+    def _candidate_collaboration(self, score_map, pred_boxes):
+        logits = self.expert_collaboration_gate(
+            score_map, pred_boxes[:, 0])
+        return {
+            "logits": logits,
+            "score": logits.softmax(dim=-1)[:, 1],
+        }
+
     def _attach_expert_reliability(self, expert_outputs, observability):
         for expert_output in expert_outputs.values():
             expert_output["reliability_predictions"] = (
@@ -403,6 +416,12 @@ class PETTrack(nn.Module):
                     expert_output["score_map"],
                     expert_output["pred_boxes"],
                     observability,
+                )
+            )
+            expert_output["collaboration_predictions"] = (
+                self._candidate_collaboration(
+                    expert_output["score_map"],
+                    expert_output["pred_boxes"],
                 )
             )
 
@@ -1028,6 +1047,12 @@ class PETTrack(nn.Module):
             small_output["pred_boxes"],
             out["presence_score"],
         )
+        small_output["collaboration_predictions"] = (
+            self._candidate_collaboration(
+                small_output["score_map"],
+                small_output["pred_boxes"],
+            )
+        )
         active_experts = tuple(
             name for name in self.expert_names
             if name in shared_outputs or name == self.precision_refiner_name
@@ -1367,6 +1392,9 @@ def _load_retained_model_checkpoint(
     if source_version is None or source_version < 30:
         migration_prefixes = (
             *migration_prefixes, "duration_evidence_decoder.")
+    if source_version is None or source_version < 31:
+        migration_prefixes = (
+            *migration_prefixes, "expert_collaboration_gate.")
     extension_prefixes = ("_pet_architecture_version", *migration_prefixes)
     retained = sorted(
         key for key in target if not key.startswith(extension_prefixes))
@@ -1524,7 +1552,7 @@ def _print_stage_report(model, cfg):
             "recovery": ["presence", "reliability", "redetect", "identity"],
             "pursuit": ["pursuit"],
             "dispatch": ["activation"],
-            "compound": ["activation"],
+            "compound": ["collaboration"],
         }.get(expert_phase, ["invalid_configuration"])
     print("PETTrack stage report")
     print("  Train/expert_phase:", expert_phase)

@@ -1173,31 +1173,45 @@ def test_dispatch_loss_uses_configured_positive_class_weights(monkeypatch):
     torch.testing.assert_close(loss, expected)
 
 
-def test_compound_loss_preserves_multilabel_targets_and_top2_coverage():
+def test_compound_loss_trains_final_localization_and_generalist_advantage():
     actor = object.__new__(PETTrackActor)
     actor.net = SimpleNamespace(expert_names=list(EXPERT_NAMES))
     actor.expert_phase = "compound"
-    actor.activation_pos_weight = (1.0, 1.0, 1.0, 1.0)
-    logits = torch.tensor([
-        [[4.0, 4.0, -4.0, -4.0], [-4.0, 4.0, 4.0, -4.0]],
-    ], requires_grad=True)
+    actor.collaboration_temperature = 0.25
+    actor.collaboration_localization_weight = 2.0
+    actor.collaboration_calibration_weight = 1.0
+    actor.collaboration_advantage_weight = 1.0
+    actor.collaboration_advantage_margin = 0.05
+    logits = torch.tensor([[
+        [0.0, 5.0, 3.0, -5.0, -5.0],
+        [0.0, -5.0, 3.0, 5.0, -5.0],
+    ]], requires_grad=True)
     active = torch.tensor([
         [[True, True, True, False, False],
          [True, False, True, True, False]],
     ])
-    labels = torch.zeros(
-        1, 3, len(CHALLENGE_NAMES), dtype=torch.bool)
-    labels[0, 0, CHALLENGE_NAMES.index("motion")] = True
-    labels[0, 0, CHALLENGE_NAMES.index("small_target")] = True
-    labels[0, 1, CHALLENGE_NAMES.index("small_target")] = True
-    labels[0, 1, CHALLENGE_NAMES.index("recovery")] = True
+    targets = torch.tensor([[
+        [0.40, 0.40, 0.20, 0.20],
+        [0.50, 0.50, 0.20, 0.20],
+    ]])
+    boxes = torch.tensor([[
+        [[0.30, 0.30, 0.20, 0.20],
+         [0.39, 0.39, 0.20, 0.20],
+         [0.38, 0.38, 0.20, 0.20],
+         [0.30, 0.30, 0.20, 0.20],
+         [0.30, 0.30, 0.20, 0.20]],
+        [[0.40, 0.40, 0.20, 0.20],
+         [0.40, 0.40, 0.20, 0.20],
+         [0.48, 0.48, 0.20, 0.20],
+         [0.49, 0.49, 0.20, 0.20],
+         [0.40, 0.40, 0.20, 0.20]],
+    ]])
     predictions = {
-        "compound_activation_logits": logits,
-        "compound_activation_mask": active,
-        "compound_challenge_labels": labels,
-        "compound_present": torch.ones(1, 3, dtype=torch.bool),
-        "compound_selected_iou": torch.tensor([[0.60, 0.65]]),
-        "compound_generalist_iou": torch.tensor([[0.45, 0.50]]),
+        "compound_candidate_logits": logits,
+        "compound_candidate_mask": active,
+        "compound_candidate_boxes": boxes,
+        "compound_targets": targets,
+        "compound_present": torch.ones(1, 2, dtype=torch.bool),
     }
 
     loss, status = actor._compute_compound_loss(predictions)
@@ -1206,39 +1220,11 @@ def test_compound_loss_preserves_multilabel_targets_and_top2_coverage():
     assert logits.grad is not None
     assert logits.grad.abs().sum() > 0
     assert status["Compound/target_specialists"] == pytest.approx(2.0)
-    assert status["Compound/active_specialists"] == pytest.approx(2.0)
-    assert status["Compound/top2_recall"] == pytest.approx(1.0)
-    assert status["Compound/selected_iou"] == pytest.approx(0.625)
-    assert status["Compound/generalist_iou"] == pytest.approx(0.475)
-
-
-@pytest.mark.parametrize("return_status", [True, False])
-def test_compound_loss_rejects_more_than_configured_active_specialists(
-        return_status):
-    actor = object.__new__(PETTrackActor)
-    actor.net = SimpleNamespace(
-        expert_names=list(EXPERT_NAMES),
-        expert_activator=SimpleNamespace(max_specialists=2),
-    )
-    actor.expert_phase = "compound"
-    actor.activation_pos_weight = (1.0, 1.0, 1.0, 1.0)
-    labels = torch.zeros(
-        1, 2, len(CHALLENGE_NAMES), dtype=torch.bool)
-    labels[0, 0, CHALLENGE_NAMES.index("motion")] = True
-    labels[0, 0, CHALLENGE_NAMES.index("small_target")] = True
-    predictions = {
-        "compound_activation_logits": torch.zeros(1, 1, 4),
-        "compound_activation_mask": torch.tensor(
-            [[[True, True, True, True, False]]]),
-        "compound_challenge_labels": labels,
-        "compound_present": torch.ones(1, 2, dtype=torch.bool),
-        "compound_selected_iou": torch.tensor([[0.5]]),
-        "compound_generalist_iou": torch.tensor([[0.5]]),
-    }
-
-    with pytest.raises(ValueError, match="at most 2 specialists"):
-        actor._compute_compound_loss(
-            predictions, return_status=return_status)
+    assert status["Compound/selected_iou"] > status[
+        "Compound/generalist_iou"]
+    assert status["Compound/iou_delta"] > 0.0
+    assert status["Loss/collaboration_localization"] > 0.0
+    assert status["Loss/collaboration_calibration"] > 0.0
 
 
 @pytest.mark.parametrize("expert_id", [1, 2, 4])

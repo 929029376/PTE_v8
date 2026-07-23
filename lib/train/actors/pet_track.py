@@ -17,7 +17,10 @@ from lib.train.data.felt_challenges import (
     exclusive_specialist_supervision_mask,
     expert_supervision_mask,
 )
-from lib.models.layers.expert_ensemble import normalized_response_psr
+from lib.models.layers.expert_ensemble import (
+    normalized_response_psr,
+    select_expert_weights,
+)
 from lib.models.layers.srbt_controller import Action
 from lib.models.layers.search_window_controller import (
     crop_box_to_image,
@@ -82,6 +85,16 @@ class PETTrackActor(PETTrackBaseActor):
             cfg.TRAIN, "ACTIVATOR_ADVANTAGE_MARGIN", 0.02))
         self.activation_pos_weight = tuple(float(value) for value in getattr(
             cfg.TRAIN, "ACTIVATOR_POS_WEIGHT", (1.0, 1.0, 1.0, 1.0)))
+        self.collaboration_temperature = float(getattr(
+            cfg.TRAIN, "COLLABORATION_TEMPERATURE", 0.25))
+        self.collaboration_localization_weight = float(getattr(
+            cfg.TRAIN, "COLLABORATION_LOCALIZATION_WEIGHT", 2.0))
+        self.collaboration_calibration_weight = float(getattr(
+            cfg.TRAIN, "COLLABORATION_CALIBRATION_WEIGHT", 1.0))
+        self.collaboration_advantage_weight = float(getattr(
+            cfg.TRAIN, "COLLABORATION_ADVANTAGE_WEIGHT", 1.0))
+        self.collaboration_advantage_margin = float(getattr(
+            cfg.TRAIN, "COLLABORATION_ADVANTAGE_MARGIN", 0.05))
         if (not math.isfinite(self.expert_advantage_weight)
                 or self.expert_advantage_weight <= 0.0):
             raise ValueError(
@@ -112,7 +125,7 @@ class PETTrackActor(PETTrackBaseActor):
             raise ValueError(
                 "TRAIN.EXPERT_PHASE must be specialize, refine, recovery, "
                 "pursuit, dispatch, or compound")
-        if self.expert_phase in {"dispatch", "compound"}:
+        if self.expert_phase == "dispatch":
             specialist_count = max(
                 len(getattr(expert_cfg, "NAMES", ())) - 1, 0)
             if (len(self.activation_pos_weight) != specialist_count
@@ -121,11 +134,30 @@ class PETTrackActor(PETTrackBaseActor):
                 raise ValueError(
                     "TRAIN.ACTIVATOR_POS_WEIGHT must contain one finite "
                     "positive value per specialist")
+        collaboration_scalars = {
+            "COLLABORATION_TEMPERATURE": self.collaboration_temperature,
+            "COLLABORATION_LOCALIZATION_WEIGHT":
+                self.collaboration_localization_weight,
+            "COLLABORATION_CALIBRATION_WEIGHT":
+                self.collaboration_calibration_weight,
+            "COLLABORATION_ADVANTAGE_WEIGHT":
+                self.collaboration_advantage_weight,
+        }
+        for name, value in collaboration_scalars.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"TRAIN.{name} must be finite and positive")
+        if (not math.isfinite(self.collaboration_advantage_margin)
+                or not 0.0 <= self.collaboration_advantage_margin <= 1.0):
+            raise ValueError(
+                "TRAIN.COLLABORATION_ADVANTAGE_MARGIN must be in [0, 1]")
         self.stage = self.expert_phase if self.expert_enabled else (
             "srbt" if self.srbt_enabled else "base")
         self.active_losses = (
             {"activation"}
-            if self.expert_phase in {"dispatch", "compound"}
+            if self.expert_phase == "dispatch"
+            else
+            {"collaboration"}
+            if self.expert_phase == "compound"
             else
             {"pursuit"}
             if self.expert_phase == "pursuit"
@@ -157,8 +189,11 @@ class PETTrackActor(PETTrackBaseActor):
                                     for parameter in parameters)):
                         module.train(True)
             return
-        if self.expert_phase in {"dispatch", "compound"}:
+        if self.expert_phase == "dispatch":
             model.expert_activator.train(mode)
+            return
+        if self.expert_phase == "compound":
+            model.expert_collaboration_gate.train(mode)
             return
         if getattr(self, "dart_decoder_only", False):
             model.duration_evidence_decoder.train(mode)
@@ -720,17 +755,19 @@ class PETTrackActor(PETTrackBaseActor):
         specialist_discrimination_present = []
         specialist_image_boxes = []
         specialist_image_targets = []
-        compound_activation_logits = []
-        compound_activation_masks = []
-        compound_selected_iou = []
-        compound_generalist_iou = []
+        compound_candidate_logits = []
+        compound_candidate_masks = []
+        compound_target_masks = []
+        compound_candidate_boxes = []
+        compound_targets = []
         expert_cfg = getattr(
             getattr(self.cfg, "MODEL", None), "EXPERT", None)
         use_activation = bool(getattr(
             expert_cfg, "USE_ACTIVATION_INFERENCE", False))
         if compound_training and not use_activation:
             raise RuntimeError(
-                "compound training requires automatic expert activation")
+                "compound collaboration requires the deployed sparse "
+                "expert activation path")
         if specialist_id is not None and use_activation:
             raise RuntimeError(
                 "causal specialist pursuit uses the declared expert directly")
@@ -852,8 +889,6 @@ class PETTrackActor(PETTrackBaseActor):
                             specialist_name,)
                     elif use_activation:
                         inference_kwargs["auto_activate"] = True
-                        inference_kwargs["return_activation_logits"] = (
-                            compound_training)
                     output = model.inference(**inference_kwargs)
                     expert_outputs = output.get("expert_outputs")
                     if not expert_outputs:
@@ -919,21 +954,40 @@ class PETTrackActor(PETTrackBaseActor):
                         ~active_mask, 0.0)
                     response_psr = response_psr.masked_fill(
                         ~active_mask, 0.0)
-                    reliability = (
-                        response_peaks.clamp(0.0, 1.0)
-                        * response_psr.clamp(0.0, 1.0)
-                    )
-                    reliability = torch.where(
-                        active_mask, reliability.clamp_min(1e-6),
-                        torch.zeros_like(reliability))
-                    expert_weights = reliability / reliability.sum(
-                        dim=1, keepdim=True).clamp_min(1e-6)
-                    observation = (
-                        expert_boxes[:, specialist_id]
-                        if specialist_id is not None
-                        else (expert_weights[..., None] * expert_boxes).sum(
-                            dim=1)
-                    )
+                    if compound_training:
+                        collaboration_logits = torch.stack([
+                            item["collaboration_predictions"]["logits"][:, 1]
+                            - item["collaboration_predictions"]["logits"][:, 0]
+                            for item in ordered
+                        ], dim=1)
+                        collaboration_quality = collaboration_logits.sigmoid()
+                        expert_weights, _ = select_expert_weights(
+                            collaboration_quality,
+                            eligible=active_mask,
+                            specialist_margin=1.05,
+                            minimum_quality=0.10,
+                            temperature=self.collaboration_temperature,
+                            straight_through=True,
+                        )
+                        observation = (
+                            expert_weights[..., None]
+                            * expert_boxes.detach()
+                        ).sum(dim=1)
+                    elif specialist_id is not None:
+                        observation = expert_boxes[:, specialist_id]
+                    else:
+                        reliability = (
+                            response_peaks.clamp(0.0, 1.0)
+                            * response_psr.clamp(0.0, 1.0)
+                        )
+                        reliability = torch.where(
+                            active_mask, reliability.clamp_min(1e-6),
+                            torch.zeros_like(reliability))
+                        expert_weights = reliability / reliability.sum(
+                            dim=1, keepdim=True).clamp_min(1e-6)
+                        observation = (
+                            expert_weights[..., None] * expert_boxes
+                        ).sum(dim=1)
                     presence_score = output.get("presence_score")
                     if presence_score is None:
                         presence_score = frames.new_ones(frames.shape[0])
@@ -949,7 +1003,7 @@ class PETTrackActor(PETTrackBaseActor):
                     event_center=event_center.detach(),
                     event_confidence=event_confidence.detach(),
                 )
-                if specialist_id is not None:
+                if specialist_id is not None or compound_training:
                     # Specialist stages must close the loop with the same
                     # candidate that receives their localization loss.
                     prediction.next_box = observation.detach()
@@ -959,18 +1013,25 @@ class PETTrackActor(PETTrackBaseActor):
                 current_quality = self._aligned_iou_xywh(
                     observation, annotations[:, frame_index])
                 if compound_training:
-                    activation_logits = output.get(
-                        "expert_activation_logits")
-                    if activation_logits is None:
-                        raise RuntimeError(
-                            "compound training requires activation logits")
-                    compound_activation_logits.append(activation_logits)
-                    compound_activation_masks.append(active_mask)
-                    compound_selected_iou.append(current_quality.detach())
-                    compound_generalist_iou.append(
-                        self._aligned_iou_xywh(
-                            expert_boxes[:, 0],
-                            annotations[:, frame_index]).detach())
+                    frame_labels = compound_challenge_labels[:, frame_index]
+                    attributes = {
+                        name: frame_labels[:, index]
+                        for index, name in enumerate(CHALLENGE_NAMES)
+                    }
+                    target_mask = expert_supervision_mask(attributes).to(
+                        device=search.device, dtype=torch.bool)
+                    target_mask[:, 0] = True
+                    for expert_id in range(1, len(model.expert_names)):
+                        if expert_id != VISIBILITY_EXPERT_ID:
+                            target_mask[:, expert_id] &= present[
+                                :, frame_index]
+                    compound_candidate_logits.append(
+                        collaboration_logits)
+                    compound_candidate_masks.append(active_mask)
+                    compound_target_masks.append(target_mask)
+                    compound_candidate_boxes.append(expert_boxes.detach())
+                    compound_targets.append(
+                        annotations[:, frame_index].detach())
                 if specialist_id is not None:
                     region_xy = crop_region[:, :2]
                     region_wh = crop_region[:, 2:]
@@ -1028,16 +1089,17 @@ class PETTrackActor(PETTrackBaseActor):
         }
         if compound_training:
             result.update({
-                "compound_activation_logits": torch.stack(
-                    compound_activation_logits, dim=1),
-                "compound_activation_mask": torch.stack(
-                    compound_activation_masks, dim=1),
-                "compound_challenge_labels": compound_challenge_labels,
-                "compound_present": present,
-                "compound_selected_iou": torch.stack(
-                    compound_selected_iou, dim=1),
-                "compound_generalist_iou": torch.stack(
-                    compound_generalist_iou, dim=1),
+                "compound_candidate_logits": torch.stack(
+                    compound_candidate_logits, dim=1),
+                "compound_candidate_mask": torch.stack(
+                    compound_candidate_masks, dim=1),
+                "compound_target_mask": torch.stack(
+                    compound_target_masks, dim=1),
+                "compound_candidate_boxes": torch.stack(
+                    compound_candidate_boxes, dim=1),
+                "compound_targets": torch.stack(
+                    compound_targets, dim=1),
+                "compound_present": present[:, :-1],
             })
         return result
 
@@ -1433,108 +1495,169 @@ class PETTrackActor(PETTrackBaseActor):
         return loss, status
 
     def _compute_compound_loss(self, predictions, return_status=True):
-        logits = predictions.get("compound_activation_logits")
-        active_mask = predictions.get("compound_activation_mask")
-        challenge_labels = predictions.get("compound_challenge_labels")
+        logits = predictions.get("compound_candidate_logits")
+        active_mask = predictions.get("compound_candidate_mask")
+        target_mask = predictions.get("compound_target_mask")
+        candidate_boxes = predictions.get("compound_candidate_boxes")
+        targets = predictions.get("compound_targets")
         present = predictions.get("compound_present")
-        selected_iou = predictions.get("compound_selected_iou")
-        generalist_iou = predictions.get("compound_generalist_iou")
         if any(value is None for value in (
-                logits, active_mask, challenge_labels, present,
-                selected_iou, generalist_iou)):
+                logits, active_mask, candidate_boxes, targets, present)):
             raise RuntimeError(
-                "compound training requires causal activation diagnostics")
+                "compound training requires causal candidate diagnostics")
         logits = logits.float()
         if logits.ndim != 3:
             raise ValueError(
-                "compound activation logits must have shape (B,S,E-1)")
-        batch_size, steps, specialist_count = logits.shape
+                "compound candidate logits must have shape (B,S,E)")
+        batch_size, steps, expert_count = logits.shape
         model = self.net.module if hasattr(self.net, "module") else self.net
-        if specialist_count != len(model.expert_names) - 1:
+        if expert_count != len(model.expert_names):
             raise ValueError(
-                "compound activation logits must cover every specialist")
+                "compound candidate logits must cover every expert")
         active_mask = torch.as_tensor(
             active_mask, device=logits.device, dtype=torch.bool)
-        if active_mask.shape != (
-                batch_size, steps, len(model.expert_names)):
+        if active_mask.shape != logits.shape:
             raise ValueError(
-                "compound activation mask must have shape (B,S,E)")
-        challenge_labels = torch.as_tensor(
-            challenge_labels, device=logits.device, dtype=torch.bool)
-        if (challenge_labels.ndim != 3
-                or challenge_labels.shape[0] != batch_size
-                or challenge_labels.shape[1] < steps
-                or challenge_labels.shape[2] != len(CHALLENGE_NAMES)):
+                "compound candidate mask must have shape (B,S,E)")
+        if not bool(active_mask[..., 0].all()):
             raise ValueError(
-                "compound challenge labels must have shape (B,T,C)")
+                "the generalist must remain available for every compound row")
+        if target_mask is None:
+            target_mask = active_mask
+        else:
+            target_mask = torch.as_tensor(
+                target_mask, device=logits.device, dtype=torch.bool)
+            if target_mask.shape != logits.shape:
+                raise ValueError(
+                    "compound target mask must have shape (B,S,E)")
+            if not bool(target_mask[..., 0].all()):
+                raise ValueError(
+                    "the generalist must be present in every target mask")
+        candidate_boxes = torch.as_tensor(
+            candidate_boxes, device=logits.device, dtype=logits.dtype)
+        if candidate_boxes.shape != (
+                batch_size, steps, expert_count, 4):
+            raise ValueError(
+                "compound candidate boxes must have shape (B,S,E,4)")
+        targets = torch.as_tensor(
+            targets, device=logits.device, dtype=logits.dtype)
+        if targets.shape != (batch_size, steps, 4):
+            raise ValueError("compound targets must have shape (B,S,4)")
         present = torch.as_tensor(
             present, device=logits.device, dtype=torch.bool)
-        if present.ndim != 2 or present.shape[0] != batch_size \
-                or present.shape[1] < steps:
-            raise ValueError("compound presence must have shape (B,T)")
+        if present.shape != (batch_size, steps):
+            raise ValueError("compound presence must have shape (B,S)")
 
-        current_labels = challenge_labels[:, :steps]
-        attributes = {
-            name: current_labels[..., index].reshape(-1)
-            for index, name in enumerate(CHALLENGE_NAMES)
-        }
-        targets = expert_supervision_mask(attributes).to(
-            logits.device)[:, 1:].reshape(
-                batch_size, steps, specialist_count)
-        current_present = present[:, :steps]
-        for expert_id in range(1, len(model.expert_names)):
-            if expert_id != VISIBILITY_EXPERT_ID:
-                targets[..., expert_id - 1] &= current_present
-        target_count = targets.sum(dim=-1)
-        if not bool((target_count >= 2).all()):
+        target_count = target_mask[..., 1:].sum(dim=-1)
+        if bool(present.any()) and not bool(
+                (target_count[present] >= 2).all()):
             raise ValueError(
-                "compound loss requires at least two target specialists per step")
+                "visible compound rows require at least two target specialists")
+        active_count = active_mask[..., 1:].sum(dim=-1)
 
-        pos_weight = logits.new_tensor(self.activation_pos_weight)
-        loss = F.binary_cross_entropy_with_logits(
-            logits, targets.to(logits.dtype), pos_weight=pos_weight)
-        selected = active_mask[..., 1:]
-        selected_count = selected.sum(dim=-1)
-        max_specialists = int(getattr(
-            getattr(model, "expert_activator", None),
-            "max_specialists", specialist_count,
-        ))
-        if bool((selected_count > max_specialists).any()):
-            raise ValueError(
-                f"compound activation may select at most "
-                f"{max_specialists} specialists")
+        candidate_iou = self._aligned_iou_xywh(
+            candidate_boxes.reshape(-1, 4),
+            targets[:, :, None, :].expand_as(
+                candidate_boxes).reshape(-1, 4),
+        ).reshape(batch_size, steps, expert_count)
+        candidate_quality = logits.sigmoid()
+        weights, selected_ids = select_expert_weights(
+            candidate_quality.reshape(-1, expert_count),
+            eligible=active_mask.reshape(-1, expert_count),
+            specialist_margin=1.05,
+            minimum_quality=0.10,
+            temperature=self.collaboration_temperature,
+            straight_through=True,
+        )
+        weights = weights.reshape(batch_size, steps, expert_count)
+        selected_ids = selected_ids.reshape(batch_size, steps)
+        selected_boxes = (
+            weights[..., None] * candidate_boxes.detach()).sum(dim=2)
+        selected_iou = self._aligned_iou_xywh(
+            selected_boxes.reshape(-1, 4),
+            targets.reshape(-1, 4),
+        ).reshape(batch_size, steps)
+        visible_weight = present.to(logits.dtype)
+        visible_count = visible_weight.sum().clamp_min(1.0)
+        localization_per_row = (
+            1.0 - selected_iou
+            + F.smooth_l1_loss(
+                selected_boxes, targets, reduction="none").sum(dim=-1)
+        )
+        localization_loss = (
+            localization_per_row * visible_weight).sum() / visible_count
+
+        calibration_mask = (
+            active_mask & present[..., None]).to(logits.dtype)
+        calibration_count = calibration_mask.sum().clamp_min(1.0)
+        calibration_loss = (
+            F.smooth_l1_loss(
+                candidate_quality, candidate_iou.detach(), reduction="none")
+            * calibration_mask
+        ).sum() / calibration_count
+
+        masked_iou = candidate_iou.masked_fill(
+            ~active_mask, float("-inf"))
+        oracle_iou = masked_iou.max(dim=-1).values
+        generalist_iou = candidate_iou[..., 0]
+        improvable = (
+            present
+            & (oracle_iou > (
+                generalist_iou + self.collaboration_advantage_margin))
+        )
+        if bool(improvable.any()):
+            advantage_loss = F.relu(
+                generalist_iou.detach()
+                + self.collaboration_advantage_margin
+                - selected_iou
+            )[improvable].mean()
+        else:
+            advantage_loss = logits.sum() * 0.0
+        loss = (
+            self.collaboration_localization_weight * localization_loss
+            + self.collaboration_calibration_weight * calibration_loss
+            + self.collaboration_advantage_weight * advantage_loss
+        )
         if not return_status:
             return loss
 
-        top2_recall = (
-            (selected & targets).float().sum()
-            / targets.float().sum().clamp_min(1.0)
+        mean_selected = (
+            selected_iou * visible_weight).sum() / visible_count
+        mean_generalist = (
+            generalist_iou * visible_weight).sum() / visible_count
+        mean_oracle = (
+            oracle_iou * visible_weight).sum() / visible_count
+        target_recall = (
+            (active_mask[..., 1:] & target_mask[..., 1:])
+            .to(logits.dtype).sum(dim=-1)
+            / target_count.to(logits.dtype).clamp_min(1.0)
         )
-        selected_iou = torch.as_tensor(
-            selected_iou, device=logits.device, dtype=logits.dtype)
-        generalist_iou = torch.as_tensor(
-            generalist_iou, device=logits.device, dtype=logits.dtype)
-        if selected_iou.shape != (batch_size, steps) \
-                or generalist_iou.shape != (batch_size, steps):
-            raise ValueError("compound IoU diagnostics must have shape (B,S)")
-        visible_weight = current_present.to(logits.dtype)
-        visible_count = visible_weight.sum().clamp_min(1.0)
         status = {
-            "Loss/activation": float(loss.detach()),
+            "Loss/collaboration_localization": float(
+                localization_loss.detach()),
+            "Loss/collaboration_calibration": float(
+                calibration_loss.detach()),
+            "Loss/collaboration_advantage": float(
+                advantage_loss.detach()),
             "Loss/total": float(loss.detach()),
             "Compound/target_specialists": float(
-                target_count.float().mean()),
+                ((target_count.to(logits.dtype) * visible_weight).sum()
+                 / visible_count).detach()),
             "Compound/active_specialists": float(
-                selected_count.float().mean()),
-            "Compound/top2_recall": float(top2_recall.detach()),
-            "Compound/selected_iou": float(
-                ((selected_iou * visible_weight).sum()
+                ((active_count.to(logits.dtype) * visible_weight).sum()
                  / visible_count).detach()),
-            "Compound/generalist_iou": float(
-                ((generalist_iou * visible_weight).sum()
+            "Compound/active_target_recall": float(
+                ((target_recall * visible_weight).sum()
                  / visible_count).detach()),
+            "Compound/selected_iou": float(mean_selected.detach()),
+            "Compound/generalist_iou": float(mean_generalist.detach()),
             "Compound/iou_delta": float(
-                (((selected_iou - generalist_iou) * visible_weight).sum()
+                (mean_selected - mean_generalist).detach()),
+            "Compound/oracle_iou": float(mean_oracle.detach()),
+            "Compound/selection_regret": float(
+                (mean_oracle - mean_selected).detach()),
+            "Compound/selected_specialist_rate": float(
+                (((selected_ids != 0).to(logits.dtype) * visible_weight).sum()
                  / visible_count).detach()),
             "Expert/phase_id": 5,
         }

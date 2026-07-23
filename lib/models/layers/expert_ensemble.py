@@ -146,6 +146,60 @@ def _temporal_consistency(boxes, last_box, eps=1e-6):
     return torch.exp(-(center_change + scale_change)).clamp(0.0, 1.0)
 
 
+def select_expert_weights(
+        quality, eligible=None, specialist_margin=1.05,
+        minimum_quality=0.10, temperature=0.25,
+        straight_through=False):
+    """Apply the shared generalist-fallback rule to candidate qualities."""
+    quality = torch.as_tensor(quality).float()
+    squeeze = quality.ndim == 1
+    if squeeze:
+        quality = quality.unsqueeze(0)
+    if quality.ndim != 2 or quality.shape[1] < 1:
+        raise ValueError("quality must have shape (B,E) or (E,)")
+    if not torch.isfinite(quality).all() or torch.any(
+            (quality < 0.0) | (quality > 1.0)):
+        raise ValueError("quality must be finite and in [0, 1]")
+    if eligible is None:
+        eligible = torch.ones_like(quality, dtype=torch.bool)
+    else:
+        eligible = torch.as_tensor(
+            eligible, device=quality.device, dtype=torch.bool)
+        if squeeze and eligible.ndim == 1:
+            eligible = eligible.unsqueeze(0)
+        if eligible.shape != quality.shape:
+            raise ValueError("eligible must match quality")
+    eligible = eligible.clone()
+    eligible[:, 0] = True
+
+    ranked = quality.masked_fill(~eligible, float("-inf"))
+    best_ids = ranked.argmax(dim=1)
+    best_quality = ranked.gather(1, best_ids[:, None]).squeeze(1)
+    generalist_quality = quality[:, 0]
+    accept_specialist = (
+        (best_ids != 0)
+        & torch.isfinite(best_quality)
+        & (best_quality >= float(minimum_quality))
+        & (best_quality >= generalist_quality * float(specialist_margin))
+    )
+    selected_ids = torch.where(
+        accept_specialist, best_ids, torch.zeros_like(best_ids))
+    hard = torch.zeros_like(quality)
+    hard.scatter_(1, selected_ids[:, None], 1.0)
+    if straight_through:
+        if not 0.0 < float(temperature):
+            raise ValueError("temperature must be positive")
+        logits = torch.logit(quality.clamp(1e-6, 1.0 - 1e-6))
+        logits = logits.masked_fill(~eligible, float("-inf"))
+        soft = torch.softmax(logits / float(temperature), dim=1)
+        weights = hard + soft - soft.detach()
+    else:
+        weights = hard
+    if squeeze:
+        return weights[0], selected_ids[0]
+    return weights, selected_ids
+
+
 def fuse_expert_predictions(
         boxes, response_peaks, response_psr, last_box,
         localization_validity=None,
@@ -194,21 +248,13 @@ def fuse_expert_predictions(
     if _has_pairwise_cluster(pairwise_iou, float(cluster_iou)):
         eligible &= consensus >= float(reject_consensus)
     eligible[0] = True
-    ranked_quality = quality.masked_fill(~eligible, float("-inf"))
-    best_id = int(ranked_quality.argmax().item())
-    selected_id = 0
-    best_quality = ranked_quality[best_id]
-    generalist_quality = quality[0]
-    if (
-        best_id != 0
-        and bool(torch.isfinite(best_quality))
-        and float(best_quality.item()) >= float(minimum_quality)
-        and float(best_quality.item())
-        >= float(generalist_quality.item()) * float(specialist_margin)
-    ):
-        selected_id = best_id
-    weights = torch.zeros_like(quality)
-    weights[selected_id] = 1.0
+    weights, selected_id_tensor = select_expert_weights(
+        quality,
+        eligible=eligible,
+        specialist_margin=specialist_margin,
+        minimum_quality=minimum_quality,
+    )
+    selected_id = int(selected_id_tensor.item())
     return ExpertEnsembleResult(
         box=boxes[selected_id],
         score=float(peaks[selected_id].item()),

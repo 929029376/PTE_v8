@@ -95,6 +95,12 @@ class PETTrack(BaseTracker):
             raise RuntimeError(
                 "sparse expert inference is enabled but the model has no activator")
         self.auto_expert_activation = use_activation
+        self.collaboration_trained = bool(getattr(
+            expert_cfg, "COLLABORATION_TRAINED", False))
+        if self.collaboration_trained and getattr(
+                self.network, "expert_collaboration_gate", None) is None:
+            raise RuntimeError(
+                "candidate collaboration is enabled but the model has no gate")
         self.preprocessor = Preprocessor(device=self.device)
         self.state = None
         search_controller_cfg = getattr(
@@ -506,6 +512,7 @@ class PETTrack(BaseTracker):
             response_peaks = []
             response_psr = []
             localization_validity = []
+            collaboration_validity = []
             acceptance_scores = []
             observability_scores = []
             for name in active_names:
@@ -533,6 +540,11 @@ class PETTrack(BaseTracker):
                         pred_box, resize_factor, reference_state),
                     height, width, margin=10))
                 reliability = expert_output.get("reliability_predictions")
+                collaboration = expert_output.get(
+                    "collaboration_predictions")
+                collaboration_validity.append(
+                    None if collaboration is None
+                    else collaboration["score"][0])
                 if reliability is None and name == expert_names[0]:
                     reliability = out_dict.get("reliability_predictions")
                 if reliability is None:
@@ -551,11 +563,19 @@ class PETTrack(BaseTracker):
                 mapped_boxes, device=response_stack.device,
                 dtype=response_stack.dtype)
             if forced_expert_id is None:
+                validity_source = (
+                    collaboration_validity
+                    if getattr(self, "collaboration_trained", False)
+                    else localization_validity)
                 candidate_validity = (
-                    torch.stack(localization_validity)
-                    if all(value is not None for value in localization_validity)
-                    else None
-                )
+                    torch.stack(validity_source)
+                    if all(value is not None for value in validity_source)
+                    else None)
+                if (getattr(self, "collaboration_trained", False)
+                        and candidate_validity is None):
+                    raise RuntimeError(
+                        "trained collaboration requires every active "
+                        "candidate score")
                 ensemble = fuse_expert_predictions(
                     boxes=boxes,
                     response_peaks=torch.stack(response_peaks),

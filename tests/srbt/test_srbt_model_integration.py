@@ -161,7 +161,7 @@ def test_model_checkpoints_trainable_duration_evidence_decoder():
         if key.startswith("duration_evidence_decoder.")
     }
 
-    assert model.ARCHITECTURE_VERSION == 30
+    assert model.ARCHITECTURE_VERSION == 31
     assert decoder_state
     assert sum(value.numel() for value in decoder_state.values()) <= 256
 
@@ -340,13 +340,17 @@ def test_inference_runs_shared_and_small_paths_once_and_returns_five_candidates(
     assert tuple(output["expert_outputs"]) == tuple(model.expert_names)
     assert output["expert_outputs"]["precision_refiner"][
         "score_map"].shape[-2:] == (4, 4)
+    assert set(output["expert_outputs"]["precision_refiner"][
+        "collaboration_predictions"]) == {"logits", "score"}
     for name in model.shared_expert_names:
         for key, value in shared_only["expert_outputs"][name].items():
-            if key == "reliability_predictions":
-                for reliability_key, reliability_value in value.items():
+            if key in {
+                    "reliability_predictions",
+                    "collaboration_predictions"}:
+                for prediction_key, prediction_value in value.items():
                     assert torch.equal(
-                        output["expert_outputs"][name][key][reliability_key],
-                        reliability_value,
+                        output["expert_outputs"][name][key][prediction_key],
+                        prediction_value,
                     )
             else:
                 assert torch.equal(output["expert_outputs"][name][key], value)

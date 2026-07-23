@@ -7,7 +7,10 @@ from lib.models.layers.expert_fusion import ProposalBoxAdapter
 from lib.models.layers.expert_ensemble import ExpertActivator
 from lib.models.layers.small_target_expert import SmallTargetExpert
 from lib.models.layers.search_window_controller import SearchWindowController
-from lib.models.layers.srbt_controller import DurationEvidenceDecoder
+from lib.models.layers.srbt_controller import (
+    DurationEvidenceDecoder,
+    LocalizationValidityGate,
+)
 from lib.models.pet_track.pet_track import _load_filtered_baseline_checkpoint
 from lib.train.base_functions import _optimizer_groups
 
@@ -27,6 +30,7 @@ class TinyStudent(torch.nn.Module):
         self.rgb_identity_verifier = torch.nn.Linear(2, 2)
         self.visibility_gate = torch.nn.Linear(2, 2)
         self.localization_validity_gate = torch.nn.Linear(2, 2)
+        self.expert_collaboration_gate = LocalizationValidityGate(hidden_dim=8)
         self.duration_evidence_decoder = DurationEvidenceDecoder(hidden_dim=8)
         self.small_target_expert = torch.nn.Linear(2, 2)
         self.default_expert = "generalist"
@@ -253,17 +257,13 @@ def test_dispatch_trains_only_the_expert_activator():
     assert trainable
     assert all(name.startswith("expert_activator.") for name in trainable)
     assert [group["name"] for group in groups] == ["expert_activator"]
-    assert groups[0]["lr"] == 3e-4
-    assert {id(parameter) for parameter in groups[0]["params"]} == {
-        id(parameter) for parameter in model.expert_activator.parameters()
-    }
 
 
-def test_compound_trains_only_the_expert_activator():
+def test_compound_trains_only_the_candidate_collaboration_gate():
     model = TinyStudent()
     cfg = _cfg()
     cfg.TRAIN.EXPERT_PHASE = "compound"
-    cfg.TRAIN.ACTIVATOR_LR = 2e-4
+    cfg.TRAIN.COLLABORATION_LR = 2e-4
 
     groups = _optimizer_groups(model, cfg)
 
@@ -272,19 +272,22 @@ def test_compound_trains_only_the_expert_activator():
         if parameter.requires_grad
     }
     assert trainable
-    assert all(name.startswith("expert_activator.") for name in trainable)
-    assert [group["name"] for group in groups] == ["expert_activator"]
-    assert groups[0]["lr"] == 2e-4
     assert all(
-        not parameter.requires_grad
-        for module in (
-            model.backbone,
-            model.expert_fusion,
-            model.expert_heads,
-            model.search_window_controller,
-        )
-        for parameter in module.parameters()
+        name.startswith("expert_collaboration_gate.")
+        for name in trainable
     )
+    assert not any(
+        parameter.requires_grad
+        for parameter in model.expert_activator.parameters()
+    )
+    assert [group["name"] for group in groups] == [
+        "expert_collaboration_gate"
+    ]
+    assert groups[0]["lr"] == pytest.approx(2e-4)
+    assert {id(parameter) for parameter in groups[0]["params"]} == {
+        id(parameter)
+        for parameter in model.expert_collaboration_gate.parameters()
+    }
 
 
 def test_recovery_decoder_only_owns_exactly_duration_decoder_parameters():
