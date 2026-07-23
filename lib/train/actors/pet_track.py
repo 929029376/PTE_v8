@@ -1,5 +1,6 @@
 """PET-Track actor with local experts, presence gating, and recovery."""
 import math
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -1836,6 +1837,57 @@ class PETTrackActor(PETTrackBaseActor):
             discrimination_violation = (
                 torch.stack(violation_sums).sum() / ranking_weight)
 
+        pursuit_out_loss = specialist_loss * 0.0
+        pursuit_out_count = 0
+        pursuit_predictions = predictions.get("pursuit_predictions", ())
+        if pursuit_predictions:
+            pursuit_losses = []
+            pursuit_weights = []
+            data_cfg = getattr(getattr(self, "cfg", None), "DATA", None)
+            search_cfg = getattr(data_cfg, "SEARCH", None)
+            settings_factor = getattr(
+                getattr(self, "settings", None), "search_area_factor", {})
+            search_factor = float(getattr(
+                search_cfg, "FACTOR", settings_factor.get("search", 4.0)))
+            for step, prediction in enumerate(pursuit_predictions):
+                out_mask = present[:, step] & ~current_inside[:, step]
+                count = int(out_mask.sum())
+                if count == 0:
+                    continue
+                pursuit_out_count += count
+                masked_prediction = SimpleNamespace(
+                    next_box=prediction.next_box[out_mask],
+                    inside_logit=prediction.inside_logit[out_mask],
+                    quality_logit=prediction.quality_logit[out_mask],
+                )
+                step_loss, _ = search_window_pursuit_loss(
+                    masked_prediction,
+                    target_next=predictions["pursuit_targets"][step][out_mask],
+                    current_inside=current_inside[:, step][out_mask],
+                    current_quality=predictions[
+                        "pursuit_current_quality"][step][out_mask],
+                    present_next=predictions[
+                        "pursuit_present_next"][step][out_mask],
+                    search_factor=search_factor,
+                    center_weight=float(getattr(
+                        train_cfg, "PURSUIT_CENTER_WEIGHT", 1.0)),
+                    scale_weight=float(getattr(
+                        train_cfg, "PURSUIT_SCALE_WEIGHT", 0.5)),
+                    containment_weight=float(getattr(
+                        train_cfg, "PURSUIT_CONTAINMENT_WEIGHT", 2.0)),
+                    inside_weight=float(getattr(
+                        train_cfg, "PURSUIT_INSIDE_WEIGHT", 0.5)),
+                    quality_weight=float(getattr(
+                        train_cfg, "PURSUIT_QUALITY_WEIGHT", 0.25)),
+                )
+                weight = image_boxes.new_tensor(float(count))
+                pursuit_losses.append(step_loss * weight)
+                pursuit_weights.append(weight)
+            if pursuit_losses:
+                pursuit_out_loss = (
+                    torch.stack(pursuit_losses).sum()
+                    / torch.stack(pursuit_weights).sum().clamp_min(1.0))
+
         motion_weight = float(getattr(
             train_cfg, "MOTION_DISPLACEMENT_WEIGHT", 1.0))
         discrimination_weight = float(getattr(
@@ -1844,6 +1896,7 @@ class PETTrackActor(PETTrackBaseActor):
             specialist_loss + joint_loss + presence_loss
             + motion_weight * motion_loss
             + discrimination_weight * discrimination_loss
+            + pursuit_out_loss
         )
         if not return_status:
             return loss
@@ -1862,6 +1915,8 @@ class PETTrackActor(PETTrackBaseActor):
             "Loss/compound_specialists": float(specialist_loss.detach()),
             "Loss/compound_joint": float(joint_loss.detach()),
             "Loss/compound_presence": float(presence_loss.detach()),
+            "Loss/compound_pursuit_out_of_crop": float(
+                pursuit_out_loss.detach()),
             "Loss/motion_displacement": float(motion_loss.detach()),
             "Loss/motion_displacement_weighted": float(
                 (motion_weight * motion_loss).detach()),
@@ -1878,6 +1933,7 @@ class PETTrackActor(PETTrackBaseActor):
             "Compound/in_crop_rate": (
                 in_crop_count / present_count if present_count else 0.0),
             "Compound/out_of_crop_count": present_count - in_crop_count,
+            "Compound/pursuit_out_of_crop_count": pursuit_out_count,
             "Compound/generalist_iou": float(generalist_iou.detach()),
             "Compound/iou_delta": float(
                 (mean_joint_iou - generalist_iou).detach()),

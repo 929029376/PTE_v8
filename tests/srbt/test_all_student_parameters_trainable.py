@@ -278,6 +278,7 @@ def test_compound_trains_specialist_paths_without_activator_or_gate():
         "proposal_adapters.",
         "small_target_expert.",
         "visibility_gate.",
+        "search_window_controller.",
     )
     assert all(name.startswith(allowed_prefixes) for name in trainable)
     assert not any(
@@ -293,13 +294,22 @@ def test_compound_trains_specialist_paths_without_activator_or_gate():
             "duration_evidence_decoder.",
             "rgb_identity_verifier.",
             "redetect_expert.",
-            "search_window_controller.",
         ))
         for name in trainable
     )
-    assert [group["name"] for group in groups] == ["compound_specialists"]
+    assert [group["name"] for group in groups] == [
+        "compound_specialists",
+        "compound_search_window_controller",
+    ]
     assert groups[0]["lr"] == pytest.approx(5e-4)
-    assert {id(parameter) for parameter in groups[0]["params"]} == {
+    assert groups[1]["lr"] == pytest.approx(
+        getattr(cfg.TRAIN, "PURSUIT_LR", cfg.TRAIN.LR))
+    grouped_parameters = {
+        id(parameter)
+        for group in groups
+        for parameter in group["params"]
+    }
+    assert grouped_parameters == {
         id(parameter)
         for parameter in model.parameters()
         if parameter.requires_grad

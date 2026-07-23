@@ -992,7 +992,7 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "compound_differentiable_chain_v64_20260723/checkpoints/train/pet_track/"
+        "compound_in_crop_v65_20260723/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_latest.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
@@ -1017,7 +1017,7 @@ def test_canonical_compound_stage_trains_specialists_without_validation():
     assert configured.TRAIN.PERSISTENT_WORKERS is True
     assert configured.TRAIN.LOAD_LATEST is True
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "compound_differentiable_chain_v64_20260723/checkpoints/train/pet_track/"
+        "compound_in_crop_v65_20260723/checkpoints/train/pet_track/"
         "felt_pet_track/PETTrack_latest.pth.tar")
     assert configured.TRAIN.STAGE == "compound"
     assert configured.TRAIN.EXPERT_PHASE == "compound"
@@ -1270,13 +1270,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_in_crop_compound_v65_run_directory():
+def test_supervisor_uses_isolated_search_recovery_compound_v66_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "compound_in_crop_v65_20260723" in supervisor
+    assert "compound_search_recovery_v66_20260723" in supervisor
+    assert "compound_in_crop_v65_20260723" not in supervisor
     assert "compound_differentiable_chain_v64_20260723" not in supervisor
     assert "compound_sparse_subbatch_v63_20260723" not in supervisor
     assert "compound_specialists_v62_20260723" not in supervisor
@@ -1327,7 +1328,7 @@ def test_supervisor_uses_isolated_in_crop_compound_v65_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "compound_in_crop_v65_20260723/logs && exec") == 2
+        "compound_search_recovery_v66_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

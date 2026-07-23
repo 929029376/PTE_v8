@@ -425,7 +425,8 @@ def _optimizer_groups(net, cfg):
                 expert_heads,
                 getattr(model, "proposal_adapters", None),
                 getattr(model, "small_target_expert", None),
-                getattr(model, "visibility_gate", None)):
+                getattr(model, "visibility_gate", None),
+                getattr(model, "search_window_controller", None)):
             if module is not None:
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
@@ -465,6 +466,10 @@ def _optimizer_groups(net, cfg):
                 "expert_fusion.", "expert_heads.",
                 "proposal_adapters.", "small_target_expert.",
                 "visibility_gate.")))
+        add_group(
+            "compound_search_window_controller",
+            float(getattr(cfg.TRAIN, "PURSUIT_LR", lr)),
+            lambda name: name.startswith("search_window_controller."))
     elif expert_phase == "pursuit":
         if pursuit_specialist_name is None:
             add_group(
