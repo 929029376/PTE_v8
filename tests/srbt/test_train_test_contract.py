@@ -992,8 +992,8 @@ def test_canonical_config_contains_local_experts_but_no_legacy_pet_or_c3_nodes()
     assert configured.MODEL.PRETRAINED_SRBT_CKPT == ""
     assert configured.MODEL.PRETRAINED_EXPERT_CKPT == ""
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "compound_in_crop_v65_20260723/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_latest.pth.tar")
+        "compound_search_recovery_v66_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.MODEL.SEARCH_CONTROLLER.ENABLE is True
     assert configured.MODEL.SEARCH_CONTROLLER.TRAINED is True
     assert configured.MODEL.SEARCH_CONTROLLER.USE_INFERENCE is False
@@ -1015,10 +1015,10 @@ def test_canonical_compound_stage_trains_specialists_without_validation():
     assert configured.DATA.VAL.SAMPLE_PER_EPOCH % configured.TRAIN.BATCH_SIZE == 0
     assert configured.TRAIN.NUM_WORKER == 5
     assert configured.TRAIN.PERSISTENT_WORKERS is True
-    assert configured.TRAIN.LOAD_LATEST is True
+    assert configured.TRAIN.LOAD_LATEST is False
     assert configured.MODEL.INIT_CHECKPOINT.endswith(
-        "compound_in_crop_v65_20260723/checkpoints/train/pet_track/"
-        "felt_pet_track/PETTrack_latest.pth.tar")
+        "compound_search_recovery_v66_20260723/checkpoints/train/pet_track/"
+        "felt_pet_track/PETTrack_best.pth.tar")
     assert configured.TRAIN.STAGE == "compound"
     assert configured.TRAIN.EXPERT_PHASE == "compound"
     assert configured.TRAIN.SPECIALIST_EXPERT_IDS == [1, 2, 3, 4]
@@ -1043,7 +1043,7 @@ def test_canonical_compound_stage_trains_specialists_without_validation():
     assert configured.DATA.SEARCH.PRECISION_SCALE_MULTIPLIER == pytest.approx(
         1.75)
     assert configured.TRAIN.MIN_EPOCH == 4
-    assert configured.TRAIN.EPOCH == 30
+    assert configured.TRAIN.EPOCH == 10
     assert configured.TRAIN.REFINE_MAX_EPOCH == 12
     assert configured.TRAIN.LR == 0.00001
     assert configured.TRAIN.RECOVERY_LR == pytest.approx(0.00001)
@@ -1270,13 +1270,13 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_search_recovery_compound_v66_run_directory():
+def test_supervisor_uses_isolated_controller_closed_loop_v67_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "compound_search_recovery_v66_20260723" in supervisor
+    assert "compound_controller_closed_loop_v67_20260723" in supervisor
     assert "compound_in_crop_v65_20260723" not in supervisor
     assert "compound_differentiable_chain_v64_20260723" not in supervisor
     assert "compound_sparse_subbatch_v63_20260723" not in supervisor
@@ -1328,7 +1328,7 @@ def test_supervisor_uses_isolated_search_recovery_compound_v66_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "compound_search_recovery_v66_20260723/logs && exec") == 2
+        "compound_controller_closed_loop_v67_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():

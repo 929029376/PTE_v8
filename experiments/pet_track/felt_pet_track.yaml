@@ -52,7 +52,7 @@ MODEL:
   PRETRAINED_BASELINE_CKPT: "pretrained_networks/AMTTrack_ep0098.pth.tar"
   PRETRAINED_SRBT_CKPT: ""
   PRETRAINED_EXPERT_CKPT: ""
-  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/compound_in_crop_v65_20260723/checkpoints/train/pet_track/felt_pet_track/PETTrack_latest.pth.tar"
+  INIT_CHECKPOINT: "/root/fnvme/PTE_v8_runs/compound_search_recovery_v66_20260723/checkpoints/train/pet_track/felt_pet_track/PETTrack_best.pth.tar"
   EXPERT:
     ENABLE: true
     DEFAULT: generalist
@@ -136,7 +136,7 @@ TRAIN:
   PROPOSAL_IDENTITY_ONLY: false
   SPECIALIST_EXPERT_IDS: [1, 2, 3, 4]
   SPECIALIST_EXPERT_SCHEDULE: []
-  LOAD_LATEST: true
+  LOAD_LATEST: false
   REBASE_SCHEDULER_ON_RESUME: true
   BACKBONE_MULTIPLIER: 0.1
   BASE_LR_MULTIPLIER_IN_ALL: 0.1
@@ -144,7 +144,7 @@ TRAIN:
   DROP_PATH_RATE: 0.1
   BATCH_SIZE: 8
   MIN_EPOCH: 4
-  EPOCH: 30
+  EPOCH: 10
   REFINE_MAX_EPOCH: 12
   LR: 0.00001
   PURSUIT_LR: 0.00005
