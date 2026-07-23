@@ -456,6 +456,30 @@ def test_pursuit_phase_trains_only_search_window_controller():
     }
 
 
+def test_compound_controller_only_keeps_compound_data_and_freezes_specialists():
+    model = TinyStudent()
+    cfg = _cfg()
+    cfg.TRAIN.EXPERT_PHASE = "compound"
+    cfg.TRAIN.COMPOUND_CONTROLLER_ONLY = True
+    cfg.TRAIN.PURSUIT_LR = 5e-5
+
+    groups = _optimizer_groups(model, cfg)
+    trainable = {
+        name: parameter for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+    assert trainable
+    assert all(
+        name.startswith("search_window_controller.") for name in trainable)
+    assert [group["name"] for group in groups] == [
+        "compound_search_window_controller"]
+    assert groups[0]["lr"] == pytest.approx(5e-5)
+    assert {id(parameter) for parameter in groups[0]["params"]} == {
+        id(parameter) for parameter in trainable.values()
+    }
+
+
 @pytest.mark.parametrize(("expert_id", "expert_name"), [
     (1, "motion"),
     (4, "discrimination"),

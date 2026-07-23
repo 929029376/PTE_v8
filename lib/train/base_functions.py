@@ -196,6 +196,10 @@ def _optimizer_groups(net, cfg):
     model = _unwrap_net(net)
     expert_phase = str(getattr(
         cfg.TRAIN, "EXPERT_PHASE", "specialize")).lower()
+    compound_controller_only = (
+        expert_phase == "compound"
+        and bool(getattr(cfg.TRAIN, "COMPOUND_CONTROLLER_ONLY", False))
+    )
     if expert_phase not in {
             "specialize", "refine", "recovery", "pursuit", "dispatch",
             "compound"}:
@@ -413,23 +417,32 @@ def _optimizer_groups(net, cfg):
                 "MODEL.EXPERT.ENABLE=true")
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        default_expert = getattr(model, "default_expert", "generalist")
-        for name, expert in expert_fusion.experts.items():
-            if name != default_expert:
-                for parameter in expert.parameters():
-                    parameter.requires_grad_(True)
-        for name, parameter in expert_fusion.residual_scale_logits.items():
-            if name != default_expert:
+        controller = getattr(model, "search_window_controller", None)
+        if compound_controller_only:
+            if controller is None:
+                raise ValueError(
+                    "compound controller-only training requires "
+                    "MODEL.SEARCH_CONTROLLER.ENABLE=true")
+            for parameter in controller.parameters():
                 parameter.requires_grad_(True)
-        for module in (
-                expert_heads,
-                getattr(model, "proposal_adapters", None),
-                getattr(model, "small_target_expert", None),
-                getattr(model, "visibility_gate", None),
-                getattr(model, "search_window_controller", None)):
-            if module is not None:
-                for parameter in module.parameters():
+        else:
+            default_expert = getattr(model, "default_expert", "generalist")
+            for name, expert in expert_fusion.experts.items():
+                if name != default_expert:
+                    for parameter in expert.parameters():
+                        parameter.requires_grad_(True)
+            for name, parameter in expert_fusion.residual_scale_logits.items():
+                if name != default_expert:
                     parameter.requires_grad_(True)
+            for module in (
+                    expert_heads,
+                    getattr(model, "proposal_adapters", None),
+                    getattr(model, "small_target_expert", None),
+                    getattr(model, "visibility_gate", None),
+                    controller):
+                if module is not None:
+                    for parameter in module.parameters():
+                        parameter.requires_grad_(True)
     lr = cfg.TRAIN.LR
     wd = cfg.TRAIN.WEIGHT_DECAY
     used = set()
@@ -458,14 +471,15 @@ def _optimizer_groups(net, cfg):
             float(getattr(cfg.TRAIN, "ACTIVATOR_LR", lr)),
             lambda name: name.startswith("expert_activator."))
     elif expert_phase == "compound":
-        add_group(
-            "compound_specialists",
-            lr * float(getattr(
-                cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0)),
-            lambda name: name.startswith((
-                "expert_fusion.", "expert_heads.",
-                "proposal_adapters.", "small_target_expert.",
-                "visibility_gate.")))
+        if not compound_controller_only:
+            add_group(
+                "compound_specialists",
+                lr * float(getattr(
+                    cfg.TRAIN, "EXPERT_LR_MULTIPLIER", 5.0)),
+                lambda name: name.startswith((
+                    "expert_fusion.", "expert_heads.",
+                    "proposal_adapters.", "small_target_expert.",
+                    "visibility_gate.")))
         add_group(
             "compound_search_window_controller",
             float(getattr(cfg.TRAIN, "PURSUIT_LR", lr)),

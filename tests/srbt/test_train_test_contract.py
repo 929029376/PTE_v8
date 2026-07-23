@@ -1270,13 +1270,14 @@ def test_proposal_identity_stage_report_is_unambiguous(capsys):
     assert "reliability" not in report
 
 
-def test_supervisor_uses_isolated_controller_supervision_v68_run_directory():
+def test_supervisor_uses_isolated_controller_warmup_v69_run_directory():
     project_root = Path(__file__).resolve().parents[2]
     supervisor = (
         project_root / "tracking" / "supervisord_local_experts_v8.conf"
     ).read_text(encoding="utf-8")
 
-    assert "compound_controller_supervision_v68_20260723" in supervisor
+    assert "compound_controller_warmup_v69_20260723" in supervisor
+    assert "compound_controller_supervision_v68_20260723" not in supervisor
     assert "compound_in_crop_v65_20260723" not in supervisor
     assert "compound_differentiable_chain_v64_20260723" not in supervisor
     assert "compound_sparse_subbatch_v63_20260723" not in supervisor
@@ -1328,7 +1329,7 @@ def test_supervisor_uses_isolated_controller_supervision_v68_run_directory():
     assert "--nproc_per_node" not in supervisor
     assert supervisor.count(
         "mkdir -p /root/fnvme/PTE_v8_runs/"
-        "compound_controller_supervision_v68_20260723/logs && exec") == 2
+        "compound_controller_warmup_v69_20260723/logs && exec") == 2
 
 
 def test_actor_avoids_legacy_counterfactual_route_outputs():
