@@ -1212,7 +1212,9 @@ def test_compound_loss_preserves_multilabel_targets_and_top2_coverage():
     assert status["Compound/generalist_iou"] == pytest.approx(0.475)
 
 
-def test_compound_loss_rejects_more_than_configured_active_specialists():
+@pytest.mark.parametrize("return_status", [True, False])
+def test_compound_loss_rejects_more_than_configured_active_specialists(
+        return_status):
     actor = object.__new__(PETTrackActor)
     actor.net = SimpleNamespace(
         expert_names=list(EXPERT_NAMES),
@@ -1235,7 +1237,8 @@ def test_compound_loss_rejects_more_than_configured_active_specialists():
     }
 
     with pytest.raises(ValueError, match="at most 2 specialists"):
-        actor._compute_compound_loss(predictions)
+        actor._compute_compound_loss(
+            predictions, return_status=return_status)
 
 
 @pytest.mark.parametrize("expert_id", [1, 2, 4])

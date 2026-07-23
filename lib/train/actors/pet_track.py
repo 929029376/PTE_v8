@@ -1493,9 +1493,6 @@ class PETTrackActor(PETTrackBaseActor):
         pos_weight = logits.new_tensor(self.activation_pos_weight)
         loss = F.binary_cross_entropy_with_logits(
             logits, targets.to(logits.dtype), pos_weight=pos_weight)
-        if not return_status:
-            return loss
-
         selected = active_mask[..., 1:]
         selected_count = selected.sum(dim=-1)
         max_specialists = int(getattr(
@@ -1506,6 +1503,9 @@ class PETTrackActor(PETTrackBaseActor):
             raise ValueError(
                 f"compound activation may select at most "
                 f"{max_specialists} specialists")
+        if not return_status:
+            return loss
+
         top2_recall = (
             (selected & targets).float().sum()
             / targets.float().sum().clamp_min(1.0)
